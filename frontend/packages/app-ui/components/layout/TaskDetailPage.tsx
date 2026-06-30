@@ -83,13 +83,13 @@ export function TaskDetailPage({
 	} = useLayoutStore((s) => s);
 
 	const {
-		activeSessionId,
 		isGenerating,
 		messageIds,
 		messagesMap,
 		pendingBootstrapSessionId,
 		streamingMessageId,
 		setActiveSession,
+		clearLocalMessages,
 		loadConversationMessages,
 	} = useChatStore((s) => s);
 
@@ -198,16 +198,25 @@ export function TaskDetailPage({
 		setActiveSession(resolvedSessionId);
 		// 项目消息刚切页时，先等 store 完成 optimistic 初始化，避免旧历史抢先覆盖 UI。
 		if (pendingBootstrapSessionId === resolvedSessionId) return;
-		if (activeSessionId === resolvedSessionId && isGenerating) return;
+		// 先清空旧消息，避免 loadConversationMessages 返回前显示旧数据闪烁
+		clearLocalMessages();
+		// 不检查 isGenerating——可能来自 workbench 跳转，SSE 连接还未建立，
+		// loadConversationMessages 内部会根据 runtime_status 决定是否回放。
 		loadConversationMessages(resolvedSessionId);
 	}, [
 		resolvedSessionId,
-		activeSessionId,
-		isGenerating,
 		pendingBootstrapSessionId,
 		setActiveSession,
+		clearLocalMessages,
 		loadConversationMessages,
 	]);
+
+	// 离开任务详情页时清理消息并关闭 SSE
+	useEffect(() => {
+		return () => {
+			clearLocalMessages();
+		};
+	}, [clearLocalMessages]);
 
 	useEffect(() => {
 		if (!resolvedTaskId) return;

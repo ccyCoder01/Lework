@@ -139,6 +139,7 @@ export function ProjectPage({
 		isGenerating,
 		pendingBootstrapSessionId,
 		setActiveSession,
+		clearLocalMessages,
 		loadConversationMessages,
 		resetLocalMessages,
 	} = useChatStore((s) => s);
@@ -289,6 +290,8 @@ export function ProjectPage({
 		// 项目消息刚创建 session 并准备开流时，跳过这次自动拉历史，避免旧数据覆盖 optimistic 消息。
 		if (pendingBootstrapSessionId === nextSessionId) return;
 		if (isGenerating && activeSessionId === nextSessionId) return;
+		// 先清空旧消息，避免 loadConversationMessages 返回前显示旧数据闪烁
+		clearLocalMessages();
 		loadConversationMessages(nextSessionId);
 	}, [
 		resolvedSessionId,
@@ -299,9 +302,17 @@ export function ProjectPage({
 		pendingBootstrapSessionId,
 		activeSessionId,
 		setActiveSession,
+		clearLocalMessages,
 		loadConversationMessages,
 		resetLocalMessages,
 	]);
+
+	// 离开项目页时清理消息并关闭 SSE
+	useEffect(() => {
+		return () => {
+			clearLocalMessages();
+		};
+	}, [clearLocalMessages]);
 
 	const handleRightSidebarResizeStart = (event: React.PointerEvent<HTMLHRElement>) => {
 		const startX = event.clientX;

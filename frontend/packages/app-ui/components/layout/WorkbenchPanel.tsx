@@ -64,7 +64,7 @@ export function WorkbenchPanel({ navigation }: { navigation?: AppNavigation }) {
 		fetchProjects,
 		clearTaskDetailRoute,
 	} = useLayoutStore((s) => s);
-	const { startSessionResponseStream, resetLocalMessages, addUploadedAttachment, isGenerating } =
+	const { addUploadedAttachment, isGenerating } =
 		useChatStore((s) => s);
 	const { isAuthenticated, openAuthDialog, requireAuth } = useAuth();
 	const fileInputRef = useRef<HTMLInputElement>(null);
@@ -91,18 +91,6 @@ export function WorkbenchPanel({ navigation }: { navigation?: AppNavigation }) {
 		setAttachments([]);
 	};
 
-	const cloneAttachmentsForOptimisticMessage = (items: Attachment[]) =>
-		items.map((attachment) => {
-			// 中文注释：工作台清空输入区前，先为图片附件复制一份独立预览地址，避免跳页后首屏丢图。
-			if (attachment.type === "image" && attachment.file) {
-				return {
-					...attachment,
-					url: URL.createObjectURL(attachment.file),
-				};
-			}
-			return { ...attachment };
-		});
-
 	useEffect(() => {
 		attachmentsRef.current = attachments;
 	}, [attachments]);
@@ -113,8 +101,7 @@ export function WorkbenchPanel({ navigation }: { navigation?: AppNavigation }) {
 
 	useLayoutEffect(() => {
 		clearTaskDetailRoute();
-		resetLocalMessages();
-	}, [clearTaskDetailRoute, resetLocalMessages]);
+	}, [clearTaskDetailRoute]);
 
 	useEffect(() => {
 		if (!activeWorkbenchProjectId) return;
@@ -139,14 +126,7 @@ export function WorkbenchPanel({ navigation }: { navigation?: AppNavigation }) {
 				composerMetadata,
 			);
 			if (data?.session_id) {
-				const optimisticAttachments = cloneAttachmentsForOptimisticMessage(attachments);
-				// 中文注释：工作台跳转详情页前，先把附件写进 optimistic 消息，避免首屏只剩文本。
-				await startSessionResponseStream(
-					data.session_id,
-					content,
-					optimisticAttachments,
-					composerMetadata,
-				);
+				// 不在 workbench 发起 SSE 连接，跳转到 TaskDetailPage 后通过回放建立
 			}
 			if (navigation && data?.project_id && data?.task_id && data?.session_id) {
 				navigation.goToTaskDetail(data.project_id, data.task_id, data.session_id);
