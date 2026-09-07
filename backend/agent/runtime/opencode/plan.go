@@ -3,38 +3,16 @@ package opencode
 import (
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
-	"github.com/insmtx/Leros/backend/agent/runtime/events"
+	"github.com/insmtx/Leros/backend/agent"
 )
-
-const maxPlanFileSize = 256 * 1024
 
 var planQuestionPathPattern = regexp.MustCompile(`^Plan at (.+) is complete\.`)
 
-func (st *runState) planHandoff(questions []events.QuestionItem) *events.PlanHandoffPayload {
-	handoff := &events.PlanHandoffPayload{}
-	path, displayPath, err := st.resolvePlanPath(questions)
-	handoff.FilePath = displayPath
-	if err != nil {
-		handoff.Error = err.Error()
-		return handoff
-	}
-
-	content, err := readPlanFile(path)
-	if err != nil {
-		handoff.Error = fmt.Sprintf("read plan file: %v", err)
-		return handoff
-	}
-	handoff.Content = content
-	return handoff
-}
-
-func (st *runState) resolvePlanPath(questions []events.QuestionItem) (string, string, error) {
+func (st *runState) resolvePlanPath(questions []agent.QuestionItem) (string, string, error) {
 	expectedName := ""
 	if st.session != nil && st.session.Slug != "" && st.session.Time.Created > 0 {
 		expectedName = fmt.Sprintf("%d-%s.md", st.session.Time.Created, st.session.Slug)
@@ -79,7 +57,10 @@ func validatePlanPath(path, expectedName string) error {
 	return nil
 }
 
-func extractPlanPath(questions []events.QuestionItem) string {
+func extractPlanPath(questions []agent.QuestionItem) string {
+	if questions == nil {
+		return ""
+	}
 	for _, question := range questions {
 		match := planQuestionPathPattern.FindStringSubmatch(strings.TrimSpace(question.Question))
 		if len(match) == 2 {
@@ -87,24 +68,4 @@ func extractPlanPath(questions []events.QuestionItem) string {
 		}
 	}
 	return ""
-}
-
-func readPlanFile(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	content, err := io.ReadAll(io.LimitReader(file, maxPlanFileSize+1))
-	if err != nil {
-		return "", err
-	}
-	if len(content) > maxPlanFileSize {
-		return "", errors.New("plan file exceeds the size limit")
-	}
-	if strings.TrimSpace(string(content)) == "" {
-		return "", errors.New("plan file is empty")
-	}
-	return string(content), nil
 }

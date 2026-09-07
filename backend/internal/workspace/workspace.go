@@ -9,10 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	assistantdomain "github.com/insmtx/Leros/backend/internal/assistant/domain"
-	"github.com/insmtx/Leros/backend/internal/worker/identity"
 	"github.com/insmtx/Leros/backend/pkg/leros"
-	"github.com/ygpkg/yg-go/logs"
 )
 
 // TaskWorkspaceRequest 标识一次任务 turn 的工作区和运行目录请求。
@@ -35,7 +32,6 @@ type TaskWorkspace struct {
 	TurnTmpDir           string
 	TurnLogDir           string
 	ArtifactManifestPath string
-	BaselinePath         string
 	EffectiveWorkDir     string
 	CloneURL             string
 }
@@ -127,40 +123,9 @@ func ResolveTaskWorkspace(req TaskWorkspaceRequest) (*TaskWorkspace, error) {
 		TurnTmpDir:           filepath.Join(turnDir, "tmp"),
 		TurnLogDir:           filepath.Join(turnDir, "logs"),
 		ArtifactManifestPath: filepath.Join(turnDir, "artifacts.jsonl"),
-		BaselinePath:         filepath.Join(turnDir, "baseline.jsonl"),
 		EffectiveWorkDir:     effectiveWorkDir,
 		CloneURL:             req.CloneURL,
 	}, nil
-}
-
-// FromAgentRequest 从标准化运行请求中的 workspace 上下文解析工作区路径。
-func FromAgentRequest(req *assistantdomain.RunRequest) (*TaskWorkspace, bool, error) {
-	if req == nil {
-		return nil, false, nil
-	}
-	projectID := strings.TrimSpace(req.Workspace.ProjectID)
-	taskID := strings.TrimSpace(req.Workspace.TaskID)
-	if taskID == "" {
-		taskID = strings.TrimSpace(req.TaskID)
-	}
-	requestID := strings.TrimSpace(req.Workspace.RequestID)
-	if projectID == "" || taskID == "" || requestID == "" {
-		return nil, false, nil
-	}
-	if req.Workspace.OrgID == 0 {
-		return nil, false, nil
-	}
-	plan, err := ResolveTaskWorkspace(TaskWorkspaceRequest{
-		OrgID:            req.Workspace.OrgID,
-		ProjectID:        projectID,
-		TaskID:           taskID,
-		RequestID:        requestID,
-		RequestedWorkDir: req.Runtime.WorkDir,
-	})
-	if err != nil {
-		return nil, false, err
-	}
-	return plan, true, nil
 }
 
 // StorageKey returns a repo-relative path suitable for persistence and Gitea API access.
@@ -177,6 +142,22 @@ func (p *TaskWorkspace) StorageKey(relativePath string) (string, error) {
 		return "", fmt.Errorf("build storage key: %w", err)
 	}
 	return filepath.ToSlash(key), nil
+}
+
+// NormalizeRelativePath validates and normalizes a repository-relative file path.
+func NormalizeRelativePath(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("relative path is required")
+	}
+	if filepath.IsAbs(value) {
+		return "", fmt.Errorf("relative path must not be absolute")
+	}
+	normalized := filepath.ToSlash(filepath.Clean(filepath.FromSlash(value)))
+	if normalized == "." || normalized == ".." || strings.HasPrefix(normalized, "../") {
+		return "", fmt.Errorf("relative path escapes repository")
+	}
+	return normalized, nil
 }
 
 // SafeJoin 解析相对路径，并确保最终路径仍在指定根目录内。
@@ -343,6 +324,9 @@ func ensureGitRepo(ctx context.Context, plan *TaskWorkspace) error {
 			}
 			return nil
 		}
+		if strings.TrimSpace(plan.CloneURL) == "" {
+			return nil
+		}
 		if err := os.RemoveAll(plan.RepoDir); err != nil {
 			return fmt.Errorf("remove broken repo: %w", err)
 		}
@@ -352,9 +336,6 @@ func ensureGitRepo(ctx context.Context, plan *TaskWorkspace) error {
 		cmd := exec.CommandContext(ctx, "git", "init", plan.RepoDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("git init: %w: %s", err, strings.TrimSpace(string(output)))
-		}
-		if err := os.MkdirAll(filepath.Join(plan.RepoDir, "assets"), 0o755); err != nil {
-			return fmt.Errorf("create assets dir: %w", err)
 		}
 		return nil
 	}
@@ -367,9 +348,6 @@ func ensureGitRepo(ctx context.Context, plan *TaskWorkspace) error {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		os.RemoveAll(plan.RepoDir)
 		return fmt.Errorf("git clone: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	if err := os.MkdirAll(filepath.Join(plan.RepoDir, "assets"), 0o755); err != nil {
-		return fmt.Errorf("create assets dir: %w", err)
 	}
 	return nil
 }
@@ -434,45 +412,4 @@ func cleanPathID(value string) string {
 		return ""
 	}
 	return value
-}
-
-func PushWorkspace(ctx context.Context, plan *TaskWorkspace) error {
-	if plan == nil || plan.RepoDir == "" {
-		logs.ErrorContextf(ctx, "PushWorkspace skipped: plan is nil or repo dir is empty")
-		return nil
-	}
-	gitDir := filepath.Join(plan.RepoDir, ".git")
-	if _, err := os.Stat(gitDir); err != nil {
-		logs.ErrorContextf(ctx, "PushWorkspace skipped: .git directory not found: %s", gitDir)
-		return nil
-	}
-
-	addCmd := exec.CommandContext(ctx, "git", "add", ".")
-	addCmd.Dir = plan.RepoDir
-	if output, err := addCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git add: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-
-	diffCmd := exec.CommandContext(ctx, "git", "diff", "--cached", "--quiet")
-	diffCmd.Dir = plan.RepoDir
-	if diffCmd.Run() == nil {
-		logs.InfoContextf(ctx, "skip git commit: no workspace changes (repo_dir=%s)", plan.RepoDir)
-		return nil
-	}
-
-	commitCmd := exec.CommandContext(ctx, "git", "commit", "-m", "task: agent run artifacts")
-	commitCmd.Dir = plan.RepoDir
-	commitCmd.Env = identity.GitAuthorEnv()
-	if output, err := commitCmd.CombinedOutput(); err != nil {
-		logs.ErrorContextf(ctx, "git commit artifacts: %v: %s", err, strings.TrimSpace(string(output)))
-		return nil
-	}
-
-	pushCmd := exec.CommandContext(ctx, "git", "push", "origin", "main")
-	pushCmd.Dir = plan.RepoDir
-	if output, err := pushCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git push: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	logs.InfoContextf(ctx, "PushWorkspace completed: repo_dir=%s", plan.RepoDir)
-	return nil
 }

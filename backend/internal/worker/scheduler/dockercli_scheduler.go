@@ -274,7 +274,7 @@ func (ds *DockerCLIScheduler) Stop(ctx context.Context, workerID string) error {
 
 	instance, ok := ds.instances[workerID]
 	if !ok {
-		return fmt.Errorf("worker %s not found", workerID)
+		return fmt.Errorf("%w: %s", worker.ErrWorkerNotFound, workerID)
 	}
 
 	if err := ds.stopContainer(ctx, instance); err != nil {
@@ -319,7 +319,7 @@ func (ds *DockerCLIScheduler) Health(ctx context.Context, workerID string) error
 	ds.mu.RUnlock()
 
 	if !ok {
-		return fmt.Errorf("worker %s not found", workerID)
+		return fmt.Errorf("%w: %s", worker.ErrWorkerNotFound, workerID)
 	}
 
 	status, err := ds.getContainerStatus(instance)
@@ -357,4 +357,18 @@ func (ds *DockerCLIScheduler) List(ctx context.Context) ([]*worker.WorkerInstanc
 		instance.mu.RUnlock()
 	}
 	return result, nil
+}
+
+func (ds *DockerCLIScheduler) Shutdown(ctx context.Context) error {
+	ds.mu.RLock()
+	instanceIDs := make([]string, 0, len(ds.instances))
+	for id := range ds.instances {
+		instanceIDs = append(instanceIDs, id)
+	}
+	ds.mu.RUnlock()
+
+	for _, id := range instanceIDs {
+		ds.Stop(ctx, id)
+	}
+	return nil
 }

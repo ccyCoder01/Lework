@@ -6,3 +6,4 @@ export { AssistantDetailPanel } from "./AssistantDetailPanel";
 export { AssistantEditDialog } from "./AssistantEditDialog";
 export { AssistantListPanel } from "./AssistantListPanel";
 export { AssistantListView } from "./AssistantListView";
+export { AssistantPermissionDialog } from "./AssistantPermissionDialog";

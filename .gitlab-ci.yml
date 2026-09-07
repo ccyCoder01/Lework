@@ -1,0 +1,891 @@
+spec:
+  inputs:
+    environment:
+      default: test
+      options:
+        - test
+        - prod
+        - image
+        - private
+      description: 发布的环境选择，image为仅构建镜像，private为桌面端私有化打包
+    app:
+      default: leros
+      options:
+        - leros
+        - leros-worker
+        - desktop
+        - leros-web
+      description: '选择要发布的应用或模块，desktop为桌面端打包上传COS'
+    update_worker_image:
+      default: "true"
+      options:
+        - "true"
+        - "false"
+      description: '发布 leros server 时是否同步构建 worker 镜像并更新 scheduler.worker_image'
+    build_tags:
+      default: enterprise
+      options:
+        - enterprise
+        - oss
+      description: '构建版本类型，oss=社区版，enterprise=企业版'
+    desktop_deploy_mode:
+      default: ""
+      description: '仅 environment=private 的桌面打包生效；此时必填，对应 COS 安装包目录 private/{mode}/ 与 logo 路径 fronted/{mode}/。SaaS（test/prod）即使填写也会被忽略'
+    desktop_app_name:
+      default: ""
+      description: '仅 environment=private 的桌面打包生效；可选，留空则为 Lework。SaaS 即使填写也会被忽略'
+    desktop_s3_domain:
+      default: ""
+      description: '仅 environment=private 的桌面打包生效；可选，S3 域名（需含 https://）。填写后必须能从 {域名}/fronted/{mode}/ 下载到 logo.svg 或 logo.png，否则打包失败。SaaS 即使填写也会被忽略'
+---
+
+stages:
+  - test
+  - build
+  - deploy
+  - desktop_build
+  - notify
+
+variables:
+  PRJ: "insmtx"
+  ENV: "$[[ inputs.environment ]]"
+  APP: "$[[ inputs.app ]]"
+  UPDATE_WORKER_IMAGE: "$[[ inputs.update_worker_image ]]"
+  LEROS_DEPLOY_MODE: "$[[ inputs.desktop_deploy_mode ]]"
+  LEROS_DEPLOY_APP_NAME: "$[[ inputs.desktop_app_name ]]"
+  LEROS_DEPLOY_S3_DOMAIN: "$[[ inputs.desktop_s3_domain ]]"
+  K3S_NAMESPACE_TEST: "insmtx-test"
+  K3S_SERVER_DEPLOYMENT: "leros"
+  K3S_SERVER_CONTAINER: "leros"
+  K3S_SERVER_CONFIGMAP: "leros-server-config"
+  K3S_SERVER_CONFIG_KEY: "config.yaml"
+
+
+uint-test:
+  stage: test
+  image: registry.cn-beijing.aliyuncs.com/wa/hub:docker_28.5-dind-1
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$APP == "desktop"'
+      when: never
+    - when: on_success
+  script:
+    - echo testing
+    # - APP=$[[ inputs.app ]] make test
+
+frontend-typecheck:
+  stage: test
+  image: registry.yygu.cn/library/node:24-alpine
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+    - if: '$APP == "desktop"'
+      when: on_success
+    - when: never
+  variables:
+    npm_config_registry: "https://registry.npmmirror.com"
+  cache:
+    key:
+      files:
+        - frontend/pnpm-lock.yaml
+    paths:
+      - frontend/.pnpm-store
+  before_script:
+    - npm install -g --prefix "$CI_PROJECT_DIR/.pnpm-bin" pnpm@10.28.2
+    - export PATH="$CI_PROJECT_DIR/.pnpm-bin/bin:$PATH"
+  script:
+    - cd frontend
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --frozen-lockfile --ignore-scripts
+    - pnpm typecheck
+
+build-image:
+  stage: build
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$APP == "desktop"'
+      when: never
+    - when: on_success
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+  image: registry.cn-beijing.aliyuncs.com/wa/hub:docker_28.5-dind-1
+  before_script:
+    - echo "PIPELINE_STATUS=failed" > build.env
+    - echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USERNAME" --password-stdin "$HARBOR_HOST"
+  script:
+    - echo $[[ inputs.app ]] $[[ inputs.environment ]]
+    - export APP=$[[ inputs.app ]]
+    - export DOCKER_BUILD_ARGS="$DOCKER_BUILD_ARGS $([[ "$[[ inputs.build_tags ]]" = enterprise ]] && echo --build-arg BUILD_TAGS=enterprise)"
+    - |
+      if [ "${APP}" = "leros-web" ]; then
+        if [ -z "$NEXT_PUBLIC_LEROS_API_BASE_URL" ]; then
+          echo "Required variable is missing: NEXT_PUBLIC_LEROS_API_BASE_URL"
+          exit 1
+        fi
+        export DOCKER_BUILD_ARGS="--build-arg NEXT_PUBLIC_LEROS_API_BASE_URL=$NEXT_PUBLIC_LEROS_API_BASE_URL --build-arg LEROS_API_BASE_URL=$NEXT_PUBLIC_LEROS_API_BASE_URL"
+        echo "Building web image with API base URL: $NEXT_PUBLIC_LEROS_API_BASE_URL"
+      fi
+    - export REGISTRY="$HARBOR_HOST"
+    - make push-image
+    - echo "PIPELINE_STATUS=success" > build.env
+    - export IMAGE_TAG=$(make image-tag)
+    - echo "IMAGE_TAG=${IMAGE_TAG}" >> build.env
+    - cat build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+build-worker-image:
+  stage: build
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$APP == "desktop"'
+      when: never
+    - if: '$APP == "leros" && $UPDATE_WORKER_IMAGE == "true"'
+      when: on_success
+    - when: never
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+  image: registry.cn-beijing.aliyuncs.com/wa/hub:docker_28.5-dind-1
+  before_script:
+    - echo "$HARBOR_PASSWORD" | docker login -u "$HARBOR_USERNAME" --password-stdin "$HARBOR_HOST"
+  script:
+    - export APP=leros-worker
+    - export DOCKER_BUILD_ARGS="$DOCKER_BUILD_ARGS $([[ "$[[ inputs.build_tags ]]" = enterprise ]] && echo --build-arg BUILD_TAGS=enterprise)"
+    - export REGISTRY="$HARBOR_HOST"
+    - make push-image
+    - export WORKER_IMAGE_TAG=$(make image-tag)
+    - echo "WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG}" > worker.env
+    - echo "WORKER_IMAGE=${HARBOR_HOST}/${PRJ}/leros-worker:${WORKER_IMAGE_TAG}" >> worker.env
+    - cat worker.env
+  artifacts:
+    reports:
+      dotenv: worker.env
+
+deploy:
+  stage: deploy
+  image: registry.ap-southeast-1.aliyuncs.com/wa/openrpa:gitlab_cd-2
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$APP == "desktop"'
+      when: never
+    - if: '$ENV == "private"'
+      when: never
+    - if: '$ENV != "image"'
+      when: on_success
+    - when: never
+  before_script:
+    - echo "PIPELINE_STATUS=failed" > deploy.env
+    - echo "Deploying $app to $environment environment"
+    - mkdir -p ~/.ssh
+    - |
+      if [ "${ENV}" = "test" ]; then
+          if [ -z "$DEPLOY_HOST_TEST" ]; then
+            echo "Required deploy variable is missing: DEPLOY_HOST_TEST"
+            exit 1
+          fi
+          DEPLOY_HOST="$DEPLOY_HOST_TEST"
+          echo "$SSH_KEY_T29" | base64 -d > ~/.ssh/id_rsa
+          UPDATE_SCRIPT="./update_yygu.sh"
+          K3S_NAMESPACE="${K3S_NAMESPACE_TEST:-insmtx-test}"
+      elif [ "${ENV}" = "prod" ]; then
+          if [ -z "$DEPLOY_HOST_PROD" ]; then
+            echo "Required deploy variable is missing: DEPLOY_HOST_PROD"
+            exit 1
+          fi
+          if [ -z "$K3S_NAMESPACE_PROD" ]; then
+            echo "Required deploy variable is missing: K3S_NAMESPACE_PROD"
+            exit 1
+          fi
+          DEPLOY_HOST="$DEPLOY_HOST_PROD"
+          echo "$SSH_KEY_P31" | base64 -d > ~/.ssh/id_rsa
+          UPDATE_SCRIPT="./update_yygu.sh"
+          K3S_NAMESPACE="$K3S_NAMESPACE_PROD"
+      else
+          echo "Unknown ENV: $ENV"
+          exit 1
+      fi
+      export DEPLOY_HOST UPDATE_SCRIPT K3S_NAMESPACE
+    - chmod 600 ~/.ssh/id_rsa
+  script:
+    # - echo "IMAGE_TAG=$IMAGE_TAG"
+    - echo "${PRJ} ${APP} ${IMAGE_TAG} "
+    - |
+      if [ "${APP}" = "leros" ] && [ "${UPDATE_WORKER_IMAGE}" = "true" ]; then
+        if [ -z "${WORKER_IMAGE:-}" ]; then
+          echo "UPDATE_WORKER_IMAGE=true but WORKER_IMAGE is empty. Check that build-worker-image ran successfully and exported worker.env."
+          echo "PIPELINE_STATUS=failed" > deploy.env
+          exit 1
+        fi
+
+        SERVER_IMAGE="${HARBOR_HOST}/${PRJ}/${APP}:${IMAGE_TAG}"
+        scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no deployments/k3s/update-leros-images.sh "$DEPLOY_HOST:/tmp/update-leros-images.sh"
+        if ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "$DEPLOY_HOST" \
+          "K3S_NAMESPACE='${K3S_NAMESPACE}' K3S_SERVER_DEPLOYMENT='${K3S_SERVER_DEPLOYMENT}' K3S_SERVER_CONTAINER='${K3S_SERVER_CONTAINER}' K3S_SERVER_CONFIGMAP='${K3S_SERVER_CONFIGMAP}' K3S_SERVER_CONFIG_KEY='${K3S_SERVER_CONFIG_KEY}' bash /tmp/update-leros-images.sh '${SERVER_IMAGE}' '${WORKER_IMAGE}'"; then
+          echo "PIPELINE_STATUS=success" > deploy.env
+        else
+          echo "PIPELINE_STATUS=failed" > deploy.env
+        fi
+      elif ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no $DEPLOY_HOST "$UPDATE_SCRIPT ${PRJ} ${APP} ${IMAGE_TAG} "; then
+        echo "PIPELINE_STATUS=success" > deploy.env
+      else
+        echo "PIPELINE_STATUS=failed" > deploy.env
+      fi
+    - cat deploy.env
+    - echo "${PIPELINE_STATUS}"
+  needs:
+    - job: build-image
+      artifacts: true
+    - job: build-worker-image
+      artifacts: true
+      optional: true
+  artifacts:
+    reports:
+      dotenv: deploy.env
+
+# ============================================================================
+# 桌面端打包 - 公共片段（通过 !reference 在各平台 template / job 中复用）
+# ============================================================================
+
+# 通用 before_script：校验必填变量、安装 coscmd
+.desktop-before-base:
+  before_script:
+    - |
+      for variable in VITE_LEROS_API_BASE_URL COS_SECRET_ID COS_SECRET_KEY COS_BUCKET COS_REGION DESKTOP_COS_ROOT_PREFIX DESKTOP_COS_PREFIX DESKTOP_TARGET; do
+        if [ -z "$(eval echo \$$variable)" ]; then
+          echo "Required desktop variable is missing: ${variable}"
+          exit 1
+        fi
+      done
+    - python3 -m venv "$CI_PROJECT_DIR/.coscmd-venv"
+    - $CI_PROJECT_DIR/.coscmd-venv/bin/pip install coscmd
+
+# macOS 专用 before_script：Node/pnpm、Apple 签名材料与显式 keychain 初始化
+.desktop-before-mac:
+  before_script:
+    - mkdir -p "$CI_PROJECT_DIR/.pnpm-bin"
+    - export PATH="/opt/homebrew/bin:/usr/local/bin:$CI_PROJECT_DIR/.pnpm-bin/bin:$CI_PROJECT_DIR/.coscmd-venv/bin:$PATH"
+    - |
+      if ! command -v node >/dev/null 2>&1; then
+        echo "Node.js is required on the macOS runner. Install Node 22 and make sure /opt/homebrew/bin or /usr/local/bin is visible to gitlab-runner."
+        exit 1
+      fi
+    - node --version
+    - |
+      retry_before_script() {
+        local attempt=1
+        local max_attempts=5
+
+        until "$@"; do
+          if [ "$attempt" -ge "$max_attempts" ]; then
+            return 1
+          fi
+
+          echo "Command failed, retrying (${attempt}/${max_attempts}): $*"
+          attempt=$((attempt + 1))
+          sleep 15
+        done
+      }
+    - retry_before_script npm install -g --prefix "$CI_PROJECT_DIR/.pnpm-bin" pnpm@10.28.2
+    - |
+      if [ "$DESKTOP_TARGET" = "mac-arm64" ] || [ "$DESKTOP_TARGET" = "mac-x64" ]; then
+        for variable in APPLE_API_KEY_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD; do
+          if [ -z "$(eval echo \$$variable)" ]; then
+            echo "Required mac desktop variable is missing: ${variable}"
+            exit 1
+          fi
+        done
+
+        export MACOS_CERTIFICATE_PATH="$CI_PROJECT_DIR/macos-certificate-${CI_JOB_ID}.p12"
+        export MACOS_KEYCHAIN_PATH="$CI_PROJECT_DIR/macos-signing-${CI_JOB_ID}.keychain-db"
+
+        printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$CI_PROJECT_DIR/AuthKey.p8"
+        printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$MACOS_CERTIFICATE_PATH"
+        chmod 600 "$CI_PROJECT_DIR/AuthKey.p8" "$MACOS_CERTIFICATE_PATH"
+
+        # 在耗时的签名与打包前验证 App Store Connect API 凭据，避免最后才因 401 失败。
+        if ! xcrun notarytool history \
+          --key "$CI_PROJECT_DIR/AuthKey.p8" \
+          --key-id "$APPLE_API_KEY_ID" \
+          --issuer "$APPLE_API_ISSUER" \
+          --output-format json >/dev/null; then
+          echo "Apple notarization authentication failed. Verify APPLE_API_KEY_BASE64, APPLE_API_KEY_ID and APPLE_API_ISSUER."
+          exit 1
+        fi
+
+        # electron-builder 26.15.2 在当前 Darwin 25.6 runner 上会用证书密码解锁其随机密码
+        # 创建的临时 keychain。这里显式管理 keychain，确保创建、导入和授权使用同一密码。
+        security delete-keychain "$MACOS_KEYCHAIN_PATH" 2>/dev/null || true
+        security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$MACOS_KEYCHAIN_PATH"
+        security set-keychain-settings -lut 21600 "$MACOS_KEYCHAIN_PATH"
+        security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$MACOS_KEYCHAIN_PATH"
+        security import "$MACOS_CERTIFICATE_PATH" \
+          -k "$MACOS_KEYCHAIN_PATH" \
+          -P "$MACOS_CERTIFICATE_PASSWORD" \
+          -T /usr/bin/codesign \
+          -T /usr/bin/productbuild \
+          -T /usr/bin/security
+        security set-key-partition-list \
+          -S apple-tool:,apple:,codesign: \
+          -s \
+          -k "$MACOS_CERTIFICATE_PASSWORD" \
+          "$MACOS_KEYCHAIN_PATH"
+
+        security find-identity -v -p codesigning "$MACOS_KEYCHAIN_PATH"
+        if [ -n "${MACOS_CODESIGN_IDENTITY:-}" ]; then
+          export MACOS_CSC_NAME="$(security find-identity -v -p codesigning "$MACOS_KEYCHAIN_PATH" | awk -v identity="$MACOS_CODESIGN_IDENTITY" 'index($0, identity) { print $2; exit }')"
+        else
+          export MACOS_CSC_NAME="$(security find-identity -v -p codesigning "$MACOS_KEYCHAIN_PATH" | awk 'index($0, "Developer ID Application:") { print $2; exit }')"
+        fi
+
+        if [ -z "$MACOS_CSC_NAME" ]; then
+          echo "No matching Developer ID Application identity found in the imported certificate"
+          exit 1
+        fi
+      fi
+
+# Linux 专用 before_script：electron-builder 系统依赖、python3-venv、npm 安装 pnpm
+.desktop-before-linux:
+  before_script:
+    - apt-get update -y && apt-get install -y --no-install-recommends
+        python3-venv python3-pip ca-certificates
+        libnspr4 libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2
+        libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1
+        libasound2 libpangocairo-1.0-0 libpango-1.0-0 libcairo2
+        libgdk-pixbuf-2.0-0 libgtk-3-0 libxshmfence1 libsecret-1-0
+    - export PATH="$CI_PROJECT_DIR/.pnpm-bin/bin:$CI_PROJECT_DIR/.coscmd-venv/bin:$PATH"
+    - mkdir -p "$CI_PROJECT_DIR/.pnpm-bin"
+    - |
+      retry_before_script() {
+        local attempt=1
+        local max_attempts=5
+
+        until "$@"; do
+          if [ "$attempt" -ge "$max_attempts" ]; then
+            return 1
+          fi
+
+          echo "Command failed, retrying (${attempt}/${max_attempts}): $*"
+          attempt=$((attempt + 1))
+          sleep 15
+        done
+      }
+    - retry_before_script npm install -g --prefix "$CI_PROJECT_DIR/.pnpm-bin" pnpm@10.28.2
+
+# Windows 交叉打包专用 before_script：Wine 用于 rcedit，以及跑 NSIS 临时安装包抽出 __uninstaller.exe。
+# 后者需要 wine32；只装 wine64 会在 makensis 阶段报 no files found。
+# wine 体积大且官方 Debian 源在国内慢：优先用预装镜像；否则阿里云源 + 作业 apt 缓存。
+.desktop-before-windows:
+  before_script:
+    - |
+      switch_debian_mirror() {
+        local files=""
+        [ -f /etc/apt/sources.list.d/debian.sources ] && files="$files /etc/apt/sources.list.d/debian.sources"
+        [ -f /etc/apt/sources.list ] && files="$files /etc/apt/sources.list"
+        [ -z "$files" ] && return 0
+        sed -i \
+          -e 's|https\?://deb.debian.org/debian|https://mirrors.aliyun.com/debian|g' \
+          -e 's|https\?://security.debian.org/debian-security|https://mirrors.aliyun.com/debian-security|g' \
+          -e 's|https\?://security.debian.org|https://mirrors.aliyun.com/debian-security|g' \
+          $files
+      }
+
+      apt_get() {
+        apt-get \
+          -o Acquire::Retries=5 \
+          -o Acquire::http::Timeout=30 \
+          -o Dir::Cache="$APT_CACHE_DIR" \
+          -o Dir::Cache::archives="$APT_CACHE_DIR/archives" \
+          "$@"
+      }
+
+      wine32_installed() {
+        dpkg -s wine32 2>/dev/null | grep -q '^Status: install ok installed' \
+          || dpkg -s wine32:i386 2>/dev/null | grep -q '^Status: install ok installed'
+      }
+
+      if command -v wine >/dev/null 2>&1 && wine32_installed && python3 -m venv --help >/dev/null 2>&1; then
+        echo "Wine already present in the image: $(wine --version)"
+      else
+        switch_debian_mirror
+        dpkg --add-architecture i386
+        APT_CACHE_DIR="$CI_PROJECT_DIR/.apt-cache"
+        mkdir -p "$APT_CACHE_DIR/archives/partial"
+        apt_get update
+        # wine32 用于执行 32 位 NSIS 卸载器提取；--no-install-recommends 不会自动装它。
+        apt_get install -y --no-install-recommends \
+          python3-venv ca-certificates wine wine64 wine32
+      fi
+      python3 -m venv --help >/dev/null
+      if ! wine32_installed; then
+        echo "wine32 is required to extract the NSIS uninstaller on Linux"
+        dpkg -l 'wine*' || true
+        exit 1
+      fi
+    - wine --version
+    - export PATH="$CI_PROJECT_DIR/.pnpm-bin/bin:$CI_PROJECT_DIR/.coscmd-venv/bin:$PATH"
+    - mkdir -p "$CI_PROJECT_DIR/.pnpm-bin"
+    - |
+      retry_before_script() {
+        local attempt=1
+        local max_attempts=5
+
+        until "$@"; do
+          if [ "$attempt" -ge "$max_attempts" ]; then
+            return 1
+          fi
+
+          echo "Command failed, retrying (${attempt}/${max_attempts}): $*"
+          attempt=$((attempt + 1))
+          sleep 15
+        done
+      }
+    - retry_before_script npm install -g --prefix "$CI_PROJECT_DIR/.pnpm-bin" pnpm@10.28.2
+
+# 通用 script：retry 工具、版本号、pnpm install、COS 配置、上传工具函数、
+# 按 DESKTOP_TARGET 分发构建参数、构建、mac 签名校验、产物拷贝与上传
+.desktop-script-build:
+  script:
+    - mkdir -p "$CI_PROJECT_DIR/.ci-home"
+    - export PATH="$CI_PROJECT_DIR/.pnpm-bin/bin:$CI_PROJECT_DIR/.coscmd-venv/bin:$PATH"
+    - |
+      retry() {
+        local attempt=1
+        local max_attempts="${RETRY_MAX_ATTEMPTS:-3}"
+
+        until "$@"; do
+          if [ "$attempt" -ge "$max_attempts" ]; then
+            return 1
+          fi
+
+          echo "Command failed, retrying (${attempt}/${max_attempts}): $*"
+          attempt=$((attempt + 1))
+          sleep 15
+        done
+      }
+    - export DESKTOP_VERSION="$(node -p 'require("./frontend/apps/desktop/package.json").version')"
+    - |
+      if [ -z "$DESKTOP_VERSION" ]; then
+        echo "desktop package version is required"
+        exit 1
+      fi
+    - |
+      if [ "$ENV" = "private" ]; then
+        if [ -z "$LEROS_DEPLOY_MODE" ]; then
+          echo "Private desktop build requires LEROS_DEPLOY_MODE (desktop_deploy_mode)"
+          exit 1
+        fi
+        if ! printf '%s' "$LEROS_DEPLOY_MODE" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; then
+          echo "Invalid LEROS_DEPLOY_MODE: $LEROS_DEPLOY_MODE"
+          exit 1
+        fi
+      else
+        if [ -n "${LEROS_DEPLOY_MODE:-}" ] || [ -n "${LEROS_DEPLOY_APP_NAME:-}" ] || [ -n "${LEROS_DEPLOY_S3_DOMAIN:-}" ]; then
+          echo "Ignoring desktop_deploy_mode/desktop_app_name/desktop_s3_domain because environment=$ENV (only used when environment=private)"
+        fi
+        export LEROS_DEPLOY_MODE=""
+        export LEROS_DEPLOY_APP_NAME=""
+        export LEROS_DEPLOY_S3_DOMAIN=""
+      fi
+    - cd frontend
+    - pnpm config set store-dir "$CI_PROJECT_DIR/frontend/.pnpm-store"
+    - pnpm install --frozen-lockfile
+    - HOME="$CI_PROJECT_DIR/.ci-home" coscmd config -a "$COS_SECRET_ID" -s "$COS_SECRET_KEY" -b "$COS_BUCKET" -r "$COS_REGION"
+    - |
+      version="$DESKTOP_VERSION"
+      root_prefix="${DESKTOP_COS_ROOT_PREFIX#/}"
+      root_prefix="${root_prefix%/}"
+      prefix="${DESKTOP_COS_PREFIX#/}"
+      prefix="${prefix%/}"
+      printf '%s\n' "$version" > "$CI_PROJECT_DIR/LATEST.txt"
+      deployment_mode="public"
+      if [ "$ENV" = "private" ]; then
+        deployment_mode="private"
+      fi
+      name_suffix=""
+      private_script_infix=""
+      if [ "$deployment_mode" = "private" ]; then
+        name_suffix="-private"
+        private_script_infix=":private"
+      fi
+
+      upload_dir() {
+        local local_dir="$1"
+        local target_dir="$2"
+
+        if [ ! -d "$local_dir" ]; then
+          echo "Missing desktop payload directory: $local_dir"
+          exit 1
+        fi
+
+        find "$local_dir" -maxdepth 1 -type f -print0 | while IFS= read -r -d '' file_path; do
+          object_key="${prefix}/${target_dir}/$(basename "$file_path")"
+          HOME="$CI_PROJECT_DIR/.ci-home" coscmd upload "$file_path" "$object_key"
+        done
+      }
+
+      upload_file() {
+        local file_path="$1"
+        local target_dir="$2"
+
+        if [ ! -f "$file_path" ]; then
+          echo "Missing desktop payload file: $file_path"
+          exit 1
+        fi
+
+        HOME="$CI_PROJECT_DIR/.ci-home" coscmd upload "$file_path" "${target_dir}/$(basename "$file_path")"
+      }
+
+      case "$DESKTOP_TARGET" in
+        mac-arm64)
+          build_script="dist:desktop${private_script_infix}:mac:arm64"
+          release_dir="desktop-release/mac-arm64"
+          cos_target_dir="darwin/arm64"
+          latest_file="latest-mac.yml"
+          root_installer="Lework-${version}-mac-arm64${name_suffix}.dmg"
+          build_with_signing="true"
+          payload_files="
+            Lework-${version}-mac-arm64${name_suffix}.dmg
+            Lework-${version}-mac-arm64${name_suffix}.zip
+            Lework-${version}-mac-arm64${name_suffix}.dmg.blockmap
+            Lework-${version}-mac-arm64${name_suffix}.zip.blockmap
+          "
+          ;;
+        mac-x64)
+          build_script="dist:desktop${private_script_infix}:mac:x64"
+          release_dir="desktop-release/mac-x64"
+          cos_target_dir="darwin/x64"
+          latest_file="latest-mac.yml"
+          root_installer="Lework-${version}-mac-x64${name_suffix}.dmg"
+          build_with_signing="true"
+          payload_files="
+            Lework-${version}-mac-x64${name_suffix}.dmg
+            Lework-${version}-mac-x64${name_suffix}.zip
+            Lework-${version}-mac-x64${name_suffix}.dmg.blockmap
+            Lework-${version}-mac-x64${name_suffix}.zip.blockmap
+          "
+          ;;
+        win-x64)
+          build_script="dist:desktop${private_script_infix}:win:x64"
+          release_dir="desktop-release/win-x64"
+          cos_target_dir="win32/x64"
+          latest_file="latest.yml"
+          root_installer="Lework-${version}-win-x64${name_suffix}.exe"
+          build_with_signing="false"
+          payload_files="
+            Lework-${version}-win-x64${name_suffix}.exe
+            Lework-${version}-win-x64${name_suffix}.exe.blockmap
+          "
+          ;;
+        linux-x64)
+          build_script="dist:desktop${private_script_infix}:linux:x64"
+          release_dir="desktop-release/linux-x64"
+          cos_target_dir="linux/x64"
+          latest_file="latest-linux.yml"
+          root_installer="Lework-${version}-linux-amd64${name_suffix}.deb"
+          linux_alt_installer="Lework-${version}-linux-x64${name_suffix}.deb"
+          build_with_signing="false"
+          payload_files="
+            Lework-${version}-linux-amd64${name_suffix}.deb
+          "
+          ;;
+        linux-arm64)
+          build_script="dist:desktop${private_script_infix}:linux:arm64"
+          release_dir="desktop-release/linux-arm64"
+          cos_target_dir="linux/arm64"
+          latest_file="latest-linux.yml"
+          root_installer="Lework-${version}-linux-arm64${name_suffix}.deb"
+          linux_alt_installer="Lework-${version}-linux-aarch64${name_suffix}.deb"
+          build_with_signing="false"
+          payload_files="
+            Lework-${version}-linux-arm64${name_suffix}.deb
+          "
+          ;;
+        *)
+          echo "Unsupported DESKTOP_TARGET: $DESKTOP_TARGET"
+          exit 1
+          ;;
+      esac
+
+      cd "$CI_PROJECT_DIR/frontend"
+      if [ "$build_with_signing" = "true" ]; then
+        unset CSC_LINK CSC_KEY_PASSWORD
+        env \
+          APPLE_API_KEY="$CI_PROJECT_DIR/AuthKey.p8" \
+          APPLE_API_KEY_ID="$APPLE_API_KEY_ID" \
+          APPLE_API_ISSUER="$APPLE_API_ISSUER" \
+          CSC_KEYCHAIN="$MACOS_KEYCHAIN_PATH" \
+          CSC_NAME="$MACOS_CSC_NAME" \
+          pnpm run "$build_script"
+      else
+        RETRY_MAX_ATTEMPTS=6 retry env ELECTRON_MIRROR="$ELECTRON_MIRROR" ELECTRON_BUILDER_BINARIES_MIRROR="$ELECTRON_BUILDER_BINARIES_MIRROR" npm_config_electron_mirror="$npm_config_electron_mirror" npm_config_electron_builder_binaries_mirror="$npm_config_electron_builder_binaries_mirror" pnpm run "$build_script"
+      fi
+
+      cd "$CI_PROJECT_DIR"
+      if [ "$build_with_signing" = "true" ]; then
+        dmg_path="frontend/apps/desktop/dist/${root_installer}"
+        if [ ! -f "$dmg_path" ]; then
+          echo "No DMG package found: $dmg_path"
+          exit 1
+        fi
+
+        mount_dir="$(mktemp -d)"
+        cleanup_mounted_dmg() {
+          hdiutil detach "$mount_dir" -quiet || true
+          rmdir "$mount_dir" || true
+        }
+        trap cleanup_mounted_dmg EXIT
+
+        hdiutil attach "$dmg_path" -nobrowse -readonly -mountpoint "$mount_dir"
+        app_path="$(find "$mount_dir" -maxdepth 1 -name '*.app' -print -quit)"
+        if [ -z "$app_path" ]; then
+          echo "No application bundle found in DMG: $dmg_path"
+          exit 1
+        fi
+
+        codesign --verify --deep --strict --verbose=2 "$app_path"
+        spctl --assess --type execute --verbose=2 "$app_path"
+        xcrun stapler validate "$app_path"
+
+        cleanup_mounted_dmg
+        trap - EXIT
+      fi
+
+      if [ -n "${linux_alt_installer:-}" ] && [ ! -f "frontend/apps/desktop/dist/${root_installer}" ] && [ -f "frontend/apps/desktop/dist/${linux_alt_installer}" ]; then
+        cp "frontend/apps/desktop/dist/${linux_alt_installer}" "frontend/apps/desktop/dist/${root_installer}"
+      fi
+
+      mkdir -p "$release_dir"
+      for payload_file in $payload_files; do
+        cp "frontend/apps/desktop/dist/${payload_file}" "$release_dir/" 2>/dev/null || true
+      done
+      cp "frontend/apps/desktop/dist/${latest_file}" "$release_dir/" 2>/dev/null || true
+
+      if [ "$deployment_mode" = "private" ]; then
+        deploy_mode="${LEROS_DEPLOY_MODE}"
+        if [ -z "$deploy_mode" ]; then
+          echo "Private desktop build requires LEROS_DEPLOY_MODE (desktop_deploy_mode)"
+          exit 1
+        elif ! printf '%s' "$deploy_mode" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; then
+          echo "Invalid LEROS_DEPLOY_MODE: $deploy_mode"
+          exit 1
+        else
+          private_prefix="${root_prefix}/private/${deploy_mode}"
+          upload_file "${release_dir}/${root_installer}" "$private_prefix"
+          upload_file "LATEST.txt" "$private_prefix"
+          cos_host="https://${COS_BUCKET}.cos.${COS_REGION}.myqcloud.com"
+          echo "Private installer URL: ${cos_host}/${private_prefix}/${root_installer}"
+          echo "Website hidden download: /download?edition=private&mode=${deploy_mode}"
+        fi
+      else
+        upload_dir "$release_dir" "$cos_target_dir"
+        upload_file "${release_dir}/${root_installer}" "$root_prefix"
+        upload_file "LATEST.txt" "$root_prefix"
+      fi
+
+# ============================================================================
+# 桌面端打包 - 平台 template / job
+# ============================================================================
+
+# 桌面构建公共 template；各平台 job 可覆盖 runner 与 before_script
+.desktop-build-template:
+  stage: desktop_build
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$APP == "desktop"'
+      when: on_success
+    - when: never
+  variables:
+    ELECTRON_CACHE: "$CI_PROJECT_DIR/.electron-cache"
+    electron_config_cache: "$CI_PROJECT_DIR/.electron-cache"
+    ELECTRON_BUILDER_CACHE: "$CI_PROJECT_DIR/.electron-builder-cache"
+    ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
+    ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/"
+    npm_config_electron_mirror: "https://npmmirror.com/mirrors/electron/"
+    npm_config_electron_builder_binaries_mirror: "https://npmmirror.com/mirrors/electron-builder-binaries/"
+    npm_config_registry: "https://registry.npmmirror.com"
+  before_script:
+    - !reference [".desktop-before-base", before_script]
+    - !reference [".desktop-before-mac", before_script]
+  script:
+    - !reference [".desktop-script-build", script]
+  after_script:
+    - |
+      if [ "$DESKTOP_TARGET" = "mac-arm64" ] || [ "$DESKTOP_TARGET" = "mac-x64" ]; then
+        security delete-keychain "$CI_PROJECT_DIR/macos-signing-${CI_JOB_ID}.keychain-db" 2>/dev/null || true
+        rm -f \
+          "$CI_PROJECT_DIR/macos-certificate-${CI_JOB_ID}.p12" \
+          "$CI_PROJECT_DIR/AuthKey.p8"
+      fi
+
+desktop-build-mac-arm64:
+  extends: .desktop-build-template
+  tags:
+    - macos-1
+  variables:
+    DESKTOP_TARGET: mac-arm64
+
+desktop-build-mac-x64:
+  extends: .desktop-build-template
+  tags:
+    - macos-2
+  variables:
+    DESKTOP_TARGET: mac-x64
+
+desktop-build-win-x64:
+  extends: .desktop-build-template
+  # 长期方案：把 wine32 打进 Harbor 镜像后改成 registry.yygu.cn/library/node:24-wine
+  # 构建见 deployments/build/Dockerfile.desktop-ci-win
+  image: registry.yygu.cn/library/node:24
+  tags:
+    - ubuntu
+  cache:
+    key: desktop-win-x64-deps
+    paths:
+      - .apt-cache/
+      - .electron-cache/
+      - .electron-builder-cache/
+      - frontend/.pnpm-store
+    policy: pull-push
+  variables:
+    DESKTOP_TARGET: win-x64
+    # rcedit / NSIS 都不需要 Gecko/Mono；禁止 wine 首次运行再去拉这俩大包。
+    WINEDLLOVERRIDES: "mscoree,mshtml="
+    WINEDEBUG: "-all"
+  before_script:
+    - !reference [".desktop-before-windows", before_script]
+    - !reference [".desktop-before-base", before_script]
+
+desktop-build-linux-x64:
+  extends: .desktop-build-template
+  image: registry.yygu.cn/library/node:24
+  tags:
+    - ubuntu
+  variables:
+    DESKTOP_TARGET: linux-x64
+  before_script:
+    - !reference [".desktop-before-linux", before_script]
+    - !reference [".desktop-before-base", before_script]
+
+desktop-build-linux-arm64:
+  extends: .desktop-build-template
+  image: registry.yygu.cn/library/node:24
+  tags:
+    - ubuntu
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$APP == "desktop" && $ENV == "private"'
+      when: on_success
+    - when: never
+  variables:
+    DESKTOP_TARGET: linux-arm64
+  before_script:
+    - !reference [".desktop-before-linux", before_script]
+    - !reference [".desktop-before-base", before_script]
+
+desktop-update-k3s-client-version:
+  stage: notify
+  image: registry.ap-southeast-1.aliyuncs.com/wa/openrpa:gitlab_cd-2
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$APP == "desktop" && $ENV != "image" && $ENV != "private"'
+      when: on_success
+    - when: never
+  needs:
+    - job: desktop-build-mac-arm64
+      optional: true
+    - job: desktop-build-mac-x64
+      optional: true
+    - job: desktop-build-win-x64
+      optional: true
+    - job: desktop-build-linux-x64
+      optional: true
+    - job: desktop-build-linux-arm64
+      optional: true
+  before_script:
+    - mkdir -p ~/.ssh
+    - |
+      if [ "${ENV}" = "test" ]; then
+          if [ -z "$DEPLOY_HOST_TEST" ]; then
+            echo "Required deploy variable is missing: DEPLOY_HOST_TEST"
+            exit 1
+          fi
+          DEPLOY_HOST="$DEPLOY_HOST_TEST"
+          echo "$SSH_KEY_T29" | base64 -d > ~/.ssh/id_rsa
+          K3S_NAMESPACE="${K3S_NAMESPACE_TEST:-insmtx-test}"
+      elif [ "${ENV}" = "prod" ]; then
+          if [ -z "$DEPLOY_HOST_PROD" ]; then
+            echo "Required deploy variable is missing: DEPLOY_HOST_PROD"
+            exit 1
+          fi
+          if [ -z "$K3S_NAMESPACE_PROD" ]; then
+            echo "Required deploy variable is missing: K3S_NAMESPACE_PROD"
+            exit 1
+          fi
+          DEPLOY_HOST="$DEPLOY_HOST_PROD"
+          echo "$SSH_KEY_P31" | base64 -d > ~/.ssh/id_rsa
+          K3S_NAMESPACE="$K3S_NAMESPACE_PROD"
+      else
+          echo "Unknown ENV: $ENV"
+          exit 1
+      fi
+      export DEPLOY_HOST K3S_NAMESPACE
+    - chmod 600 ~/.ssh/id_rsa
+  script:
+    - export DESKTOP_VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' frontend/apps/desktop/package.json | head -n 1)"
+    - |
+      if [ -z "$DESKTOP_VERSION" ]; then
+        echo "desktop package version is required"
+        exit 1
+      fi
+    - scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no deployments/k3s/update-desktop-latest-version.sh "$DEPLOY_HOST:/tmp/update-desktop-latest-version.sh"
+    - |
+      ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "$DEPLOY_HOST" \
+        "K3S_NAMESPACE='${K3S_NAMESPACE}' K3S_SERVER_DEPLOYMENT='${K3S_SERVER_DEPLOYMENT}' K3S_SERVER_CONFIGMAP='${K3S_SERVER_CONFIGMAP}' K3S_SERVER_CONFIG_KEY='${K3S_SERVER_CONFIG_KEY}' bash /tmp/update-desktop-latest-version.sh '${DESKTOP_VERSION}'"
+
+notify:
+  stage: notify
+  image: registry.ap-southeast-1.aliyuncs.com/wa/openrpa:curl_8.12.1
+  dependencies:
+    - build-image
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$APP == "desktop"'
+      when: never
+    - when: always
+  script:
+    - |
+      if [ -z "$WEWORK_WEBHOOK_KEY" ]; then
+        echo "Required notify variable is missing: WEWORK_WEBHOOK_KEY"
+        exit 1
+      fi
+    - echo "${PIPELINE_STATUS}"
+    - |
+      if [ "${PIPELINE_STATUS}" = "success" ]; then
+        MSG="【${ENV}环境】服务组件${PRJ}/${APP}:${IMAGE_TAG} 更新成功"
+      else
+        MSG="【${ENV}环境】服务组件${PRJ}/${APP}:${IMAGE_TAG} 更新失败"
+      fi
+      curl -H "Content-Type: application/json;charset=utf-8" \
+        -d "{\"msgtype\": \"text\",\"text\": {\"content\":\"${MSG}\"}}" \
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${WEWORK_WEBHOOK_KEY}"
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: always
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: always
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: always
+    - if: $CI_PIPELINE_SOURCE == "api"
+      when: always
+    - when: never

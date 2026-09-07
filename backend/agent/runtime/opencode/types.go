@@ -1,4 +1,4 @@
-// Package opencode 将 OpenCode CLI 适配到 Leros 外部 CLI 引擎接口。
+// Package opencode adapts the OpenCode CLI to the agent Runtime contract.
 // 使用 opencode serve 模式，通过 HTTP REST API + SSE 进行通信。
 package opencode
 
@@ -50,6 +50,10 @@ type messageRequest struct {
 type messagePart struct {
 	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
+	// file part（多模态，对齐 opencode v1 SessionV1.FilePartInput：{type,mime,filename,url}）
+	MIME     string `json:"mime,omitempty"`
+	Filename string `json:"filename,omitempty"`
+	URL      string `json:"url,omitempty"`
 }
 
 // messageResponse 是 POST /session/:id/message 的响应体。
@@ -89,89 +93,117 @@ type sseEvent struct {
 	Properties any    `json:"properties,omitempty"`
 }
 
-// textDeltaProps 是 session.next.text.delta 事件的 properties。
-type textDeltaProps struct {
-	SessionID          string `json:"sessionID"`
-	AssistantMessageID string `json:"assistantMessageID"`
-	TextID             string `json:"textID"`
-	Delta              string `json:"delta"`
+// ============================================================================
+// V1 事件 props（新版 OpenCode V2 session 发布的事件）
+// ============================================================================
+
+// messagePartDeltaProps 是 message.part.delta 事件的 properties。
+type messagePartDeltaProps struct {
+	SessionID string `json:"sessionID"`
+	MessageID string `json:"messageID"`
+	PartID    string `json:"partID"`
+	Field     string `json:"field"`
+	Delta     string `json:"delta"`
 }
 
-// textStartedProps 是 session.next.text.started 事件的 properties。
-type textStartedProps struct {
-	SessionID          string `json:"sessionID"`
-	AssistantMessageID string `json:"assistantMessageID"`
-	TextID             string `json:"textID"`
+// messagePartUpdatedProps 是 message.part.updated 事件的 properties。
+type messagePartUpdatedProps struct {
+	SessionID string `json:"sessionID"`
+	Part      v1Part `json:"part"`
+	Time      int64  `json:"time"`
 }
 
-// textEndedProps 是 session.next.text.ended 事件的 properties。
-type textEndedProps struct {
-	SessionID          string `json:"sessionID"`
-	AssistantMessageID string `json:"assistantMessageID"`
-	TextID             string `json:"textID"`
-	Text               string `json:"text"`
+// messageUpdatedProps is emitted when OpenCode updates message-level metadata.
+type messageUpdatedProps struct {
+	SessionID string        `json:"sessionID"`
+	Info      v1MessageInfo `json:"info"`
 }
 
-// toolInputStartedProps 是 session.next.tool.input.started 事件的 properties。
-type toolInputStartedProps struct {
-	SessionID          string `json:"sessionID"`
-	AssistantMessageID string `json:"assistantMessageID"`
-	CallID             string `json:"callID"`
-	Name               string `json:"name"`
+// sessionUpdatedProps is emitted when OpenCode updates session-level metadata.
+type sessionUpdatedProps struct {
+	SessionID string        `json:"sessionID"`
+	Info      v1MessageInfo `json:"info"`
 }
 
-// toolCalledProps 是 session.next.tool.called 事件的 properties。
-type toolCalledProps struct {
-	SessionID          string         `json:"sessionID"`
-	AssistantMessageID string         `json:"assistantMessageID"`
-	CallID             string         `json:"callID"`
-	Tool               string         `json:"tool"`
-	Input              map[string]any `json:"input"`
+// v1MessageInfo contains the fields needed from OpenCode message/session metadata.
+type v1MessageInfo struct {
+	ID     string    `json:"id,omitempty"`
+	Role   string    `json:"role,omitempty"`
+	Tokens *v1Tokens `json:"tokens,omitempty"`
 }
 
-// toolSuccessProps 是 session.next.tool.success 事件的 properties。
-type toolSuccessProps struct {
-	SessionID          string   `json:"sessionID"`
-	AssistantMessageID string   `json:"assistantMessageID"`
-	CallID             string   `json:"callID"`
-	Tool               string   `json:"tool"`
-	Result             any      `json:"result,omitempty"`
-	OutputPaths        []string `json:"outputPaths,omitempty"`
+// v1Part 是 V1 Part 的多态结构体，按 type 字段区分具体类型。
+type v1Part struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionID"`
+	MessageID string `json:"messageID"`
+	Type      string `json:"type"`
+
+	// text part
+	Text      string `json:"text,omitempty"`
+	Synthetic *bool  `json:"synthetic,omitempty"`
+
+	// step-start part
+	Snapshot string `json:"snapshot,omitempty"`
+
+	// step-finish part
+	Reason string    `json:"reason,omitempty"`
+	Cost   float64   `json:"cost,omitempty"`
+	Tokens *v1Tokens `json:"tokens,omitempty"`
+
+	// tool part
+	CallID string       `json:"callID,omitempty"`
+	Tool   string       `json:"tool,omitempty"`
+	State  *v1ToolState `json:"state,omitempty"`
+
+	// reasoning part
+	// Text field reused
+
+	// agent part
+	Name string `json:"name,omitempty"`
 }
 
-// toolFailedProps 是 session.next.tool.failed 事件的 properties。
-type toolFailedProps struct {
-	SessionID          string `json:"sessionID"`
-	AssistantMessageID string `json:"assistantMessageID"`
-	CallID             string `json:"callID"`
-	Tool               string `json:"tool"`
-	Error              struct {
+// v1Tokens 是 OpenCode 消息或 step-finish part 中的 token 使用量。
+type v1Tokens struct {
+	Total     int `json:"total,omitempty"`
+	Input     int `json:"input"`
+	Output    int `json:"output"`
+	Reasoning int `json:"reasoning"`
+	Cache     struct {
+		Read  int `json:"read"`
+		Write int `json:"write"`
+	} `json:"cache"`
+}
+
+// v1ToolState 是 tool part 的状态，按 status 字段区分。
+type v1ToolState struct {
+	Status string `json:"status"`
+
+	// pending / running / completed / error 共有
+	Input map[string]any `json:"input,omitempty"`
+
+	// running / completed 共有
+	Title string `json:"title,omitempty"`
+
+	// completed 特有
+	Output string `json:"output,omitempty"`
+
+	// error 特有
+	Error string `json:"error,omitempty"`
+
+	// completed / error 共有
+	Metadata map[string]any `json:"metadata,omitempty"`
+}
+
+// sessionErrorProps 是 session.error 事件的 properties（V1 事件，保留）。
+type sessionErrorProps struct {
+	SessionID string `json:"sessionID"`
+	Error     struct {
 		Message string `json:"message"`
+		Data    struct {
+			Message string `json:"message"`
+		} `json:"data"`
 	} `json:"error"`
-}
-
-// stepEndedProps 是 session.next.step.ended 事件的 properties。
-type stepEndedProps struct {
-	SessionID          string  `json:"sessionID"`
-	AssistantMessageID string  `json:"assistantMessageID"`
-	Finish             string  `json:"finish"`
-	Cost               float64 `json:"cost"`
-	Tokens             struct {
-		Input  int `json:"input"`
-		Output int `json:"output"`
-		Cache  struct {
-			Read  int `json:"read"`
-			Write int `json:"write"`
-		} `json:"cache"`
-	} `json:"tokens"`
-}
-
-// reasoningDeltaProps 是 session.next.reasoning.delta 事件的 properties。
-type reasoningDeltaProps struct {
-	SessionID          string `json:"sessionID"`
-	AssistantMessageID string `json:"assistantMessageID"`
-	ReasoningID        string `json:"reasoningID"`
-	Delta              string `json:"delta"`
 }
 
 // ============================================================================
@@ -183,8 +215,20 @@ type configContent struct {
 	Schema     string                    `json:"$schema,omitempty"`
 	Provider   map[string]providerConfig `json:"provider"`
 	Model      string                    `json:"model,omitempty"`
-	Permission map[string]string         `json:"permission,omitempty"`
+	Agent      map[string]agentConfig    `json:"agent,omitempty"`
+	Permission map[string]any            `json:"permission,omitempty"`
 	MCP        map[string]any            `json:"mcp,omitempty"`
+	Skills     *skillsConfig             `json:"skills,omitempty"`
+}
+
+// skillsConfig configures additional OpenCode Skill search paths.
+type skillsConfig struct {
+	Paths []string `json:"paths,omitempty"`
+}
+
+// agentConfig 描述 OpenCode V1 agent 配置。
+type agentConfig struct {
+	Prompt string `json:"prompt,omitempty"`
 }
 
 // providerConfig 描述一个 AI provider 的配置。
@@ -204,14 +248,29 @@ type providerOptions struct {
 
 // modelConfig 描述单个模型的配置。
 type modelConfig struct {
-	ID          string     `json:"id"`
-	Name        string     `json:"name"`
-	Limit       modelLimit `json:"limit"`
-	Cost        modelCost  `json:"cost"`
-	ToolCall    bool       `json:"tool_call"`
-	Attachment  bool       `json:"attachment"`
-	Reasoning   bool       `json:"reasoning"`
-	Temperature bool       `json:"temperature"`
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	Limit       modelLimit      `json:"limit"`
+	Cost        modelCost       `json:"cost"`
+	ToolCall    bool            `json:"tool_call"`
+	Attachment  bool            `json:"attachment"`
+	Reasoning   bool            `json:"reasoning"`
+	Temperature bool            `json:"temperature"`
+	Modalities  *modalityConfig `json:"modalities,omitempty"`
+	// Options 采样参数等透传项，原样进入请求体 providerOptions（驼峰键）。
+	Options map[string]any `json:"options,omitempty"`
+}
+
+// modalityConfig 描述模型的模态能力，对齐 opencode config 的 modalities 字段。
+// 声明 input 中的某个模态时 opencode 判定 capabilities.input.<modality>=true，
+// 对应类型的附件才会传给模型；未声明的模态被降级为提示文本（不整轮失败）。
+// 注意：应只声明该模型真正支持的模态——若声明了模型并不支持的类型
+// （如视频），opencode 会将其原样传给 AI SDK，后者对不支持的 file part
+// 返回硬错误而非优雅降级。output 主要影响模型输出能力的声明
+// （目前源码无运行时门控），同样只声明模型实际支持的输出。
+type modalityConfig struct {
+	Input  []string `json:"input"`
+	Output []string `json:"output,omitempty"`
 }
 
 // modelLimit 描述模型的上下文限制。
@@ -287,7 +346,7 @@ type questionItem struct {
 	Header   string           `json:"header,omitempty"`
 	Options  []questionOption `json:"options"`
 	Multiple bool             `json:"multiple"`
-	Custom   bool             `json:"custom"`
+	Custom   *bool            `json:"custom"`
 }
 
 // questionOption 是问题的单个选项。

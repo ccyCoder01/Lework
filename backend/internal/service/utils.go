@@ -37,3 +37,18 @@ func getCallerFromContext(ctx context.Context) (*types.Caller, error) {
 	}
 	return caller, nil
 }
+
+// mustCallerOrg returns the authenticated caller with a bound org from context.
+// HTTP handlers must register RequireCallerOrg before reaching service code.
+func mustCallerOrg(ctx context.Context) (*types.Caller, error) {
+	caller, _ := auth.FromContext(ctx)
+	if caller == nil || caller.OrgID == 0 || caller.State != types.AuthStateSucc {
+		return nil, errors.New("user not authenticated or org not set")
+	}
+	return caller, nil
+}
+
+// requireCallerOrg is the legacy name for mustCallerOrg; prefer mustCallerOrg in new code.
+func requireCallerOrg(ctx context.Context) (*types.Caller, error) {
+	return mustCallerOrg(ctx)
+}

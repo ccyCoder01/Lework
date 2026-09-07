@@ -30,10 +30,26 @@ type Subscriber interface {
 	// startSeq 指定起始序列号，小于等于 startSeq 的消息不会被投递。
 	// startSeq 为 0 时仅投递订阅之后的新消息。
 	SubscribeFrom(ctx context.Context, topic string, startSeq int64, handler func(msg *nats.Msg)) error
+	// SubscribeManualDurable 使用持久化消费者订阅，由 handler 手动控制消息确认。
+	// handler 接收到原始 *nats.Msg，自行负责调用 Ack、Nak、NakWithDelay 或 Term。
+	// handler 中发生 panic 时自动触发 Nak。
+	SubscribeManualDurable(ctx context.Context, topic string, consumer string, handler func(msg *nats.Msg)) error
 }
 
 // EventBus 组合了发布和订阅能力，提供完整的事件总线功能
 type EventBus interface {
 	Publisher
 	Subscriber
+}
+
+// CoreRequester 提供基于 Core NATS 的同步 request/reply 能力。
+//
+// 与 Publisher.Request（走 JetStream）不同，CoreRequester 使用 Core NATS 的
+// 临时 inbox 直接发送请求并等待单一回复，不进入 JetStream 任务队列、
+// 不污染任务消息流。适用于低频率、需要同步结果的运维类查询（如 Worker 状态）。
+type CoreRequester interface {
+	// RequestReply 向 subject 发送 Core NATS request 并等待单一回复。
+	// 返回原始 NATS 消息，其中包含回复数据；超时或 NATS 不可用时返回错误。
+	// 调用方需保证传入的 ctx 携带超时，以区分超时与连接错误。
+	RequestReply(ctx context.Context, subject string, request any) (*nats.Msg, error)
 }

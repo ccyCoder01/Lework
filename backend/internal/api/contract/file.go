@@ -8,18 +8,19 @@ import (
 type FileService interface {
 	UploadFile(ctx context.Context, req *UploadFileRequest) (*UploadFileResult, error)
 	DownloadFile(ctx context.Context, orgID uint, fileID string) (io.ReadCloser, *FileDownloadInfo, error)
+	DownloadFileByURI(ctx context.Context, orgID uint, storageURI string) (io.ReadCloser, *FileDownloadInfo, error)
 	PresignDownloadURL(ctx context.Context, orgID uint, publicID, storageURI string) (string, error)
 }
 
 type UploadFileRequest struct {
-	OrgID    uint
-	OwnerID  uint
-	File     io.Reader
-	Filename string
-	FileSize int64
-	MimeType string
-	Purpose  string
-	SourceID string
+	OrgID        uint
+	OwnerID      uint
+	File         io.Reader
+	Filename     string
+	MimeType     string
+	Purpose      string
+	SourceID     string
+	RelativePath string
 }
 
 type UploadFileResult struct {

@@ -80,6 +80,7 @@ func (p *Pagination) Fill() {
 type PageQuery struct {
 	Filters    []Filter `json:"filters,omitempty"`
 	OrderBy    []string `json:"order_by,omitempty"`
+	ProjectIDs []uint   `json:"-"`
 	Caller     `json:"-"`
 	Pagination `json:",inline"`
 }

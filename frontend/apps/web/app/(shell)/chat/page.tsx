@@ -1,5 +1,5 @@
-import { ChatRoutePage } from "@/components/route-pages";
+import { NewTaskRoutePage } from "../../../components/route-pages";
 
-export default function ChatPage() {
-	return <ChatRoutePage />;
+export default function Page() {
+	return <NewTaskRoutePage />;
 }

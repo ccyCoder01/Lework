@@ -4,7 +4,58 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"go.uber.org/zap/zapcore"
 )
+
+func TestResolveLogLevel(t *testing.T) {
+	tests := []struct {
+		name  string
+		level string
+		want  zapcore.Level
+		valid bool
+	}{
+		{name: "empty defaults to info", want: zapcore.InfoLevel, valid: true},
+		{name: "debug", level: "debug", want: zapcore.DebugLevel, valid: true},
+		{name: "info", level: "info", want: zapcore.InfoLevel, valid: true},
+		{name: "warn", level: "warn", want: zapcore.WarnLevel, valid: true},
+		{name: "error", level: "error", want: zapcore.ErrorLevel, valid: true},
+		{name: "trimmed and case insensitive", level: " WARN ", want: zapcore.WarnLevel, valid: true},
+		{name: "invalid defaults to info", level: "trace", want: zapcore.InfoLevel},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(envDev, "")
+			got, valid := resolveLogLevel(tt.level)
+			if got != tt.want {
+				t.Fatalf("resolveLogLevel(%q) = %s, want %s", tt.level, got, tt.want)
+			}
+			if valid != tt.valid {
+				t.Fatalf("resolveLogLevel(%q) valid = %v, want %v", tt.level, valid, tt.valid)
+			}
+		})
+	}
+}
+
+func TestResolveLogLevelUsesDevAsFallback(t *testing.T) {
+	t.Setenv(envDev, "true")
+	got, valid := resolveLogLevel("")
+	if got != zapcore.DebugLevel {
+		t.Fatalf("empty log level with LEROS_DEV = %s, want debug", got)
+	}
+	if !valid {
+		t.Fatal("empty log level should be valid")
+	}
+
+	got, valid = resolveLogLevel("error")
+	if got != zapcore.ErrorLevel {
+		t.Fatalf("configured log level with LEROS_DEV = %s, want error", got)
+	}
+	if !valid {
+		t.Fatal("configured error log level should be valid")
+	}
+}
 
 func TestRootCommandHelp(t *testing.T) {
 	tests := []struct {
@@ -21,7 +72,7 @@ func TestRootCommandHelp(t *testing.T) {
 			if err != nil {
 				t.Fatalf("execute help: %v", err)
 			}
-			for _, expected := range []string{"server", "worker", "skill", "login", "logout", "session"} {
+			for _, expected := range []string{"server", "worker", "login", "logout", "session", "skill"} {
 				if !strings.Contains(output, expected) {
 					t.Fatalf("help output missing %q:\n%s", expected, output)
 				}
@@ -46,16 +97,6 @@ func TestCommandHelpFlags(t *testing.T) {
 		args     []string
 		expected []string
 	}{
-		{
-			name:     "skill long help",
-			args:     []string{"skill", "--help"},
-			expected: []string{"Search, install, list, and uninstall skills", "install", "search"},
-		},
-		{
-			name:     "skill short help",
-			args:     []string{"skill", "-h"},
-			expected: []string{"Search, install, list, and uninstall skills", "install", "search"},
-		},
 		{
 			name:     "login help",
 			args:     []string{"login", "--help"},
@@ -177,71 +218,6 @@ func TestNewRootCommandDoesNotDuplicateCommands(t *testing.T) {
 			seen[name] = true
 		}
 	}
-}
-
-func TestSkillCommands(t *testing.T) {
-	t.Run("install no args", func(t *testing.T) {
-		_, err := executeRootCommand("skill", "install")
-		if err == nil {
-			t.Fatal("expected error for install with no args")
-		}
-		if !strings.Contains(err.Error(), "accepts 1 arg") {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-
-	t.Run("search no args", func(t *testing.T) {
-		_, err := executeRootCommand("skill", "search")
-		if err == nil {
-			t.Fatal("expected error for search with no args")
-		}
-		if !strings.Contains(err.Error(), "accepts 1 arg") {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-
-	t.Run("install help", func(t *testing.T) {
-		output, err := executeRootCommand("skill", "install", "--help")
-		if err != nil {
-			t.Fatalf("install help: %v", err)
-		}
-		for _, expected := range []string{"Install a skill", "identifier", "--force", "--yes"} {
-			if !strings.Contains(output, expected) {
-				t.Fatalf("install help missing %q:\n%s", expected, output)
-			}
-		}
-	})
-
-	t.Run("search help", func(t *testing.T) {
-		output, err := executeRootCommand("skill", "search", "--help")
-		if err != nil {
-			t.Fatalf("search help: %v", err)
-		}
-		for _, expected := range []string{"Search for skills", "--limit", "--json"} {
-			if !strings.Contains(output, expected) {
-				t.Fatalf("search help missing %q:\n%s", expected, output)
-			}
-		}
-	})
-
-	t.Run("invalid short name", func(t *testing.T) {
-		_, err := executeRootCommand("skill", "install", "nonexistent-skill-xyz-123")
-		if err == nil {
-			t.Fatal("expected error for nonexistent skill")
-		}
-	})
-
-	t.Run("root help includes skill", func(t *testing.T) {
-		output, err := executeRootCommand("--help")
-		if err != nil {
-			t.Fatalf("root help: %v", err)
-		}
-		for _, expected := range []string{"skill", "Manage skills"} {
-			if !strings.Contains(output, expected) {
-				t.Fatalf("root help missing %q:\n%s", expected, output)
-			}
-		}
-	})
 }
 
 func executeRootCommand(args ...string) (string, error) {

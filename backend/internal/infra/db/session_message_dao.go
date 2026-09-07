@@ -66,14 +66,14 @@ func GetSessionMessagesByIDs(ctx context.Context, db *gorm.DB, sessionID uint, i
 	return entities, nil
 }
 
-// GetRecentProcessingUserMessages returns recent user messages that are currently being answered.
+// GetRecentProcessingUserMessages returns recent user messages awaiting or receiving a reply.
 func GetRecentProcessingUserMessages(ctx context.Context, db *gorm.DB, sessionID uint, since time.Time) ([]*types.SessionMessage, error) {
 	var entities []*types.SessionMessage
 	err := db.WithContext(ctx).
-		Where("session_id = ? AND role = ? AND status = ? AND updated_at >= ?",
+		Where("session_id = ? AND role = ? AND status IN ? AND updated_at >= ?",
 			sessionID,
 			string(types.MessageRoleUser),
-			string(types.MessageStatusProcessing),
+			[]string{string(types.MessageStatusPending), string(types.MessageStatusProcessing)},
 			since,
 		).
 		Order("updated_at DESC").
@@ -189,4 +189,43 @@ func reverse(messages []*types.SessionMessage) {
 	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
 		messages[i], messages[j] = messages[j], messages[i]
 	}
+}
+
+// GetLastAssistantMessageCreatedAt 查询指定 AI 队友在 session 中的最后一条消息的创建时间。
+// 若该队友在 session 中无消息记录，返回 nil。
+func GetLastAssistantMessageCreatedAt(ctx context.Context, db *gorm.DB, sessionID uint, assistantID uint) (*time.Time, error) {
+	if assistantID == 0 {
+		return nil, nil
+	}
+	var entity types.SessionMessage
+	err := db.WithContext(ctx).
+		Where("session_id = ? AND assistant_id = ? AND role = ?", sessionID, assistantID, string(types.MessageRoleAssistant)).
+		Order("created_at DESC").
+		Limit(1).
+		Select("created_at").
+		Find(&entity).Error
+	if err != nil {
+		return nil, err
+	}
+	if entity.CreatedAt.IsZero() {
+		return nil, nil
+	}
+	return &entity.CreatedAt, nil
+}
+
+// GetSessionMessagesInRange 获取指定时间窗口内的 user/assistant 消息（不含已软删），按 sequence 升序。
+func GetSessionMessagesInRange(ctx context.Context, db *gorm.DB, sessionID uint, windowStart time.Time) ([]*types.SessionMessage, error) {
+	var entities []*types.SessionMessage
+	err := db.WithContext(ctx).
+		Where("session_id = ? AND created_at > ? AND role IN ?",
+			sessionID,
+			windowStart,
+			[]string{string(types.MessageRoleUser), string(types.MessageRoleAssistant)},
+		).
+		Order("sequence ASC").
+		Find(&entities).Error
+	if err != nil {
+		return nil, err
+	}
+	return entities, nil
 }

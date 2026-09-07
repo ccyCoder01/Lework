@@ -1,14 +1,14 @@
 package modelrouter
 
 import (
-	"net/http"
 	"strings"
 
+	"github.com/insmtx/Leros/backend/internal/llm"
 	"github.com/insmtx/Leros/backend/pkg/llmprotocol"
 )
 
-// UpstreamConfig describes the complete upstream forwarding configuration.
 type UpstreamConfig struct {
+	ModelID      uint
 	ModelName    string
 	Provider     string
 	BaseURL      string
@@ -18,11 +18,23 @@ type UpstreamConfig struct {
 	MaxTokens    int
 	Temperature  float64
 	TimeoutSec   int
-	httpClient   *http.Client
 }
 
-// protocolForProvider returns the default upstream protocol for a provider.
-// This is modelrouter's own mapping — it does not delegate to llmprotocol.
+func (c UpstreamConfig) ToModelConfig() *llm.ModelConfig {
+	return &llm.ModelConfig{
+		ID:           c.ModelID,
+		Provider:     c.Provider,
+		ModelName:    c.ModelName,
+		BaseURL:      c.BaseURL,
+		BaseURLHasV1: c.BaseURLHasV1,
+		APIKey:       c.APIKey,
+		MaxTokens:    c.MaxTokens,
+		Temperature:  c.Temperature,
+		TimeoutSec:   c.TimeoutSec,
+		Status:       "active",
+	}
+}
+
 func protocolForProvider(provider string) llmprotocol.Protocol {
 	switch strings.ToLower(provider) {
 	case "anthropic":

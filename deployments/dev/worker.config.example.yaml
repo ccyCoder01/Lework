@@ -7,10 +7,23 @@ server_addr: "127.0.0.1:8080"
 workspace_root:
 
 nats:
-  url: "nats://localhost:4223/"
+  url: "nats://localhost:14223/"
 
 log:
   level: debug
+
+logger:
+  default:
+    - writer: console
+      level: debug
+    - writer: cls
+      level: info
+      tencent_cls:
+        topic_id: ${TENCENT_CLS_TOPIC_ID}
+        secret_id: ${TENCENT_CLS_SECRET_ID}
+        secret_key: ${TENCENT_CLS_SECRET_KEY}
+        region: ap-beijing
+        endpoint: ap-beijing.cls.tencentcs.com
 
 cli:
   default: "leros"

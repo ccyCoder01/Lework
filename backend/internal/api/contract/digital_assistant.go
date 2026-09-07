@@ -10,8 +10,8 @@ type DigitalAssistantService interface {
 	// 根据 ID 获取数字助手详情（从上下文获取权限信息）
 	GetDigitalAssistantByID(ctx context.Context, id uint) (*DigitalAssistantDetail, error)
 
-	// 根据 Code 获取数字助手详情（从上下文获取权限信息）
-	GetDigitalAssistantByCode(ctx context.Context, code string) (*DigitalAssistantDetail, error)
+	// 根据 PublicID 获取数字助手详情（从上下文获取权限信息）
+	GetDigitalAssistantByPublicID(ctx context.Context, publicID string) (*DigitalAssistantDetail, error)
 
 	// 更新数字助手信息（从上下文获取权限信息）
 	UpdateDigitalAssistant(ctx context.Context, id uint, req *UpdateDigitalAssistantRequest) (*DigitalAssistant, error)
@@ -22,6 +22,18 @@ type DigitalAssistantService interface {
 	// 查询数字助手列表（从上下文获取权限信息）
 	ListDigitalAssistant(ctx context.Context, req *ListDigitalAssistantRequest) (*DigitalAssistantList, error)
 
+	// 检查当前组织内的数字助手名称是否可用。
+	CheckDigitalAssistantName(ctx context.Context, req *CheckDigitalAssistantNameRequest) (*CheckDigitalAssistantNameResponse, error)
+
 	// 更新数字助手状态（从上下文获取权限信息）
 	UpdateDigitalAssistantStatus(ctx context.Context, id uint, req *UpdateDigitalAssistantStatusRequest) error
+
+	// 基于模板创建数字助手（从上下文获取权限信息）
+	CreateDigitalAssistantFromTemplate(ctx context.Context, req *CreateDigitalAssistantFromTemplateRequest) (*DigitalAssistant, error)
+
+	// 读取 AI 队友共享权限配置。
+	GetDigitalAssistantPermissions(ctx context.Context, publicID string) (*DigitalAssistantPermissionSettingsView, error)
+
+	// 全量更新 AI 队友共享权限配置。
+	UpdateDigitalAssistantPermissions(ctx context.Context, req *UpdateDigitalAssistantPermissionsRequest) (*DigitalAssistantPermissionSettingsView, error)
 }

@@ -62,22 +62,19 @@ func GetProjectsByIDs(ctx context.Context, db *gorm.DB, ids []uint) ([]*types.Pr
 	return entities, nil
 }
 
-// CreateProjectMember 创建项目成员
-func CreateProjectMember(ctx context.Context, db *gorm.DB, member *types.ProjectMember) error {
-	return db.WithContext(ctx).Create(member).Error
-}
-
-// ListProjectMembers 查询项目成员列表
-func ListProjectMembers(ctx context.Context, db *gorm.DB, projectID uint) ([]*types.ProjectMember, error) {
-	var entities []*types.ProjectMember
+// IsProjectUserMember 检查指定用户（uin）是否在项目资源上拥有有效 binding。
+func IsProjectUserMember(ctx context.Context, db *gorm.DB, orgID, uin, projectID uint) (bool, error) {
+	var count int64
 	err := db.WithContext(ctx).
-		Where("project_id = ? AND deleted_at IS NULL", projectID).
-		Order("joined_at ASC").
-		Find(&entities).Error
+		Table(types.TableNameResourceBinding+" AS rb").
+		Joins("INNER JOIN "+types.TableNameResource+" AS r ON r.id = rb.resource_id").
+		Where("r.type = ? AND r.biz_id = ? AND r.org_id = ?", string(types.ResourceTypeProject), projectID, orgID).
+		Where("rb.uin = ? AND rb.deleted_at IS NULL AND r.deleted_at IS NULL", uin).
+		Count(&count).Error
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	return entities, nil
+	return count > 0, nil
 }
 
 // GetProjectSession 根据项目ID获取scope=project的会话
@@ -95,6 +92,80 @@ func GetProjectSession(ctx context.Context, db *gorm.DB, projectID uint) (*types
 	return &entity, nil
 }
 
+// ListProjectIDsByUser 查询用户在组织内通过 resource_binding 可访问的项目 ID 列表。
+func ListProjectIDsByUser(ctx context.Context, db *gorm.DB, orgID, uin uint) ([]uint, error) {
+	var boundBizIDs []uint
+	if err := db.WithContext(ctx).
+		Table(types.TableNameResourceBinding+" AS rb").
+		Select("r.biz_id").
+		Joins("INNER JOIN "+types.TableNameResource+" AS r ON r.id = rb.resource_id").
+		Where("rb.org_id = ? AND rb.uin = ? AND r.type = ?", orgID, uin, string(types.ResourceTypeProject)).
+		Where("rb.deleted_at IS NULL AND r.deleted_at IS NULL").
+		Pluck("r.biz_id", &boundBizIDs).Error; err != nil {
+		return nil, err
+	}
+	return boundBizIDs, nil
+}
+
+// IsProjectAssistantBound 检查助手是否在项目资源上拥有有效 binding。
+func IsProjectAssistantBound(ctx context.Context, db *gorm.DB, orgID, projectID, assistantID uint) (bool, error) {
+	resource, err := GetResourceByBizID(ctx, db, orgID, types.ResourceTypeProject, projectID)
+	if err != nil {
+		return false, err
+	}
+	if resource == nil {
+		return false, nil
+	}
+	binding, err := GetResourceBindingByAssistantID(ctx, db, resource.ID, assistantID)
+	if err != nil {
+		return false, err
+	}
+	return binding != nil, nil
+}
+
+// ResolveBoundProjectAssistantID 解析项目上已绑定的 AI 队友 ID：优先组织默认队友，否则取最新绑定的助手。
+// 未找到时返回 0, nil。
+func ResolveBoundProjectAssistantID(ctx context.Context, db *gorm.DB, orgID, projectID uint) (uint, error) {
+	resource, err := GetResourceByBizID(ctx, db, orgID, types.ResourceTypeProject, projectID)
+	if err != nil {
+		return 0, err
+	}
+	if resource == nil {
+		return 0, nil
+	}
+
+	defaultAssistantID, err := GetDefaultAssistantIDByOrg(ctx, db, orgID)
+	if err != nil {
+		return 0, err
+	}
+	if defaultAssistantID > 0 {
+		binding, err := GetResourceBindingByAssistantID(ctx, db, resource.ID, defaultAssistantID)
+		if err != nil {
+			return 0, err
+		}
+		if binding != nil {
+			return defaultAssistantID, nil
+		}
+	}
+
+	bindings, err := ListResourceBindingsByResourceID(ctx, db, resource.ID)
+	if err != nil {
+		return 0, err
+	}
+	var latestAssistantID uint
+	var latestBindingID uint
+	for _, b := range bindings {
+		if b.AssistantID == nil || *b.AssistantID == 0 {
+			continue
+		}
+		if b.ID > latestBindingID {
+			latestBindingID = b.ID
+			latestAssistantID = *b.AssistantID
+		}
+	}
+	return latestAssistantID, nil
+}
+
 // ListProjects 查询项目列表，使用 PageQuery 作为查询参数
 func ListProjects(ctx context.Context, d *gorm.DB, opt *types.PageQuery) ([]*types.Project, int64, error) {
 	var entities []*types.Project
@@ -102,8 +173,8 @@ func ListProjects(ctx context.Context, d *gorm.DB, opt *types.PageQuery) ([]*typ
 
 	query := d.WithContext(ctx).Table(types.TableNameProject).
 		Where("org_id = ? AND deleted_at IS NULL", opt.OrgID)
-	if opt.Uin > 0 {
-		query = query.Where("owner_id = ?", opt.Uin)
+	if len(opt.ProjectIDs) > 0 {
+		query = query.Where("id IN (?)", opt.ProjectIDs)
 	}
 
 	for _, filter := range opt.Filters {

@@ -1,0 +1,17 @@
+{
+  "month": "2026-06",
+  "records": [
+    {
+      "name": "张三",
+      "project": "A项目",
+      "category": "外聘",
+      "actual_work_days": 23,
+      "marked_work_days": 23,
+      "personal_leave_days": 1,
+      "sick_leave_days": 0,
+      "absent_days": 0,
+      "daily_marks": ["8", "8", "事", "8"],
+      "source": "视觉识别：A项目/第1页/第8行"
+    }
+  ]
+}

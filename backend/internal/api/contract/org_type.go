@@ -1,81 +1,47 @@
 package contract
 
-import (
-	"time"
-
-	"github.com/insmtx/Leros/backend/types"
-)
+import "github.com/insmtx/Leros/backend/internal/adapter/account"
 
 type Org struct {
-	PublicID  string    `json:"public_id"`
-	Type      string    `json:"type"`
-	Code      string    `json:"code"`
-	Name      string    `json:"name"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	account.Org
 }
 
 type CreateOrgRequest struct {
-	Name   string `json:"name" binding:"required"`
-	Code   string `json:"code" binding:"required"`
-	Type   string `json:"type,omitempty"`
-	Status string `json:"status,omitempty"`
+	account.CreateOrgInput
 }
 
 type UpdateOrgRequest struct {
-	Name   *string `json:"name,omitempty"`
-	Type   *string `json:"type,omitempty"`
-	Status *string `json:"status,omitempty"`
+	account.UpdateOrgInput
 }
 
 type ListOrgsRequest struct {
-	Keyword *string `json:"keyword,omitempty"`
-	Status  *string `json:"status,omitempty"`
-	types.Pagination
+	account.ListOrgsInput
 }
 
 type OrgList struct {
-	Total  int64 `json:"total"`
-	Offset int   `json:"offset"`
-	Limit  int   `json:"limit"`
-	Items  []Org `json:"items"`
+	account.OrgList
 }
 
 type OrgMember struct {
-	ID        uint      `json:"id"`
-	Uin       uint      `json:"uin"`
-	UserID    string    `json:"user_id"`
-	OrgID     string    `json:"org_id"`
-	IsDefault bool      `json:"is_default"`
-	UserName  string    `json:"user_name,omitempty"`
-	UserLogin string    `json:"user_login,omitempty"`
-	AvatarURL string    `json:"avatar_url,omitempty"`
-	OrgName   string    `json:"org_name,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	account.OrgMember
+}
+
+type OrgMemberDepartment struct {
+	account.OrgMemberDepartment
 }
 
 type CreateOrgMemberRequest struct {
-	UserID    string `json:"user_id" binding:"required"`
-	OrgID     string `json:"org_id" binding:"required"`
-	IsDefault bool   `json:"is_default,omitempty"`
+	account.CreateOrgMemberInput
 }
 
 type UpdateOrgMemberRequest struct {
-	OrgID     *string `json:"org_id,omitempty"`
-	IsDefault *bool   `json:"is_default,omitempty"`
+	account.UpdateOrgMemberInput
 }
 
 type ListOrgMembersRequest struct {
-	OrgID  *string `json:"org_id,omitempty"`
-	UserID *string `json:"user_id,omitempty"`
-	types.Pagination
+	account.ListOrgMembersInput
 }
 
 type OrgMemberList struct {
-	Total  int64       `json:"total"`
-	Offset int         `json:"offset"`
-	Limit  int         `json:"limit"`
-	Items  []OrgMember `json:"items"`
+	account.OrgMemberList
 }

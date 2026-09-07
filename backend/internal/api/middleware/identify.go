@@ -2,19 +2,20 @@ package middleware
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
 	"github.com/gin-gonic/gin"
-	ygauth "github.com/ygpkg/yg-go/apis/runtime/auth"
-	"github.com/ygpkg/yg-go/encryptor/snowflake"
+	"github.com/google/uuid"
+	"github.com/ygpkg/yg-go/apis/constants"
 	"github.com/ygpkg/yg-go/logs"
 	"gorm.io/gorm"
 
+	adapteraccount "github.com/insmtx/Leros/backend/internal/adapter/account"
 	localauth "github.com/insmtx/Leros/backend/internal/api/auth"
-	"github.com/insmtx/Leros/backend/internal/infra/db"
 	"github.com/insmtx/Leros/backend/types"
 )
 
@@ -23,126 +24,134 @@ const (
 	headerKeyTraceID   = "X-Trace-ID"
 )
 
-// CallerMiddleware .
-func CallerMiddleware(jwtSecret string, database *gorm.DB) gin.HandlerFunc {
+var skipAuthPaths = map[string]bool{
+	"/v1/RegisterByEmail":    true,
+	"/v1/LoginByPassword":    true,
+	"/v1/SendPhoneLoginCode": true,
+	"/v1/LoginByPhoneCode":   true,
+	"/v1/RefreshToken":       true,
+	"/v1/ChooseUin":          true,
+	"/v1/CreateOrganization": true,
+}
+
+// TokenParser is an alias for account.TokenParser so callers in
+// api/handler (which cannot import account directly due to import
+// cycles) can reference the parser contract through this package.
+type TokenParser = adapteraccount.TokenParser
+
+// CallerMiddleware parses the Authorization header via the injected
+// TokenParser and stores the resulting Caller/Trace in the gin context.
+func CallerMiddleware(parser adapteraccount.TokenParser, database *gorm.DB) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
 		reqID := ctx.Request.Header.Get(headerKeyRequestID)
 		if reqID == "" {
-			reqID = snowflake.GenerateIDBase58()
+			reqID = strings.ReplaceAll(uuid.NewString(), "-", "")
 		}
 		traceID := ctx.Request.Header.Get(headerKeyTraceID)
 		if traceID == "" {
 			traceID = reqID
 		}
+		ctx.Set(constants.CtxKeyRequestID, reqID)
+		ctx.Header(headerKeyRequestID, reqID)
+		logs.SetContextFields(ctx, "req_id", reqID)
+		requestCtx := context.WithValue(ctx.Request.Context(), constants.CtxKeyRequestID, reqID)
+		ctx.Request = ctx.Request.WithContext(logs.WithContextFields(
+			requestCtx, "req_id", reqID,
+		))
 
-		caller := parseCallerFromRequest(ctx, jwtSecret, database, reqID)
+		caller, tokenStr := parseCallerFromRequest(ctx, parser)
 
-		localauth.WithGinContext(ctx, caller, &types.Trace{
+		trace := &types.Trace{
 			RequestID: reqID,
 			TraceID:   traceID,
 			SpanID:    []string{},
-		})
+		}
+		if tokenStr != "" {
+			reqCtx := localauth.WithBearerToken(ctx.Request.Context(), tokenStr)
+			ctx.Request = ctx.Request.WithContext(reqCtx)
+		}
+		localauth.WithGinContext(ctx, caller, trace, tokenStr)
+		ctx.Request = ctx.Request.WithContext(localauth.WithContext(ctx.Request.Context(), caller, trace))
 		ctx.Next()
 	}
 }
 
-func parseCallerFromRequest(ctx *gin.Context, jwtSecret string, database *gorm.DB, reqID string) *types.Caller {
+func parseCallerFromRequest(ctx *gin.Context, parser adapteraccount.TokenParser) (*types.Caller, string) {
 	if os.Getenv("LEROS_DEV") == "true" {
 		return &types.Caller{
 			Uin:   1,
 			OrgID: 1,
 			Kind:  types.CallerKindUser,
 			State: types.AuthStateSucc,
-		}
+		}, ""
 	}
+
+	if skipAuthPaths[ctx.Request.URL.Path] {
+		authHeader := ctx.Request.Header.Get("Authorization")
+		if authHeader != "" {
+			tokenStr := extractTokenFromHeader(authHeader)
+			if tokenStr != "" {
+				reqCtx, cancel := context.WithTimeout(ctx.Request.Context(), 5*time.Second)
+				defer cancel()
+				userCaller, userErr := parser.ParseUser(reqCtx, tokenStr)
+				if userErr == nil && userCaller != nil && userCaller.State == types.AuthStateSucc {
+					return userCaller, tokenStr
+				}
+				return &types.Caller{State: types.AuthStateNil}, tokenStr
+			}
+		}
+		return &types.Caller{State: types.AuthStateNil}, ""
+	}
+
 	authHeader := ctx.Request.Header.Get("Authorization")
 	if authHeader == "" {
 		return &types.Caller{
 			Uin:   0,
 			OrgID: 0,
 			State: types.AuthStateNil,
-		}
+		}, ""
 	}
 
 	tokenStr := extractTokenFromHeader(authHeader)
 	if tokenStr == "" {
-		logs.Debugw("no valid token found in request", "authHeader", authHeader, "reqID", reqID)
+		logs.DebugContextw(ctx, "no valid token found in request", "authHeader", authHeader)
 		return &types.Caller{
 			Uin:   0,
 			OrgID: 0,
 			State: types.AuthStateNil,
-		}
+		}, ""
 	}
 
-	userClaims, err := parseJWTToken(tokenStr, jwtSecret)
-	if err != nil {
-		if workerCaller, workerErr := parseWorkerCaller(tokenStr, jwtSecret); workerErr == nil {
-			return workerCaller
-		} else {
-			logs.Warnw("parse auth token failed", "user_error", err, "worker_error", workerErr)
-		}
-		return failedCaller()
-	}
-
-	if userClaims.Uin == 0 {
-		if workerCaller, workerErr := parseWorkerCaller(tokenStr, jwtSecret); workerErr == nil {
-			return workerCaller
-		}
-		return failedCaller()
-	}
-
-	queryCtx, cancel := context.WithTimeout(ctx.Request.Context(), 3*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	userOrg, err := db.GetUserOrgByUin(queryCtx, database, userClaims.Uin)
-	if err != nil {
-		logs.Warnw("get user org by uin failed, db error", "error", err, "uin", userClaims.Uin, "reqID", ctx.Request.Header.Get(headerKeyRequestID))
-		return &types.Caller{
-			Uin:   userClaims.Uin,
-			OrgID: 0,
-			Kind:  types.CallerKindUser,
-			State: types.AuthStateFailed,
+	if isWorkerToken(tokenStr) {
+		workerCaller, workerErr := parser.ParseWorker(reqCtx, tokenStr)
+		if workerErr == nil && workerCaller != nil && workerCaller.State == types.AuthStateSucc {
+			return workerCaller, tokenStr
 		}
-	}
-
-	if userOrg == nil {
-		logs.Warnw("user org not found", "uin", userClaims.Uin)
-		return &types.Caller{
-			Uin:   userClaims.Uin,
-			OrgID: 0,
-			Kind:  types.CallerKindUser,
-			State: types.AuthStateFailed,
+		if workerErr != nil {
+			logs.WarnContextw(ctx, "parse worker token failed", "error", workerErr)
 		}
+		return &types.Caller{State: types.AuthStateFailed}, tokenStr
 	}
 
-	return &types.Caller{
-		Uin:   userClaims.Uin,
-		OrgID: userOrg.OrgID,
-		Kind:  types.CallerKindUser,
-		State: types.AuthStateSucc,
+	userCaller, userErr := parser.ParseUser(reqCtx, tokenStr)
+	if userErr == nil && userCaller != nil && userCaller.State == types.AuthStateSucc {
+		return userCaller, tokenStr
 	}
-}
+	if userErr != nil {
+		logs.DebugContextw(ctx, "parse user token failed", "error", userErr)
+	}
 
-func parseWorkerCaller(tokenStr, jwtSecret string) (*types.Caller, error) {
-	claims, err := localauth.ParseWorkerToken(tokenStr, jwtSecret)
-	if err != nil {
-		return nil, err
+	workerCaller, workerErr := parser.ParseWorker(reqCtx, tokenStr)
+	if workerErr == nil && workerCaller != nil && workerCaller.State == types.AuthStateSucc {
+		return workerCaller, tokenStr
 	}
-	return &types.Caller{
-		Uin:      0,
-		OrgID:    claims.OrgID,
-		WorkerID: claims.WorkerID,
-		Kind:     types.CallerKindWorker,
-		State:    types.AuthStateSucc,
-	}, nil
-}
-
-func failedCaller() *types.Caller {
-	return &types.Caller{
-		Uin:   0,
-		OrgID: 0,
-		State: types.AuthStateFailed,
+	if workerErr != nil {
+		logs.WarnContextw(ctx, "parse auth token failed", "user_error", userErr, "worker_error", workerErr)
 	}
+	return &types.Caller{State: types.AuthStateFailed}, tokenStr
 }
 
 func extractTokenFromHeader(authHeader string) string {
@@ -152,13 +161,20 @@ func extractTokenFromHeader(authHeader string) string {
 	return strings.TrimSpace(authHeader)
 }
 
-func parseJWTToken(tokenStr, jwtSecret string) (*ygauth.UserClaims, error) {
-	claims := &ygauth.UserClaims{}
-	_, err := jwt.ParseWithClaims(tokenStr, claims, func(token *jwt.Token) (interface{}, error) {
-		return []byte(jwtSecret), nil
-	})
-	if err != nil {
-		return nil, err
+func isWorkerToken(tokenStr string) bool {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) < 2 {
+		return false
 	}
-	return claims, nil
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	var payload struct {
+		Aud string `json:"aud"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false
+	}
+	return payload.Aud == "worker"
 }

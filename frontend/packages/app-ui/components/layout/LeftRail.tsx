@@ -2,13 +2,19 @@
 
 import type { AuthUser, NavItem, Project, ProjectTask, ViewMode } from "@leros/store";
 import {
-	authenticatedFetch,
-	getFileDownloadUrl,
+	Action,
+	getNativeFileInputAccept,
+	isPrivateDeployment,
+	LEFT_RAIL_MAX_WIDTH,
+	LEFT_RAIL_MIN_WIDTH,
 	projectFileApi,
 	useAuthStore,
 	useChatStore,
+	useGlobalConfigStore,
 	useLayoutStore,
+	useProjectsMenuCapabilities,
 	userApi,
+	useTaskCapabilities,
 } from "@leros/store";
 import { Button } from "@leros/ui/components/ui/button";
 import {
@@ -23,13 +29,16 @@ import {
 	DropdownMenu,
 	DropdownMenuContent,
 	DropdownMenuItem,
-	DropdownMenuSeparator,
 	DropdownMenuTrigger,
 } from "@leros/ui/components/ui/dropdown-menu";
 import { Input } from "@leros/ui/components/ui/input";
-import { ScrollArea } from "@leros/ui/components/ui/scroll-area";
 import { cn } from "@leros/ui/lib/utils";
 import {
+	ArrowLeft,
+	ArrowLeftRight,
+	Blocks,
+	Bot,
+	Building2,
 	Camera,
 	Check,
 	ChevronDown,
@@ -37,23 +46,25 @@ import {
 	ChevronsLeft,
 	ChevronsRight,
 	ClipboardList,
-	Database,
+	Clock,
+	Contact,
 	ExternalLink,
-	Folder,
-	FolderKanban,
-	FolderOpen,
-	Hash,
+	FileText,
+	Inbox,
+	LayoutDashboard,
 	Loader2,
 	LogOut,
+	MessageSquare,
 	MoreHorizontal,
 	Network,
 	Pencil,
 	RefreshCcw,
+	Search,
+	Settings,
 	Trash2,
 	UserRound,
 	Users,
 	X,
-	Zap,
 } from "lucide-react";
 import type { ChangeEvent, CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -61,14 +72,38 @@ import { toast } from "sonner";
 import { APP_LOGO_SRC } from "../../assets";
 import { useAuth } from "../auth";
 import { DiceBearAvatar } from "../avatar/DiceBearAvatar";
+import {
+	blobToDataURL,
+	cacheProtectedImageDataURL,
+	ProtectedImage,
+} from "../avatar/ProtectedImage";
+import { ListLoadMoreSentinel } from "../common/ListLoadMoreSentinel";
+import { FeedbackDialog } from "../feedback/FeedbackDialog";
+import { OrganizationSwitchPanel } from "../org-admin/OrganizationSwitchPanel";
+import { CanGate } from "../permission/CanGate";
+import { useBrandIdentity } from "../private-deployment/useBrandIdentity";
+import { ProjectActionsDropdown } from "../project/ProjectActionsDropdown";
+import { preventRailMenuClickThrough, runRailMenuAction } from "../project/ProjectActionsMenu";
+import { usePaginatedProjectList } from "../project/usePaginatedProjectList";
+import { GlobalTaskSearchDialog } from "./GlobalTaskSearchDialog";
 import { getRecentProjectsForLeftRail } from "./left-rail-list-utils";
+import { ProjectIcon } from "./project-icon";
 
-const LEFT_RAIL_WIDTH_STORAGE_KEY = "leros-left-rail-width";
-const LEFT_RAIL_COLLAPSED_STORAGE_KEY = "leros-left-rail-collapsed";
-const AVATAR_CACHE_PREFIX = "leros-avatar-cache:";
-const LEFT_RAIL_COLLAPSED_WIDTH = 72;
-const RECENT_PROJECT_LIMIT = 5;
-const PROJECT_TASK_PREVIEW_LIMIT = 5;
+const LEFT_RAIL_COLLAPSED_WIDTH = 50;
+// 中文注释：设计稿要求项目展开后先预览 10 条任务，点“展开显示”后再展示全部任务。
+const PROJECT_TASK_PREVIEW_LIMIT = 10;
+
+function blurFocusedElement() {
+	requestAnimationFrame(() => {
+		(document.activeElement as HTMLElement | null)?.blur();
+	});
+}
+
+function handleRailMenuOpenChange(open: boolean) {
+	if (!open) {
+		blurFocusedElement();
+	}
+}
 
 type PublicEnv = {
 	readonly VITE_LEROS_APP_VERSION?: string;
@@ -78,27 +113,58 @@ export type AppNavigation = {
 	currentPath: string;
 	goToRoute: (route: ViewMode) => void;
 	goToProject: (projectId: string) => void;
-	goToTaskDetail: (projectId: string, taskId: string, sessionId?: string | null) => void;
+	goToProjectTasks: (projectId: string) => void;
+	goToTaskDetail: (projectId: string, taskId: string, sessionId: string) => void;
+	goToAutomationDetail: (publicId: string) => void;
 };
 
 const iconMap: Record<string, React.ReactNode> = {
 	IconTask: <ClipboardList className="size-5" />,
 	IconAITeammate: <Users className="size-5" />,
-	IconProjectsHub: <FolderKanban className="size-5" />,
-	IconSkill: <Zap className="size-5" />,
-	IconKnowledge: <Database className="size-5" />,
-	IconProject: <Hash className="size-4" />,
+	IconOrgProfile: <FileText className="size-5" />,
+	IconOrgContacts: <Contact className="size-5" />,
+	IconOrgModels: <Bot className="size-5" />,
+	IconProjectsHub: <ProjectIcon className="size-5" />,
+	IconWorkbench: <LayoutDashboard className="size-5" />,
+	IconSkill: <Blocks className="size-5" />,
+	IconKnowledge: <Inbox className="size-5" />,
+	IconAutomation: <Clock className="size-5" />,
+	IconProject: <ProjectIcon className="size-4" />,
 };
 
 const navIdToView: Record<string, ViewMode> = {
+	chat: "chat",
 	workbench: "workbench",
-	"ai-teammates": "aiTeammates",
 	"projects-hub": "projectsHub",
 	knowledge: "knowledge",
 	skills: "skills",
+	automation: "automation",
+	"org-profile": "orgProfile",
+	"org-departments": "orgDepartments",
+	"org-assistants": "orgAssistants",
+	"org-models": "orgModels",
 };
 
-const protectedNavIds = new Set(["skills", "knowledge"]);
+const ORG_ADMIN_NAV_ITEMS: NavItem[] = [
+	{ id: "org-profile", label: "组织信息管理", icon: "IconOrgProfile" },
+	{ id: "org-departments", label: "通讯录", icon: "IconOrgContacts" },
+	{ id: "org-assistants", label: "AI队友", icon: "IconAITeammate" },
+	{ id: "org-models", label: "模型管理", icon: "IconOrgModels" },
+];
+
+function isOrgAdminPath(path?: string): boolean {
+	return Boolean(path?.startsWith("/org"));
+}
+
+function isOrgAdminView(view: ViewMode): boolean {
+	return (
+		view === "orgProfile" ||
+		view === "orgDepartments" ||
+		view === "orgAssistants" ||
+		view === "orgModels"
+	);
+}
+
 const appVersion = getAppVersion();
 const brandVersionLabel = appVersion.startsWith("v") ? appVersion : `v${appVersion}`;
 
@@ -109,57 +175,85 @@ export function LeftRail({
 	logoSrc?: string;
 	navigation?: AppNavigation;
 }) {
+	const { logo: customBrandLogo, name: brandName } = useBrandIdentity();
 	const {
 		navGroups,
-		projects,
 		currentView,
 		activeProjectId,
 		activeTaskDetailProjectId,
 		activeTaskDetailTaskId,
 		leftRailCollapsed,
 		leftRailWidth,
-		fetchProjects,
 		fetchTasks,
 		deleteProject,
 		deleteTask,
+		leaveProject,
 		setLeftRailCollapsed,
 		setLeftRailWidth,
 		switchView,
 		switchProject,
+		setProjectRoute,
 		openTaskDetail,
 		updateProject,
 		updateTask,
 	} = useLayoutStore((s) => s);
 	const clearComposerInput = useChatStore((s) => s.clearComposerInput);
 	const setAuthUser = useAuthStore((s) => s.setAuthUser);
+	const edition = useGlobalConfigStore((s) => s.edition);
 	const { isHydrated, isAuthenticated, openAuthDialog, requireAuth, logout, user } = useAuth();
-	const hasLoadedPreferenceRef = useRef(false);
+	// 中文注释：OSS 版无多组织切换，隐藏左下角用户菜单中的「切换组织」入口。
+	const canSwitchOrganization = edition !== "oss";
+	const projectList = usePaginatedProjectList({
+		enabled: isAuthenticated,
+		includeCachedProjects: true,
+	});
+	const visibleProjects = isAuthenticated ? projectList.projects : [];
+	useProjectsMenuCapabilities(visibleProjects.map((project) => project.id));
 	const [renameProject, setRenameProject] = useState<Project | null>(null);
 	const [renameTask, setRenameTask] = useState<ProjectTask | null>(null);
 	const [renameValue, setRenameValue] = useState("");
 	const [renameTaskValue, setRenameTaskValue] = useState("");
 	const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
-	const [deleteTaskTarget, setDeleteTaskTarget] = useState<ProjectTask | null>(null);
+	const [leaveTarget, setLeaveTarget] = useState<Project | null>(null);
+	const [deleteTaskTarget, setDeleteTaskTarget] = useState<{
+		task: ProjectTask;
+		projectId: string;
+	} | null>(null);
 	const [accountDialogOpen, setAccountDialogOpen] = useState(false);
+	const [orgSwitchDialogOpen, setOrgSwitchDialogOpen] = useState(false);
+	const [orgSwitchPanelMode, setOrgSwitchPanelMode] = useState<"switch" | "create">("switch");
+	const [feedbackDialogOpen, setFeedbackDialogOpen] = useState(false);
+	const [globalTaskSearchOpen, setGlobalTaskSearchOpen] = useState(false);
 	const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(() => new Set());
 	const [expandedTaskProjectIds, setExpandedTaskProjectIds] = useState<Set<string>>(
 		() => new Set(),
 	);
 	const [taskLoadedProjectIds, setTaskLoadedProjectIds] = useState<Set<string>>(() => new Set());
+	const [loadingTaskProjectIds, setLoadingTaskProjectIds] = useState<Set<string>>(() => new Set());
+
+	const resetProjectExpansionState = useCallback(() => {
+		setExpandedProjectIds(new Set());
+		setExpandedTaskProjectIds(new Set());
+		setTaskLoadedProjectIds(new Set());
+		setLoadingTaskProjectIds(new Set());
+	}, []);
 
 	/* ── Desktop update notifier ── */
 	const [promptOpen, setPromptOpen] = useState(false);
-	const [downloadedVersion, setDownloadedVersion] = useState<string | undefined>(undefined);
+	const [desktopUpdateState, setDesktopUpdateState] = useState<DesktopUpdateState | null>(null);
 	const [installing, setInstalling] = useState(false);
 	const [installError, setInstallError] = useState<string | null>(null);
 	const previousPhaseRef = useRef<DesktopUpdateState["phase"] | null>(null);
 	const previousVersionRef = useRef<string | undefined>(undefined);
 	const snoozeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const updatePromptSnoozeMs = 5 * 60 * 1000;
+	const updatePromptRefreshMs = 2 * 60 * 1000;
 	const versionUpdateImageSrc = new URL(
 		"../../../../apps/desktop/resources/octopus_version_update.png",
 		import.meta.url,
 	).href;
+	const promptVersion =
+		desktopUpdateState?.downloadedVersion ?? desktopUpdateState?.availableVersion;
 
 	const clearSnoozeTimer = () => {
 		if (snoozeTimerRef.current) {
@@ -168,16 +262,15 @@ export function LeftRail({
 		}
 	};
 
-	const openUpdatePrompt = (version?: string) => {
+	const openUpdatePrompt = () => {
 		clearSnoozeTimer();
-		setDownloadedVersion(version);
 		setInstallError(null);
 		setPromptOpen(true);
 	};
 
 	const snoozeUpdatePrompt = () => {
 		setPromptOpen(false);
-		if (!downloadedVersion || installing) return;
+		if (!promptVersion || installing) return;
 		clearSnoozeTimer();
 		snoozeTimerRef.current = setTimeout(() => {
 			setPromptOpen(true);
@@ -193,14 +286,16 @@ export function LeftRail({
 
 		void api.getState().then((state) => {
 			if (!mounted) return;
+			setDesktopUpdateState(state);
 			previousPhaseRef.current = state.phase;
 			previousVersionRef.current = state.availableVersion ?? state.downloadedVersion;
 			if (state.phase === "downloaded") {
-				openUpdatePrompt(state.downloadedVersion ?? state.availableVersion);
+				openUpdatePrompt();
 			}
 		});
 
 		const unsubscribe = api.subscribe((state) => {
+			setDesktopUpdateState(state);
 			const previousPhase = previousPhaseRef.current;
 			const previousVersion = previousVersionRef.current;
 			const nextVersion = state.availableVersion ?? state.downloadedVersion;
@@ -209,7 +304,7 @@ export function LeftRail({
 				state.phase === "downloaded" &&
 				(previousPhase !== "downloaded" || previousVersion !== nextVersion)
 			) {
-				openUpdatePrompt(nextVersion);
+				openUpdatePrompt();
 			}
 
 			previousPhaseRef.current = state.phase;
@@ -222,6 +317,37 @@ export function LeftRail({
 			unsubscribe();
 		};
 	}, []);
+
+	useEffect(() => {
+		if (!promptOpen) return;
+
+		const api = getDesktopUpdateApi();
+		if (!api) return;
+
+		let cancelled = false;
+
+		const refreshPromptUpdateState = async () => {
+			const state = await api.getState().catch(() => null);
+			if (!state || cancelled) return;
+			setDesktopUpdateState(state);
+
+			if (!state.canCheck || state.phase === "checking" || state.phase === "downloading") {
+				return;
+			}
+
+			const nextState = await api.checkForUpdates().catch(() => null);
+			if (!nextState || cancelled) return;
+			setDesktopUpdateState(nextState);
+		};
+
+		void refreshPromptUpdateState();
+		const intervalId = setInterval(refreshPromptUpdateState, updatePromptRefreshMs);
+
+		return () => {
+			cancelled = true;
+			clearInterval(intervalId);
+		};
+	}, [promptOpen]);
 
 	const handleInstallNow = async () => {
 		setInstalling(true);
@@ -247,40 +373,37 @@ export function LeftRail({
 	/* ── end Desktop update notifier ── */
 
 	useEffect(() => {
-		fetchProjects();
-	}, [fetchProjects]);
+		if (isAuthenticated) return;
+		resetProjectExpansionState();
+	}, [isAuthenticated, resetProjectExpansionState]);
+
+	// 中文注释：组织切换后应重置项目展开态，避免沿用上一组织的展开记录并误显示“暂无任务”。
+	useEffect(() => {
+		if (user?.currentOrg?.id == null) return;
+		resetProjectExpansionState();
+	}, [user?.currentOrg?.id, resetProjectExpansionState]);
+
+	// 中文注释：组织管理入口按 AuthSession 返回的 is_admin 判断，当前组织为管理员即可进入。
+	const currentOrgMeta =
+		user?.organizations?.find((org) => org.id === user?.currentOrg?.id) ?? user?.currentOrg;
+	const isOrgAdmin = Boolean(currentOrgMeta?.isAdmin);
+
+	const inOrgAdminMode = navigation
+		? isOrgAdminPath(navigation.currentPath)
+		: isOrgAdminView(currentView);
 
 	useEffect(() => {
-		if (typeof window === "undefined" || hasLoadedPreferenceRef.current) return;
-		hasLoadedPreferenceRef.current = true;
-
-		const savedWidth = window.localStorage.getItem(LEFT_RAIL_WIDTH_STORAGE_KEY);
-		const savedCollapsed = window.localStorage.getItem(LEFT_RAIL_COLLAPSED_STORAGE_KEY);
-
-		if (savedWidth) {
-			const parsedWidth = Number(savedWidth);
-			if (Number.isFinite(parsedWidth)) {
-				setLeftRailWidth(parsedWidth);
-			}
+		// 中文注释：非管理员不应停留在组织管理页（含直达路由），自动回到新建任务首页。
+		if (isOrgAdmin || !inOrgAdminMode) return;
+		if (navigation) {
+			navigation.goToRoute("chat");
+			return;
 		}
-
-		if (savedCollapsed) {
-			setLeftRailCollapsed(savedCollapsed === "true");
-		}
-	}, [setLeftRailCollapsed, setLeftRailWidth]);
-
-	useEffect(() => {
-		if (typeof window === "undefined" || !hasLoadedPreferenceRef.current) return;
-		window.localStorage.setItem(LEFT_RAIL_WIDTH_STORAGE_KEY, String(leftRailWidth));
-	}, [leftRailWidth]);
-
-	useEffect(() => {
-		if (typeof window === "undefined" || !hasLoadedPreferenceRef.current) return;
-		window.localStorage.setItem(LEFT_RAIL_COLLAPSED_STORAGE_KEY, String(leftRailCollapsed));
-	}, [leftRailCollapsed]);
+		switchView("chat");
+	}, [inOrgAdminMode, isOrgAdmin, navigation, switchView]);
 
 	const handleNavClick = (item: NavItem) => {
-		const view = navIdToView[item.id] ?? "chat";
+		const view = navIdToView[item.id] ?? "workbench";
 		const navigate = () => {
 			if (navigation) {
 				navigation.goToRoute(view);
@@ -288,11 +411,26 @@ export function LeftRail({
 			}
 			switchView(view);
 		};
-		if (protectedNavIds.has(item.id)) {
-			requireAuth(navigate);
+		navigate();
+	};
+
+	const handleOpenOrgAdmin = () => {
+		if (!isOrgAdmin) return;
+		requireAuth(() => {
+			if (navigation) {
+				navigation.goToRoute("orgProfile");
+				return;
+			}
+			switchView("orgProfile");
+		});
+	};
+
+	const handleBackToWorkbench = () => {
+		if (navigation) {
+			navigation.goToRoute("chat");
 			return;
 		}
-		navigate();
+		switchView("chat");
 	};
 
 	const handleProjectClick = (projectId: string) => {
@@ -324,9 +462,14 @@ export function LeftRail({
 			});
 
 			if (shouldLoadTasks) {
+				setLoadingTaskProjectIds((current) => new Set(current).add(project.id));
 				void fetchTasks(project.id).finally(() => {
-					// 中文注释：避免无任务项目在每次展开时重复请求详情接口。
 					setTaskLoadedProjectIds((current) => new Set(current).add(project.id));
+					setLoadingTaskProjectIds((current) => {
+						const next = new Set(current);
+						next.delete(project.id);
+						return next;
+					});
 				});
 			}
 		});
@@ -334,11 +477,15 @@ export function LeftRail({
 
 	const handleOpenTask = (projectId: string, task: ProjectTask) => {
 		requireAuth(() => {
-			if (navigation) {
-				navigation.goToTaskDetail(projectId, task.id, task.sessionId ?? null);
+			if (!task.sessionId) {
+				toast.warning("当前任务缺少会话，无法打开详情");
 				return;
 			}
-			openTaskDetail(projectId, task.id, task.sessionId ?? null);
+			if (navigation) {
+				navigation.goToTaskDetail(projectId, task.id, task.sessionId);
+				return;
+			}
+			openTaskDetail(projectId, task.id, task.sessionId);
 		});
 	};
 
@@ -360,10 +507,14 @@ export function LeftRail({
 		const name = renameValue.trim();
 		if (!renameProject || !name) return;
 
-		const updatedProject = await updateProject({ public_id: renameProject.id, name });
+		const updatedProject = await updateProject({
+			public_id: renameProject.id,
+			name,
+		});
 		if (updatedProject) {
 			setRenameProject(null);
 			setRenameValue("");
+			blurFocusedElement();
 		}
 	};
 
@@ -375,6 +526,30 @@ export function LeftRail({
 		if (updatedTask) {
 			setRenameTask(null);
 			setRenameTaskValue("");
+			blurFocusedElement();
+		}
+	};
+
+	const handleConfirmLeave = async () => {
+		if (!leaveTarget) return;
+
+		const leavingActiveProject =
+			activeProjectId === leaveTarget.id ||
+			navigation?.currentPath === `/projects/${leaveTarget.id}` ||
+			navigation?.currentPath.startsWith(`/projects/${leaveTarget.id}/`);
+
+		const left = await leaveProject(leaveTarget.id);
+		if (!left) return;
+
+		setLeaveTarget(null);
+		blurFocusedElement();
+
+		if (leavingActiveProject) {
+			if (navigation) {
+				navigation.goToRoute("chat");
+				return;
+			}
+			switchView("chat");
 		}
 	};
 
@@ -390,39 +565,61 @@ export function LeftRail({
 		if (!deleted) return;
 
 		setDeleteTarget(null);
+		blurFocusedElement();
 
 		if (deletingActiveProject) {
 			if (navigation) {
-				navigation.goToRoute("workbench");
+				navigation.goToRoute("chat");
 				return;
 			}
-			switchView("workbench");
+			switchView("chat");
 		}
 	};
 
 	const handleConfirmTaskDelete = async () => {
 		if (!deleteTaskTarget) return;
-		await deleteTask(deleteTaskTarget.id);
+
+		const { task, projectId } = deleteTaskTarget;
+		const deletingActiveTask =
+			activeTaskDetailTaskId === task.id ||
+			navigation?.currentPath.startsWith(`/projects/${projectId}/tasks/${task.id}`) ||
+			(currentView === "taskDetail" &&
+				activeTaskDetailProjectId === projectId &&
+				activeTaskDetailTaskId === task.id);
+
+		const deleted = await deleteTask(task.id);
+		if (!deleted) return;
+
 		setDeleteTaskTarget(null);
+		blurFocusedElement();
+
+		if (deletingActiveTask) {
+			if (navigation) {
+				navigation.goToProjectTasks(projectId);
+				return;
+			}
+			switchProject(projectId);
+			setProjectRoute(projectId, "tasks");
+		}
 	};
 
 	const handleProfileClick = () => {
 		if (!isAuthenticated) {
-			openAuthDialog("login");
+			openAuthDialog("phone");
 		}
 	};
 
 	const handleLogout = () => {
 		logout();
 		if (navigation) {
-			navigation.goToRoute("workbench");
+			navigation.goToRoute("chat");
 			return;
 		}
-		switchView("workbench");
+		switchView("chat");
 	};
 
 	const isItemActive = (item: NavItem) => {
-		const view = navIdToView[item.id] ?? "chat";
+		const view = navIdToView[item.id] ?? "workbench";
 		if (navigation) {
 			return getRouteActive(navigation.currentPath, view);
 		}
@@ -458,7 +655,7 @@ export function LeftRail({
 	};
 
 	const sidebarWidth = leftRailCollapsed ? LEFT_RAIL_COLLAPSED_WIDTH : leftRailWidth;
-	const profileTriggerWidth = Math.max(0, sidebarWidth - 16);
+	const profileTriggerWidth = Math.max(0, sidebarWidth - 1);
 
 	return (
 		<aside
@@ -469,91 +666,163 @@ export function LeftRail({
 			<div className="leros-brand">
 				<div className="leros-brand-main">
 					<div className="leros-logo-placeholder" aria-hidden="true">
-						<img
-							src={logoSrc}
-							alt=""
-							className="leros-logo-image"
-							onError={(event) => {
-								event.currentTarget.hidden = true;
-							}}
-						/>
+						{customBrandLogo ? (
+							<ProtectedImage
+								src={customBrandLogo}
+								alt=""
+								className="leros-logo-image"
+								fallback={
+									<img
+										src={logoSrc}
+										alt=""
+										className="leros-logo-image"
+										onError={(event) => {
+											event.currentTarget.hidden = true;
+										}}
+									/>
+								}
+							/>
+						) : (
+							<img
+								src={logoSrc}
+								alt=""
+								className="leros-logo-image"
+								onError={(event) => {
+									event.currentTarget.hidden = true;
+								}}
+							/>
+						)}
 						<Network className="size-5" />
 					</div>
 					<div className="leros-sidebar-expandable min-w-0">
-						<div className="leros-brand-title">Lework</div>
+						<div className="leros-brand-title" title={brandName}>
+							{brandName}
+						</div>
 						<div className="leros-brand-version">{brandVersionLabel}</div>
 					</div>
 				</div>
-				<button
-					type="button"
-					className="leros-sidebar-toggle"
-					aria-label={leftRailCollapsed ? "展开侧边栏" : "收起侧边栏"}
-					onClick={() => setLeftRailCollapsed(!leftRailCollapsed)}
-				>
-					{leftRailCollapsed ? (
-						<ChevronsRight className="size-[18px]" />
-					) : (
-						<ChevronsLeft className="size-[18px]" />
-					)}
-				</button>
+				{/* 中文注释：搜索与收起同属右侧操作区，成组排列避免 space-between 把两者拉开 */}
+				<div className="leros-brand-actions flex shrink-0 items-center gap-0.5">
+					{!leftRailCollapsed ? (
+						<button
+							type="button"
+							className="leros-sidebar-toggle"
+							aria-label="全局搜索任务"
+							// 中文注释：全局搜索入口只在左栏展开态展示，收起态保持当前紧凑布局不变。
+							onClick={() => requireAuth(() => setGlobalTaskSearchOpen(true))}
+						>
+							<Search className="size-[17px]" />
+						</button>
+					) : null}
+					<button
+						type="button"
+						className="leros-sidebar-toggle"
+						aria-label={leftRailCollapsed ? "展开侧边栏" : "收起侧边栏"}
+						onClick={() => setLeftRailCollapsed(!leftRailCollapsed)}
+					>
+						{leftRailCollapsed ? (
+							<ChevronsRight className="size-[18px]" />
+						) : (
+							<ChevronsLeft className="size-[18px]" />
+						)}
+					</button>
+				</div>
 			</div>
 
-			<ScrollArea hideScrollbar className="min-h-0 flex-1 overflow-hidden">
-				<nav className="leros-nav" aria-label="主导航">
-					{navGroups.map((group) => {
-						return (
-							<div key={group.id} className="leros-nav-section">
-								{group.id === "projects" ? (
-									<div
-										className={cn(
-											"leros-nav-section-label",
-											"normal-case leading-snug tracking-normal font-normal",
-										)}
-									>
-										<span className="text-sm">最近项目</span>
-										<span className="text-xs">（仅展示5个）</span>
+			<div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+				{inOrgAdminMode ? (
+					<nav className="leros-nav shrink-0" aria-label="组织管理导航">
+						{/* 中文注释：组织管理模式下提供显式返回主界面入口，样式与侧栏导航项保持一致。 */}
+						<button
+							type="button"
+							onClick={handleBackToWorkbench}
+							className={cn("leros-nav-item mb-1", leftRailCollapsed && "justify-center")}
+							title="返回主界面"
+							aria-label="返回主界面"
+						>
+							<span className="leros-nav-icon">
+								<ArrowLeft className="size-5" />
+							</span>
+							<span className={cn("flex-1 truncate font-medium", leftRailCollapsed && "hidden")}>
+								返回主界面
+							</span>
+						</button>
+						<div className="space-y-1">
+							{ORG_ADMIN_NAV_ITEMS.map((item) => (
+								<NavItemButton
+									key={item.id}
+									item={item}
+									active={isItemActive(item)}
+									collapsed={leftRailCollapsed}
+									onClick={() => handleNavClick(item)}
+								/>
+							))}
+						</div>
+					</nav>
+				) : (
+					<>
+						<nav className="leros-nav shrink-0" aria-label="主导航">
+							{navGroups
+								.filter((group) => group.id !== "projects")
+								.map((group) => (
+									<div key={group.id} className="leros-nav-section">
+										{group.label ? (
+											<div className="leros-nav-section-label">{group.label}</div>
+										) : null}
+										<div className="space-y-1">
+											{group.items.map((item: NavItem) => (
+												<NavItemButton
+													key={item.id}
+													item={item}
+													active={isItemActive(item)}
+													collapsed={leftRailCollapsed}
+													onClick={() => handleNavClick(item)}
+												/>
+											))}
+										</div>
 									</div>
-								) : group.label ? (
-									<div className="leros-nav-section-label">{group.label}</div>
-								) : null}
-								{group.id === "projects" ? (
-									<ProjectList
-										projects={projects}
-										activeProjectId={activeProjectId}
-										activeTaskDetailProjectId={activeTaskDetailProjectId}
-										activeTaskDetailTaskId={activeTaskDetailTaskId}
-										currentView={currentView}
-										currentPath={navigation?.currentPath}
-										expandedProjectIds={expandedProjectIds}
-										expandedTaskProjectIds={expandedTaskProjectIds}
-										onToggleProject={handleToggleProject}
-										onEnterProject={handleProjectClick}
-										onOpenTask={handleOpenTask}
-										onExpandTasks={handleExpandProjectTasks}
-										onRenameProject={handleOpenRename}
-										onDeleteProject={setDeleteTarget}
-										onRenameTask={handleOpenTaskRename}
-										onDeleteTask={setDeleteTaskTarget}
-										collapsed={leftRailCollapsed}
-									/>
-								) : (
-									<div className="space-y-1">
-										{group.items.map((item: NavItem) => (
-											<NavItemButton
-												key={item.id}
-												item={item}
-												active={isItemActive(item)}
-												collapsed={leftRailCollapsed}
-												onClick={() => handleNavClick(item)}
-											/>
-										))}
-									</div>
-								)}
-							</div>
-						);
-					})}
-				</nav>
-			</ScrollArea>
+								))}
+						</nav>
+
+						{!leftRailCollapsed && (
+							<section className="leros-nav leros-nav-section mb-0 flex min-h-0 flex-1 flex-col">
+								<div
+									className={cn(
+										"leros-nav-section-label shrink-0",
+										"normal-case leading-snug tracking-normal font-normal",
+									)}
+								>
+									<span className="text-sm">最近项目</span>
+								</div>
+								<ProjectList
+									projects={visibleProjects}
+									activeProjectId={activeProjectId}
+									activeTaskDetailProjectId={activeTaskDetailProjectId}
+									activeTaskDetailTaskId={activeTaskDetailTaskId}
+									currentView={currentView}
+									currentPath={navigation?.currentPath}
+									expandedProjectIds={expandedProjectIds}
+									expandedTaskProjectIds={expandedTaskProjectIds}
+									loadingTaskProjectIds={loadingTaskProjectIds}
+									onToggleProject={handleToggleProject}
+									onEnterProject={handleProjectClick}
+									onOpenTask={handleOpenTask}
+									onExpandTasks={handleExpandProjectTasks}
+									onRenameProject={handleOpenRename}
+									onDeleteProject={setDeleteTarget}
+									onLeaveProject={setLeaveTarget}
+									onRenameTask={handleOpenTaskRename}
+									onDeleteTask={(task, projectId) => setDeleteTaskTarget({ task, projectId })}
+									collapsed={false}
+									hasMore={projectList.hasMore}
+									loadingMore={projectList.loadingMore}
+									onLoadMore={projectList.loadMore}
+								/>
+							</section>
+						)}
+					</>
+				)}
+			</div>
 
 			<div className="leros-sidebar-footer shrink-0">
 				{!isHydrated ? (
@@ -571,15 +840,15 @@ export function LeftRail({
 								<button
 									type="button"
 									className="leros-profile-trigger"
-									title={user?.name ?? "个人中心"}
+									title={user?.uinName ?? user?.name ?? "个人中心"}
 								>
 									<ProfileAvatar user={user} />
 									<div className="leros-sidebar-expandable flex-1 overflow-hidden text-left">
-										<p className="truncate text-[14px] font-bold text-[var(--leros-text-strong)]">
-											{user?.name ?? "Lework 用户"}
+										<p className="truncate text-[14px] font-semibold text-[var(--leros-text-strong)]">
+											{user?.uinName ?? user?.name ?? "Lework 用户"}
 										</p>
-										<p className="truncate text-[11px] text-[var(--leros-text-subtle)]">
-											{getDisplayPhone(user) ?? "已登录"}
+										<p className="truncate text-[12px] text-[var(--leros-text-subtle)]">
+											{user?.currentOrg?.name ?? getDisplayPhone(user) ?? "已登录"}
 										</p>
 									</div>
 								</button>
@@ -589,22 +858,32 @@ export function LeftRail({
 							align="start"
 							side="top"
 							sideOffset={10}
-							className="leros-profile-menu"
+							className="leros-profile-menu border-[var(--leros-control-border)] bg-[var(--leros-surface)] text-[var(--leros-text)] shadow-[var(--leros-shadow-menu)]"
 							style={
 								{
 									"--leros-sidebar-menu-width": `${profileTriggerWidth}px`,
 								} as CSSProperties
 							}
 						>
-							{/* 暂时仅保留退出登录入口，其他菜单项先注释隐藏；恢复时记得同步恢复对应 import。 */}
+							{isPrivateDeployment ? (
+								<DropdownMenuItem
+									onClick={() => {
+										if (navigation) {
+											navigation.goToRoute("settings");
+											return;
+										}
+										switchView("settings");
+									}}
+								>
+									<Settings className="size-4 shrink-0" />
+									<span>系统设置</span>
+								</DropdownMenuItem>
+							) : null}
+							{/* 其他菜单项先注释隐藏；恢复时记得同步恢复对应 import。 */}
 							{/*
 							<DropdownMenuItem>
 								<UserRound className="size-4" />
 								<span>个人信息</span>
-							</DropdownMenuItem>
-							<DropdownMenuItem>
-								<Settings className="size-4" />
-								<span>系统设置</span>
 							</DropdownMenuItem>
 							<DropdownMenuItem>
 								<CircleHelp className="size-4" />
@@ -612,14 +891,41 @@ export function LeftRail({
 							</DropdownMenuItem>
 							*/}
 							<DropdownMenuItem onClick={() => setAccountDialogOpen(true)}>
-								<UserRound className="size-4" />
+								<UserRound className="size-4 shrink-0" />
 								<span>账户管理</span>
 							</DropdownMenuItem>
-							<DropdownMenuSeparator />
-							<DesktopUpdateMenuSection />
-							<DropdownMenuSeparator />
+							{isOrgAdmin ? (
+								<DropdownMenuItem onClick={handleOpenOrgAdmin}>
+									<Building2 className="size-4 shrink-0" />
+									<span>组织管理</span>
+								</DropdownMenuItem>
+							) : null}
+							{canSwitchOrganization ? (
+								<DropdownMenuItem
+									onClick={() => {
+										if (!requireAuth()) return;
+										setOrgSwitchDialogOpen(true);
+									}}
+								>
+									<ArrowLeftRight className="size-4 shrink-0" />
+									<span>切换组织</span>
+								</DropdownMenuItem>
+							) : null}
+							{isPrivateDeployment ? null : <DesktopUpdateMenuSection />}
+							{/* 中文注释：私有化环境不展示意见反馈入口。 */}
+							{isPrivateDeployment ? null : (
+								<DropdownMenuItem
+									onClick={() => {
+										if (!requireAuth()) return;
+										setFeedbackDialogOpen(true);
+									}}
+								>
+									<MessageSquare className="size-4 shrink-0" />
+									<span>意见反馈</span>
+								</DropdownMenuItem>
+							)}
 							<DropdownMenuItem variant="destructive" onClick={handleLogout}>
-								<LogOut className="size-4" />
+								<LogOut className="size-4 shrink-0" />
 								<span>退出登录</span>
 							</DropdownMenuItem>
 						</DropdownMenuContent>
@@ -633,11 +939,11 @@ export function LeftRail({
 					>
 						<ProfileAvatar user={null} />
 						<div className="leros-sidebar-expandable flex-1 overflow-hidden text-left">
-							<p className="truncate text-[14px] font-bold text-[var(--leros-text-strong)]">
+							<p className="truncate text-[14px] font-semibold text-[var(--leros-text-strong)]">
 								登录 / 注册
 							</p>
-							<p className="text-[10px] font-bold uppercase tracking-tight text-[var(--leros-primary)]">
-								LEROS
+							<p className="text-[10px] font-semibold uppercase tracking-tight text-[var(--leros-primary)]">
+								Lework
 							</p>
 						</div>
 						<UserRound className="leros-sidebar-expandable size-4 shrink-0 text-[var(--leros-text-subtle)]" />
@@ -650,8 +956,8 @@ export function LeftRail({
 				tabIndex={0}
 				aria-orientation="vertical"
 				aria-label="调整侧边栏宽度"
-				aria-valuemin={220}
-				aria-valuemax={320}
+				aria-valuemin={LEFT_RAIL_MIN_WIDTH}
+				aria-valuemax={LEFT_RAIL_MAX_WIDTH}
 				aria-valuenow={leftRailWidth}
 				onPointerDown={handleResizePointerDown}
 				onKeyDown={(event) => {
@@ -665,9 +971,53 @@ export function LeftRail({
 				onOpenChange={setAccountDialogOpen}
 				onUserChange={setAuthUser}
 			/>
+			{isPrivateDeployment ? null : (
+				<FeedbackDialog open={feedbackDialogOpen} onOpenChange={setFeedbackDialogOpen} />
+			)}
+			<Dialog
+				open={orgSwitchDialogOpen}
+				disablePointerDismissal
+				onOpenChange={(open, details) => {
+					// 中文注释：切换或创建组织可能包含未提交内容，只允许右上角关闭按钮退出。
+					if (!open && details.reason === "escape-key") return;
+					if (!open && orgSwitchPanelMode === "create") {
+						// 中文注释：从切换组织进入创建组织时，X 只返回切换组织列表。
+						setOrgSwitchPanelMode("switch");
+						return;
+					}
+					setOrgSwitchDialogOpen(open);
+				}}
+			>
+				<DialogContent
+					className="flex max-h-[min(70dvh,calc(100dvh-2rem))] w-full max-w-none flex-col overflow-hidden p-6"
+					style={{ width: "min(33vw, calc(100vw - 2rem))" }}
+					showCloseButton
+				>
+					<OrganizationSwitchPanel
+						navigation={navigation}
+						onDone={() => {
+							setOrgSwitchPanelMode("switch");
+							setOrgSwitchDialogOpen(false);
+						}}
+						active={orgSwitchDialogOpen}
+						initialMode={orgSwitchPanelMode}
+						onModeChange={setOrgSwitchPanelMode}
+					/>
+				</DialogContent>
+			</Dialog>
+			<GlobalTaskSearchDialog
+				open={globalTaskSearchOpen}
+				onOpenChange={setGlobalTaskSearchOpen}
+				navigation={navigation}
+			/>
 			<Dialog
 				open={renameProject !== null}
-				onOpenChange={(open) => !open && setRenameProject(null)}
+				onOpenChange={(open) => {
+					if (!open) {
+						setRenameProject(null);
+						blurFocusedElement();
+					}
+				}}
 			>
 				<DialogContent className="sm:max-w-md" showCloseButton={false}>
 					<DialogHeader>
@@ -694,7 +1044,13 @@ export function LeftRail({
 						</span>
 					</div>
 					<DialogFooter className="mt-4">
-						<Button variant="outline" onClick={() => setRenameProject(null)}>
+						<Button
+							variant="outline"
+							onClick={() => {
+								setRenameProject(null);
+								blurFocusedElement();
+							}}
+						>
 							取消
 						</Button>
 						<Button onClick={handleConfirmRename} disabled={!renameValue.trim()}>
@@ -704,7 +1060,15 @@ export function LeftRail({
 				</DialogContent>
 			</Dialog>
 
-			<Dialog open={renameTask !== null} onOpenChange={(open) => !open && setRenameTask(null)}>
+			<Dialog
+				open={renameTask !== null}
+				onOpenChange={(open) => {
+					if (!open) {
+						setRenameTask(null);
+						blurFocusedElement();
+					}
+				}}
+			>
 				<DialogContent className="sm:max-w-md" showCloseButton={false}>
 					<DialogHeader>
 						<DialogTitle>重命名任务</DialogTitle>
@@ -730,7 +1094,13 @@ export function LeftRail({
 						</span>
 					</div>
 					<DialogFooter className="mt-4">
-						<Button variant="outline" onClick={() => setRenameTask(null)}>
+						<Button
+							variant="outline"
+							onClick={() => {
+								setRenameTask(null);
+								blurFocusedElement();
+							}}
+						>
 							取消
 						</Button>
 						<Button onClick={handleConfirmTaskRename} disabled={!renameTaskValue.trim()}>
@@ -740,16 +1110,30 @@ export function LeftRail({
 				</DialogContent>
 			</Dialog>
 
-			<Dialog open={deleteTaskTarget !== null} onOpenChange={(open) => !open && setDeleteTaskTarget(null)}>
+			<Dialog
+				open={deleteTaskTarget !== null}
+				onOpenChange={(open) => {
+					if (!open) {
+						setDeleteTaskTarget(null);
+						blurFocusedElement();
+					}
+				}}
+			>
 				<DialogContent className="sm:max-w-md" showCloseButton={false}>
 					<DialogHeader>
 						<DialogTitle>删除任务</DialogTitle>
 						<DialogDescription>
-							确定要删除 <strong>{deleteTaskTarget?.title}</strong> 吗？此操作不可撤销。
+							确定要删除 <strong>{deleteTaskTarget?.task.title}</strong> 吗？此操作不可撤销。
 						</DialogDescription>
 					</DialogHeader>
 					<DialogFooter className="mt-4">
-						<Button variant="outline" onClick={() => setDeleteTaskTarget(null)}>
+						<Button
+							variant="outline"
+							onClick={() => {
+								setDeleteTaskTarget(null);
+								blurFocusedElement();
+							}}
+						>
 							取消
 						</Button>
 						<Button variant="destructive" onClick={handleConfirmTaskDelete}>
@@ -759,7 +1143,15 @@ export function LeftRail({
 				</DialogContent>
 			</Dialog>
 
-			<Dialog open={deleteTarget !== null} onOpenChange={(open) => !open && setDeleteTarget(null)}>
+			<Dialog
+				open={deleteTarget !== null}
+				onOpenChange={(open) => {
+					if (!open) {
+						setDeleteTarget(null);
+						blurFocusedElement();
+					}
+				}}
+			>
 				<DialogContent className="sm:max-w-md" showCloseButton={false}>
 					<DialogHeader>
 						<DialogTitle>删除项目</DialogTitle>
@@ -768,11 +1160,50 @@ export function LeftRail({
 						</DialogDescription>
 					</DialogHeader>
 					<DialogFooter className="mt-4">
-						<Button variant="outline" onClick={() => setDeleteTarget(null)}>
+						<Button
+							variant="outline"
+							onClick={() => {
+								setDeleteTarget(null);
+								blurFocusedElement();
+							}}
+						>
 							取消
 						</Button>
 						<Button variant="destructive" onClick={handleConfirmDelete}>
 							删除
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
+			<Dialog
+				open={leaveTarget !== null}
+				onOpenChange={(open) => {
+					if (!open) {
+						setLeaveTarget(null);
+						blurFocusedElement();
+					}
+				}}
+			>
+				<DialogContent className="sm:max-w-md" showCloseButton={false}>
+					<DialogHeader>
+						<DialogTitle>离开项目</DialogTitle>
+						<DialogDescription>
+							确定要离开 <strong>{leaveTarget?.name}</strong> 吗？离开后你将无法继续访问该项目。
+						</DialogDescription>
+					</DialogHeader>
+					<DialogFooter className="mt-4">
+						<Button
+							variant="outline"
+							onClick={() => {
+								setLeaveTarget(null);
+								blurFocusedElement();
+							}}
+						>
+							取消
+						</Button>
+						<Button variant="destructive" onClick={handleConfirmLeave}>
+							离开
 						</Button>
 					</DialogFooter>
 				</DialogContent>
@@ -802,7 +1233,7 @@ export function LeftRail({
 							<div className="pr-7">
 								<div className="truncate text-[14px] font-semibold leading-5">新版本已就绪</div>
 								<div className="truncate text-[13px] leading-4 text-slate-900/60">
-									{downloadedVersion ? `V${downloadedVersion.replace(/^v/i, "")}` : "V"}
+									{promptVersion ? `V${promptVersion.replace(/^v/i, "")}` : "V"}
 								</div>
 							</div>
 							<div className="mt-1 flex items-center justify-end">
@@ -828,6 +1259,8 @@ export function LeftRail({
 	);
 }
 
+const ACCOUNT_USER_NAME_MAX_LENGTH = 20;
+
 function AccountManagementDialog({
 	open,
 	user,
@@ -840,12 +1273,13 @@ function AccountManagementDialog({
 	onUserChange: (user: AuthUser | null) => void;
 }) {
 	const fileInputRef = useRef<HTMLInputElement>(null);
-	const [nameValue, setNameValue] = useState(user?.name ?? "");
+	const [nameValue, setNameValue] = useState(user?.uinName ?? user?.name ?? "");
 	const [editingName, setEditingName] = useState(false);
 	const [savingName, setSavingName] = useState(false);
 	const [uploadingAvatar, setUploadingAvatar] = useState(false);
 	const [previewAvatarUrl, setPreviewAvatarUrl] = useState<string | undefined>();
 	const displayPhone = getDisplayPhone(user);
+	const displayEmail = user?.email?.trim() || undefined;
 
 	useEffect(() => {
 		if (!open) {
@@ -853,42 +1287,38 @@ function AccountManagementDialog({
 			setPreviewAvatarUrl(undefined);
 			return;
 		}
-		setNameValue(user?.name ?? "");
-	}, [open, user?.name]);
+		setNameValue(user?.uinName ?? user?.name ?? "");
+	}, [open, user?.uinName, user?.name]);
 
 	const updateLocalUser = (patch: Partial<AuthUser>) => {
 		if (!user) return;
 		onUserChange({ ...user, ...patch });
 	};
 
-	const requirePublicId = () => {
-		if (user?.publicId) return user.publicId;
-		toast.error("当前登录信息缺少用户 ID，请重新登录后再试");
-		return null;
-	};
-
 	const handleSaveName = async () => {
-		const publicId = requirePublicId();
 		const nextName = nameValue.trim();
-		if (!publicId || !nextName || nextName === user?.name) {
+		if (!nextName || nextName === (user?.uinName ?? user?.name)) {
 			setEditingName(false);
 			return;
 		}
 
 		setSavingName(true);
 		try {
-			const response = await userApi.update({ public_id: publicId, name: nextName });
+			const response = await userApi.updateCurrent({
+				name: nextName,
+			});
 			const updatedUser = response.data.data;
 			if (updatedUser?.name) {
 				updateLocalUser({
-					publicId: updatedUser.public_id || publicId,
+					publicId: updatedUser.public_id || user?.publicId || "",
 					name: updatedUser.name,
+					uinName: updatedUser.name,
 					email: updatedUser.email || user?.email || "",
 					phone: updatedUser.phone || user?.phone,
 					avatarUrl: updatedUser.avatar_url || user?.avatarUrl,
 				});
 			} else {
-				updateLocalUser({ name: nextName });
+				updateLocalUser({ name: nextName, uinName: nextName });
 			}
 			setEditingName(false);
 			toast.success("用户名已更新");
@@ -913,21 +1343,23 @@ function AccountManagementDialog({
 		const previewURL = URL.createObjectURL(file);
 		setPreviewAvatarUrl(previewURL);
 		try {
-			const uploadResponse = await projectFileApi.uploadLoose({ file, purpose: "avatar" });
+			const uploadResponse = await projectFileApi.uploadLoose({
+				file,
+				purpose: "avatar",
+			});
 			const uploaded = uploadResponse.data;
 			if (!uploaded?.public_id) {
 				throw new Error("头像上传失败");
 			}
 
-			const publicId = requirePublicId();
-			if (!publicId) return;
-
-			const avatarUrl = getFileDownloadUrl(uploaded.public_id);
-			const response = await userApi.update({ public_id: publicId, avatar_url: avatarUrl });
+			const avatarUrl = uploaded.public_id;
+			const response = await userApi.updateCurrent({
+				avatar_url: avatarUrl,
+			});
 			const updatedUser = response.data.data;
-			cacheAvatarDataURL(avatarUrl, await blobToDataURL(file));
+			cacheProtectedImageDataURL(avatarUrl, await blobToDataURL(file));
 			updateLocalUser({
-				publicId: updatedUser?.public_id || publicId,
+				publicId: updatedUser?.public_id || user?.publicId || "",
 				name: updatedUser?.name || user?.name || "",
 				email: updatedUser?.email || user?.email || "",
 				phone: updatedUser?.phone || user?.phone,
@@ -961,8 +1393,9 @@ function AccountManagementDialog({
 							disabled={uploadingAvatar}
 							aria-label="上传头像"
 						>
-							<ImageWithFallback
-								src={previewAvatarUrl || user?.avatarUrl}
+							<ProtectedImage
+								src={user?.avatarUrl}
+								localSrc={previewAvatarUrl}
 								alt={user?.name ?? "Avatar"}
 								className="h-full w-full object-cover"
 								fallback={
@@ -974,7 +1407,7 @@ function AccountManagementDialog({
 											size={128}
 										/>
 									) : (
-										<span className="text-xl font-bold">{getAvatarInitial("Lework")}</span>
+										<span className="text-xl font-semibold">{getAvatarInitial("Lework")}</span>
 									)
 								}
 							/>
@@ -989,7 +1422,7 @@ function AccountManagementDialog({
 						<input
 							ref={fileInputRef}
 							type="file"
-							accept="image/*"
+							accept={getNativeFileInputAccept("image/*")}
 							className="hidden"
 							onChange={handleAvatarChange}
 						/>
@@ -1002,11 +1435,12 @@ function AccountManagementDialog({
 								<div className="flex items-center gap-2">
 									<Input
 										value={nameValue}
+										maxLength={ACCOUNT_USER_NAME_MAX_LENGTH}
 										onChange={(event) => setNameValue(event.target.value)}
 										onKeyDown={(event) => {
 											if (event.key === "Enter") void handleSaveName();
 											if (event.key === "Escape") {
-												setNameValue(user?.name ?? "");
+												setNameValue(user?.uinName ?? user?.name ?? "");
 												setEditingName(false);
 											}
 										}}
@@ -1029,7 +1463,7 @@ function AccountManagementDialog({
 							) : (
 								<div className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
 									<span className="truncate text-sm font-medium text-slate-900">
-										{user?.name ?? "Lework 用户"}
+										{user?.uinName ?? user?.name ?? "Lework 用户"}
 									</span>
 									<Button
 										variant="ghost"
@@ -1044,9 +1478,13 @@ function AccountManagementDialog({
 						</div>
 
 						<div>
-							<div className="mb-1.5 text-xs font-medium text-slate-500">手机号</div>
+							<div className="mb-1.5 text-xs font-medium text-slate-500">
+								{isPrivateDeployment ? "邮箱" : "手机号"}
+							</div>
 							<div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-500">
-								{displayPhone ?? "未绑定手机号"}
+								{isPrivateDeployment
+									? (displayEmail ?? "未绑定邮箱")
+									: (displayPhone ?? "未绑定手机号")}
 							</div>
 						</div>
 					</div>
@@ -1072,10 +1510,10 @@ function ProfileAvatar({ user }: { user: AuthUser | null }) {
 
 	return (
 		<span
-			className="leros-avatar overflow-hidden text-[11px] font-bold"
+			className="leros-avatar overflow-hidden text-[11px] font-semibold"
 			style={{ background: "var(--leros-primary)", color: "#fff" }}
 		>
-			<ImageWithFallback
+			<ProtectedImage
 				src={user?.avatarUrl}
 				alt={user?.name ?? "Avatar"}
 				className="h-full w-full object-cover"
@@ -1112,122 +1550,6 @@ function getAppVersion(): string {
 function isImageFile(file: File): boolean {
 	if (file.type.startsWith("image/")) return true;
 	return /\.(avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(file.name);
-}
-
-function ImageWithFallback({
-	src,
-	alt,
-	className,
-	fallback,
-	onProtectedSrcNotFound,
-}: {
-	src?: string | null;
-	alt: string;
-	className: string;
-	fallback: React.ReactNode;
-	onProtectedSrcNotFound?: () => void;
-}) {
-	const [failed, setFailed] = useState(false);
-	const [imageURL, setImageURL] = useState<string | null>(() => getCachedAvatarDataURL(src));
-
-	useEffect(() => {
-		setFailed(false);
-		if (!src || !isProtectedFileURL(src)) {
-			setImageURL(null);
-			return;
-		}
-
-		const cachedAvatarURL = getCachedAvatarDataURL(src);
-		if (cachedAvatarURL) {
-			setImageURL(cachedAvatarURL);
-			// 中文注释：头像缓存命中后直接复用，避免输入框等无关重渲染时重复下载同一文件。
-			return;
-		}
-
-		let cancelled = false;
-		authenticatedFetch(src)
-			.then(async (response) => {
-				if (!response.ok) throw new Error(`HTTP ${response.status}`);
-				return response.blob();
-			})
-			.then(async (blob) => {
-				if (cancelled) return;
-				const dataURL = await blobToDataURL(blob);
-				if (cancelled) return;
-				cacheAvatarDataURL(src, dataURL);
-				setImageURL(dataURL);
-			})
-			.catch((error) => {
-				if (cancelled) return;
-				const isNotFoundError =
-					error instanceof Error && (error.message === "HTTP 404" || error.message.includes("404"));
-				if (isNotFoundError) {
-					onProtectedSrcNotFound?.();
-				}
-				if (!cachedAvatarURL) setFailed(true);
-			});
-
-		return () => {
-			cancelled = true;
-		};
-	}, [src, onProtectedSrcNotFound]);
-
-	if (!src || failed) return <>{fallback}</>;
-	const imageSrc = imageURL || src;
-	if (isProtectedFileURL(src) && !imageURL) return <>{fallback}</>;
-
-	return (
-		<img
-			src={imageSrc}
-			alt={alt}
-			className={className}
-			loading="lazy"
-			decoding="async"
-			referrerPolicy="no-referrer"
-			onError={() => setFailed(true)}
-		/>
-	);
-}
-
-function isProtectedFileURL(src: string): boolean {
-	return src.includes("/files/") && src.includes("/download");
-}
-
-function getAvatarCacheKey(src: string): string {
-	return `${AVATAR_CACHE_PREFIX}${src}`;
-}
-
-function getCachedAvatarDataURL(src?: string | null): string | null {
-	if (!src || typeof window === "undefined" || !isProtectedFileURL(src)) return null;
-	try {
-		return window.localStorage.getItem(getAvatarCacheKey(src));
-	} catch {
-		return null;
-	}
-}
-
-function cacheAvatarDataURL(src: string, dataURL: string) {
-	if (typeof window === "undefined" || !isProtectedFileURL(src)) return;
-	try {
-		window.localStorage.setItem(getAvatarCacheKey(src), dataURL);
-	} catch {
-		// Avatar cache is an optional UX optimization.
-	}
-}
-
-function blobToDataURL(blob: Blob): Promise<string> {
-	return new Promise((resolve, reject) => {
-		const reader = new FileReader();
-		reader.addEventListener("load", () => {
-			if (typeof reader.result === "string") {
-				resolve(reader.result);
-				return;
-			}
-			reject(new Error("头像缓存失败"));
-		});
-		reader.addEventListener("error", () => reject(new Error("头像缓存失败")));
-		reader.readAsDataURL(blob);
-	});
 }
 
 function getAvatarInitial(label: string) {
@@ -1320,6 +1642,12 @@ function DesktopUpdateMenuSection() {
 			if (nextState.phase === "up-to-date") {
 				toast.success("当前已经是最新版本");
 			}
+			if (nextState.phase === "available") {
+				toast.success(nextState.message);
+			}
+			if (nextState.phase === "error") {
+				toast.error(nextState.message);
+			}
 			if (nextState.phase === "unsupported") {
 				toast.message(nextState.message);
 			}
@@ -1329,46 +1657,59 @@ function DesktopUpdateMenuSection() {
 	};
 
 	return (
-		<div className="space-y-1">
+		<>
 			{updateState.phase === "downloading" && typeof updateState.progressPercent === "number" ? (
-				<div className="px-2 pb-1">
+				<div className="leros-profile-menu-progress">
 					<div className="h-1.5 overflow-hidden rounded-full bg-slate-200">
 						<div
 							className="h-full rounded-full bg-[#34c59a] transition-all"
-							style={{ width: `${Math.max(0, Math.min(updateState.progressPercent, 100))}%` }}
+							style={{
+								width: `${Math.max(0, Math.min(updateState.progressPercent, 100))}%`,
+							}}
 						/>
 					</div>
 				</div>
 			) : null}
 
-			<button
-				type="button"
-				className="flex w-full items-center gap-2 rounded-sm px-2 py-2 text-left text-sm text-slate-700 outline-none transition-colors hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
-				onClick={handleCheckForUpdates}
+			<DropdownMenuItem
+				onClick={() => void handleCheckForUpdates()}
 				disabled={!updateState.canCheck || checking}
 			>
 				{checking || updateState.phase === "checking" ? (
-					<Loader2 className="size-4 animate-spin" />
+					<Loader2 className="size-4 shrink-0 animate-spin" />
 				) : (
-					<RefreshCcw className="size-4" />
+					<RefreshCcw className="size-4 shrink-0" />
 				)}
 				<span>检查更新</span>
-			</button>
-		</div>
+			</DropdownMenuItem>
+		</>
 	);
 }
 
 function getRouteActive(path: string, view: ViewMode) {
-	if (view === "workbench") return path === "/" || path.startsWith("/workbench");
-	if (view === "chat") return path.startsWith("/chat");
-	if (view === "digitalAssistant") return path.startsWith("/assistants");
-	if (view === "aiTeammates") return path.startsWith("/ai-teammates");
+	if (view === "chat") return path === "/" || path.startsWith("/chat");
+	if (view === "workbench") return path.startsWith("/workbench");
+	if (view === "orgAssistants") return path.startsWith("/org/assistants");
+	if (view === "orgProfile") return path.startsWith("/org/profile") || path === "/org";
+	if (view === "orgDepartments") return path.startsWith("/org/departments");
+	if (view === "orgModels") return path.startsWith("/org/models");
 	if (view === "projectsHub") return path === "/projects";
 	if (view === "skills") return path.startsWith("/skills");
 	if (view === "knowledge") return path.startsWith("/knowledge");
 	if (view === "tasks") return path.startsWith("/tasks");
+	if (view === "automation") return path === "/automation" || path.startsWith("/automation/");
 	return false;
 }
+
+/** 侧栏行悬浮时才占位展开的操作槽，挤压左侧名称区域。 */
+const railHoverChevronSlotClass =
+	"flex h-6 w-0 shrink-0 items-center justify-center overflow-hidden opacity-0 transition-[width,opacity] duration-150 group-hover:w-6 group-hover:opacity-100";
+
+const railHoverMenuSlotClass =
+	"flex h-6 w-0 shrink-0 overflow-hidden opacity-0 transition-[width,opacity] duration-150 group-hover:w-6 group-hover:opacity-100 has-[button[data-popup-open]]:w-6 has-[button[data-popup-open]]:opacity-100";
+
+const railHoverExternalLinkSlotClass =
+	"flex h-6 w-0 shrink-0 items-center justify-center overflow-hidden opacity-0 transition-[width,opacity] duration-150 group-hover:w-6 group-hover:opacity-100 group-has-[button[data-popup-open]]:w-6 group-has-[button[data-popup-open]]:opacity-100";
 
 function ProjectList({
 	projects,
@@ -1379,15 +1720,20 @@ function ProjectList({
 	currentPath,
 	expandedProjectIds,
 	expandedTaskProjectIds,
+	loadingTaskProjectIds,
 	onToggleProject,
 	onEnterProject,
 	onOpenTask,
 	onExpandTasks,
 	onRenameProject,
 	onDeleteProject,
+	onLeaveProject,
 	onRenameTask,
 	onDeleteTask,
 	collapsed,
+	hasMore,
+	loadingMore,
+	onLoadMore,
 }: {
 	projects: Project[];
 	activeProjectId: string | null;
@@ -1397,30 +1743,33 @@ function ProjectList({
 	currentPath?: string;
 	expandedProjectIds: Set<string>;
 	expandedTaskProjectIds: Set<string>;
+	loadingTaskProjectIds: Set<string>;
 	onToggleProject: (project: Project) => void;
 	onEnterProject: (projectId: string) => void;
 	onOpenTask: (projectId: string, task: ProjectTask) => void;
 	onExpandTasks: (projectId: string) => void;
 	onRenameProject: (project: Project) => void;
 	onDeleteProject: (project: Project) => void;
+	onLeaveProject: (project: Project) => void;
 	onRenameTask: (task: ProjectTask) => void;
-	onDeleteTask: (task: ProjectTask) => void;
+	onDeleteTask: (task: ProjectTask, projectId: string) => void;
 	collapsed: boolean;
+	hasMore?: boolean;
+	loadingMore?: boolean;
+	onLoadMore?: () => void;
 }) {
-	const recentProjects = getRecentProjectsForLeftRail(
-		projects,
-		expandedProjectIds,
-		RECENT_PROJECT_LIMIT,
-	);
+	const recentProjects = getRecentProjectsForLeftRail(projects);
+	const [scrollRoot, setScrollRoot] = useState<HTMLDivElement | null>(null);
 
 	return (
 		<div
-			className={cn("space-y-1", !collapsed && "no-scrollbar overflow-y-auto pr-1")}
-			style={!collapsed ? { maxHeight: "max(180px, calc(100vh - 420px))" } : undefined}
+			ref={setScrollRoot}
+			className={cn("no-scrollbar min-h-0 flex-1 space-y-1 overflow-y-auto", !collapsed && "pr-1")}
 		>
 			{recentProjects.map((project) => {
 				const projectExpanded = expandedProjectIds.has(project.id);
 				const tasksExpanded = expandedTaskProjectIds.has(project.id);
+				const isLoadingTasks = loadingTaskProjectIds.has(project.id);
 				const visibleTasks = tasksExpanded
 					? project.tasks
 					: project.tasks.slice(0, PROJECT_TASK_PREVIEW_LIMIT);
@@ -1436,7 +1785,10 @@ function ProjectList({
 						<div
 							role="button"
 							tabIndex={0}
-							onClick={() => onToggleProject(project)}
+							onClick={(event) => {
+								(event.currentTarget as HTMLDivElement).blur();
+								onToggleProject(project);
+							}}
 							onKeyDown={(event) => {
 								if (event.key === "Enter" || event.key === " ") {
 									event.preventDefault();
@@ -1445,76 +1797,64 @@ function ProjectList({
 							}}
 							data-active={active}
 							className={cn(
-								"leros-nav-item group relative cursor-pointer text-sm",
+								"leros-nav-item group cursor-pointer gap-1 text-sm",
 								collapsed && "justify-center",
 							)}
 							title={collapsed ? project.name : undefined}
 						>
 							<span className="flex size-4 shrink-0 items-center justify-center text-[var(--leros-text-subtle)]">
-								{projectExpanded ? (
-									<FolderOpen className="size-4" />
-								) : (
-									<Folder className="size-4" />
-								)}
+								{project.automationId ? <Clock className="size-4" /> : <ProjectIcon />}
 							</span>
 							{!collapsed && (
-								<span className="flex min-w-0 flex-1 items-center gap-0.5">
-									<span className="min-w-0 truncate">{project.name}</span>
-									<span className="flex shrink-0 items-center text-[var(--leros-text-subtle)] opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100">
-										{projectExpanded ? (
-											<ChevronDown className="size-3.5" />
-										) : (
-											<ChevronRight className="size-3.5" />
-										)}
-									</span>
-								</span>
-							)}
-							{!collapsed && (
 								<>
-									<DropdownMenu>
-										<DropdownMenuTrigger
-											render={
-												<button
-													type="button"
-													aria-label={`管理项目 ${project.name}`}
-													className="flex size-6 shrink-0 items-center justify-center rounded-md text-[var(--leros-text-subtle)] opacity-0 transition-[opacity,background-color,color] duration-150 hover:bg-black/5 hover:text-[var(--leros-text-strong)] group-hover:opacity-100 group-focus-within:opacity-100 aria-expanded:opacity-100"
-													onClick={(event) => event.stopPropagation()}
-												>
-													<MoreHorizontal className="size-4" />
-												</button>
-											}
+									<span className="-mr-6 min-w-0 flex-1 truncate group-hover:mr-0 group-has-[button[data-popup-open]]:mr-0">
+										{project.name}
+									</span>
+									{/* 悬停时将操作组移入原生省略号后的视觉留白，保持三个图标的相对间距。 */}
+									<div className="flex shrink-0 items-center transition-transform duration-150 group-hover:-translate-x-3 group-has-[button[data-popup-open]]:-translate-x-3">
+										<span
+											className={cn(railHoverChevronSlotClass, "text-[var(--leros-text-subtle)]")}
+										>
+											{projectExpanded ? (
+												<ChevronDown className="size-3.5" />
+											) : (
+												<ChevronRight className="size-3.5" />
+											)}
+										</span>
+										<ProjectActionsDropdown
+											project={project}
+											onRename={onRenameProject}
+											onDelete={onDeleteProject}
+											onLeave={onLeaveProject}
+											variant="rail"
+											slotClassName={railHoverMenuSlotClass}
 										/>
-										<DropdownMenuContent align="end" sideOffset={4}>
-											<DropdownMenuItem onClick={() => onRenameProject(project)}>
-												<Pencil className="size-3.5" />
-												<span>重命名</span>
-											</DropdownMenuItem>
-											<DropdownMenuItem
-												variant="destructive"
-												onClick={() => onDeleteProject(project)}
-											>
-												<Trash2 className="size-3.5" />
-												<span>删除</span>
-											</DropdownMenuItem>
-										</DropdownMenuContent>
-									</DropdownMenu>
-									<button
-										type="button"
-										aria-label={`进入项目 ${project.name}`}
-										className="flex size-6 shrink-0 items-center justify-center rounded-md text-[var(--leros-text-subtle)] opacity-0 transition-[opacity,background-color,color] duration-150 hover:bg-black/5 hover:text-[var(--leros-text-strong)] group-hover:opacity-100 group-focus-within:opacity-100"
-										onClick={(event) => {
-											event.stopPropagation();
-											onEnterProject(project.id);
-										}}
-									>
-										<ExternalLink className="size-3.5" />
-									</button>
+										<button
+											type="button"
+											aria-label={`进入项目 ${project.name}`}
+											className={cn(
+												railHoverExternalLinkSlotClass,
+												"rounded-md text-[var(--leros-text-subtle)] transition-[background-color,color] duration-150 hover:bg-black/5 hover:text-[var(--leros-text-strong)]",
+											)}
+											onClick={(event) => {
+												event.stopPropagation();
+												onEnterProject(project.id);
+											}}
+										>
+											<ExternalLink className="size-3.5" />
+										</button>
+									</div>
 								</>
 							)}
 						</div>
 						{!collapsed && projectExpanded ? (
 							<div className="space-y-1">
-								{visibleTasks.length > 0 ? (
+								{isLoadingTasks ? (
+									<div className="flex items-center gap-2 px-8 py-2 text-sm text-[var(--leros-text-subtle)]">
+										<Loader2 className="size-3.5 animate-spin" />
+										<span>任务加载中...</span>
+									</div>
+								) : visibleTasks.length > 0 ? (
 									visibleTasks.map((task) => {
 										const taskActive = currentPath
 											? currentPath.startsWith(`/projects/${project.id}/tasks/${task.id}`)
@@ -1544,6 +1884,14 @@ function ProjectList({
 					</div>
 				);
 			})}
+			{onLoadMore ? (
+				<ListLoadMoreSentinel
+					hasMore={Boolean(hasMore)}
+					loading={Boolean(loadingMore)}
+					onLoadMore={onLoadMore}
+					root={scrollRoot}
+				/>
+			) : null}
 		</div>
 	);
 }
@@ -1561,49 +1909,86 @@ function TaskListItem({
 	active: boolean;
 	onOpenTask: (projectId: string, task: ProjectTask) => void;
 	onRenameTask: (task: ProjectTask) => void;
-	onDeleteTask: (task: ProjectTask) => void;
+	onDeleteTask: (task: ProjectTask, projectId: string) => void;
 }) {
+	useTaskCapabilities(task.id);
+	const resource = { type: "task" as const, publicId: task.id };
+
 	return (
+		// biome-ignore lint/a11y/useSemanticElements: The row contains a nested action button, so the row itself cannot be a button.
 		<div
+			role="button"
+			tabIndex={0}
+			onClick={(event) => {
+				if ((event.target as HTMLElement).closest("[data-rail-menu-slot]")) {
+					return;
+				}
+				(event.currentTarget as HTMLDivElement).blur();
+				onOpenTask(projectId, task);
+			}}
+			onKeyDown={(event) => {
+				if (event.key === "Enter" || event.key === " ") {
+					event.preventDefault();
+					onOpenTask(projectId, task);
+				}
+			}}
 			data-active={active}
-			className="group flex min-h-8 w-full items-center gap-1 rounded-sm pl-8 pr-2 py-1.5 text-sm text-[var(--leros-text)] transition-colors hover:bg-[color-mix(in_srgb,var(--leros-text)_8%,transparent)] data-[active=true]:bg-[var(--leros-primary-softer)] data-[active=true]:font-semibold data-[active=true]:text-[var(--leros-primary)]"
+			className="group flex min-h-8 w-full cursor-pointer items-center gap-1 rounded-sm pl-8 pr-2 py-1.5 text-sm text-[var(--leros-text)] transition-colors hover:bg-[color-mix(in_srgb,var(--leros-text)_8%,transparent)] data-[active=true]:bg-[var(--leros-primary-softer)] data-[active=true]:font-semibold data-[active=true]:text-[var(--leros-primary)]"
+			title={task.title}
 		>
-			<button
-				type="button"
-				onClick={() => onOpenTask(projectId, task)}
-				className="flex min-w-0 flex-1 items-center gap-2 pr-1 text-left"
-				title={task.title}
+			{task.taskType === "cron" ? (
+				<span className="shrink-0 text-[var(--leros-text-subtle)]">
+					<Clock className="size-3.5" />
+				</span>
+			) : null}
+			<span className="min-w-0 flex-1 truncate text-left">{task.title}</span>
+			{task.updatedAt ? (
+				<span className="shrink-0 text-xs font-normal text-[var(--leros-text-subtle)]">
+					{formatRelativeTaskTime(task.updatedAt)}
+				</span>
+			) : null}
+			<div
+				className={railHoverMenuSlotClass}
+				data-rail-menu-slot=""
+				onPointerDown={(event) => event.stopPropagation()}
 			>
-				<span className="min-w-0 flex-1 truncate">{task.title}</span>
-				{task.updatedAt ? (
-					<span className="shrink-0 text-xs font-normal text-[var(--leros-text-subtle)]">
-						{formatRelativeTaskTime(task.updatedAt)}
-					</span>
-				) : null}
-			</button>
-			<DropdownMenu>
-				<DropdownMenuTrigger
-					render={
-						<button
-							type="button"
-							aria-label={`管理任务 ${task.title}`}
-							className="flex size-6 shrink-0 items-center justify-center rounded-md text-[var(--leros-text-subtle)] opacity-0 transition-[opacity,background-color,color] duration-150 hover:bg-black/5 hover:text-[var(--leros-text-strong)] group-hover:opacity-100 group-focus-within:opacity-100 aria-expanded:opacity-100"
-						>
-							<MoreHorizontal className="size-4" />
-						</button>
-					}
-				/>
-				<DropdownMenuContent align="end" sideOffset={4}>
-					<DropdownMenuItem onClick={() => onRenameTask(task)}>
-						<Pencil className="size-3.5" />
-						<span>重命名</span>
-					</DropdownMenuItem>
-					<DropdownMenuItem variant="destructive" onClick={() => onDeleteTask(task)}>
-						<Trash2 className="size-3.5" />
-						<span>删除</span>
-					</DropdownMenuItem>
-				</DropdownMenuContent>
-			</DropdownMenu>
+				<DropdownMenu onOpenChange={handleRailMenuOpenChange}>
+					<DropdownMenuTrigger
+						render={
+							<button
+								type="button"
+								aria-label={`管理任务 ${task.title}`}
+								className="flex size-6 items-center justify-center rounded-md text-[var(--leros-text-subtle)] transition-[background-color,color] duration-150 hover:bg-black/5 hover:text-[var(--leros-text-strong)]"
+								onClick={(event) => event.stopPropagation()}
+								onPointerDown={(event) => event.stopPropagation()}
+							>
+								<MoreHorizontal className="size-4" />
+							</button>
+						}
+					/>
+					<DropdownMenuContent align="end" sideOffset={4}>
+						<CanGate action={Action.TaskUpdate} resource={resource}>
+							<DropdownMenuItem
+								onPointerDown={preventRailMenuClickThrough}
+								onClick={(event) => runRailMenuAction(event, () => onRenameTask(task))}
+							>
+								<Pencil className="size-3.5" />
+								<span>重命名</span>
+							</DropdownMenuItem>
+						</CanGate>
+						<CanGate action={Action.TaskDelete} resource={resource}>
+							<DropdownMenuItem
+								variant="destructive"
+								onPointerDown={preventRailMenuClickThrough}
+								onClick={(event) => runRailMenuAction(event, () => onDeleteTask(task, projectId))}
+							>
+								<Trash2 className="size-3.5" />
+								<span>删除</span>
+							</DropdownMenuItem>
+						</CanGate>
+					</DropdownMenuContent>
+				</DropdownMenu>
+			</div>
 		</div>
 	);
 }
@@ -1662,9 +2047,7 @@ function NavItemButton({
 			className={cn("leros-nav-item", collapsed && "justify-center")}
 			title={collapsed ? item.label : undefined}
 		>
-			<span className={cn("leros-nav-icon", item.icon === "IconProject" && "leros-nav-icon-text")}>
-				{icon}
-			</span>
+			<span className="leros-nav-icon">{icon}</span>
 			<span className={cn("flex-1 truncate font-medium", collapsed && "hidden")}>{item.label}</span>
 			{item.badge ? (
 				<span

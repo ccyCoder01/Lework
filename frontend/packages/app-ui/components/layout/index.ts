@@ -1,8 +1,12 @@
 "use client";
 
-export { CenterCanvas } from "./CenterCanvas";
 export { type AppNavigation, LeftRail } from "./LeftRail";
+export { NewTaskPage } from "./NewTaskPage";
 export { ProjectPage } from "./ProjectPage";
 export { Shell } from "./Shell";
 export { TaskDetailPage } from "./TaskDetailPage";
-export { WorkbenchPanel } from "./WorkbenchPanel";
+export { WorkbenchPage } from "./WorkbenchPage";
+export {
+	buildAssistantNewTaskPrefill,
+	buildSkillNewTaskPrefill,
+} from "./new-task-prefill";

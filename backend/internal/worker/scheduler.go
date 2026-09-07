@@ -2,8 +2,11 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+var ErrWorkerNotFound = errors.New("worker not found")
 
 type WorkerEnvType string
 
@@ -18,6 +21,14 @@ type WorkerScheduler interface {
 	Stop(ctx context.Context, workerID string) error
 	Health(ctx context.Context, workerID string) error
 	List(ctx context.Context) ([]*WorkerInstance, error)
+	Shutdown(ctx context.Context) error
+}
+
+// WorkerSpecReconciler reports whether an existing runtime worker diverges from
+// the scheduler's desired spec. Schedulers that can inspect external state
+// implement this optional interface.
+type WorkerSpecReconciler interface {
+	NeedsReconcile(ctx context.Context, spec *WorkerSpec) (bool, error)
 }
 
 type WorkerSpec struct {

@@ -12,6 +12,7 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
 
+	"github.com/insmtx/Leros/backend/internal/llm"
 	"github.com/insmtx/Leros/backend/pkg/llmprotocol"
 )
 
@@ -19,9 +20,12 @@ import (
 // Test setup
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-func setupTestRouter(store *ModelStore) *gin.Engine {
+func setupTestRouter(store *ModelStore, caller llm.Caller) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+
+	store.SetCaller(caller)
+	store.SetOrgID(0)
 
 	v1 := r.Group("/v1")
 	v1.POST("/chat/completions", handleModelRoute(store, llmprotocol.ProtocolOpenAIChat))
@@ -140,7 +144,9 @@ func TestHandler_ChatToChat_NonStream(t *testing.T) {
 	chatResp := []byte(`{"id":"chatcmpl-001","object":"chat.completion","created":1700000000,"model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"Hello from GPT!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`)
 	mock.setResponse(200, chatResp)
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "gpt-5",
 		Provider:     "openai",
@@ -152,7 +158,7 @@ func TestHandler_ChatToChat_NonStream(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	reqBody := `{"model":"gpt-5","messages":[{"role":"user","content":"Hi"}],"stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -180,7 +186,9 @@ func TestHandler_ChatToChat_AuthHeader(t *testing.T) {
 	chatResp := []byte(`{"id":"chatcmpl-auth","object":"chat.completion","created":1700000000,"model":"gpt-5","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"OK"}}]}`)
 	mock.setResponse(200, chatResp)
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "gpt-5",
 		Provider:     "openai",
@@ -192,7 +200,7 @@ func TestHandler_ChatToChat_AuthHeader(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	reqBody := `{"model":"gpt-5","messages":[{"role":"user","content":"Hi"}],"stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -215,7 +223,9 @@ func TestHandler_ChatToAnthropic_AuthHeader(t *testing.T) {
 	antResp := []byte(`{"id":"msg_auth_ant","type":"message","role":"assistant","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Hello from Claude!"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":5}}`)
 	mock.setResponse(200, antResp)
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "gpt-5",
 		Provider:     "anthropic",
@@ -227,7 +237,7 @@ func TestHandler_ChatToAnthropic_AuthHeader(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	reqBody := `{"model":"gpt-5","messages":[{"role":"user","content":"Hi"}],"stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -250,7 +260,9 @@ func TestHandler_ChatToAnthropic_NonStream(t *testing.T) {
 	antResp := []byte(`{"id":"msg_001","type":"message","role":"assistant","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Hello from Claude!"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":5}}`)
 	mock.setResponse(200, antResp)
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "gpt-5",
 		Provider:     "anthropic",
@@ -262,7 +274,7 @@ func TestHandler_ChatToAnthropic_NonStream(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	reqBody := `{"model":"gpt-5","messages":[{"role":"user","content":"Hi"}],"stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -303,7 +315,9 @@ func TestHandler_AnthropicToChat_NonStream(t *testing.T) {
 	chatResp := []byte(`{"id":"chatcmpl-002","object":"chat.completion","created":1700000000,"model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"Hello from GPT via Anthropic!"},"finish_reason":"stop"}]}`)
 	mock.setResponse(200, chatResp)
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "claude-sonnet-4-20250514",
 		Provider:     "openai",
@@ -315,7 +329,7 @@ func TestHandler_AnthropicToChat_NonStream(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	reqBody := `{"model":"claude-sonnet-4-20250514","max_tokens":4096,"messages":[{"role":"user","content":"Hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -346,7 +360,9 @@ func TestHandler_ResponsesToChat_NonStream(t *testing.T) {
 	chatResp := []byte(`{"id":"chatcmpl-resp","object":"chat.completion","created":1700000000,"model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"Hello from Chat!"},"finish_reason":"stop"}]}`)
 	mock.setResponse(200, chatResp)
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "gpt-5",
 		Provider:     "openai",
@@ -358,7 +374,7 @@ func TestHandler_ResponsesToChat_NonStream(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	reqBody := `{"model":"gpt-5","input":"Hello from Responses!"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -380,7 +396,9 @@ func TestHandler_ResponsesToChat_NonStream(t *testing.T) {
 }
 
 func TestHandler_InvalidJSON(t *testing.T) {
-	store := &ModelStore{}
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(nil, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "gpt-5",
 		Provider:     "openai",
@@ -392,7 +410,7 @@ func TestHandler_InvalidJSON(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("not-json"))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -404,8 +422,9 @@ func TestHandler_InvalidJSON(t *testing.T) {
 }
 
 func TestHandler_ModelNotFound(t *testing.T) {
-	store := &ModelStore{}
-	router := setupTestRouter(store)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(nil, nil)
+	router := setupTestRouter(store, caller)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"unknown-model","messages":[{"role":"user","content":"Hi"}]}`))
@@ -430,7 +449,9 @@ func TestHandler_UpstreamError(t *testing.T) {
 	mock.streamLines = nil
 	mock.mu.Unlock()
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "gpt-5",
 		Provider:     "openai",
@@ -442,7 +463,7 @@ func TestHandler_UpstreamError(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"gpt-5","messages":[{"role":"user","content":"Hi"}],"stream":false}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -478,7 +499,9 @@ func TestHandler_ChatToChat_StreamRaw(t *testing.T) {
 	}
 	mock.setStreamResponse(streamLines)
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "gpt-5",
 		Provider:     "openai",
@@ -490,7 +513,7 @@ func TestHandler_ChatToChat_StreamRaw(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	reqBody := `{"model":"gpt-5","messages":[{"role":"user","content":"Hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -524,7 +547,9 @@ func TestHandler_ChatToAnthropic_Stream(t *testing.T) {
 	}
 	mock.setStreamResponse(streamLines)
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "gpt-5",
 		Provider:     "anthropic",
@@ -536,7 +561,7 @@ func TestHandler_ChatToAnthropic_Stream(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	reqBody := `{"model":"gpt-5","messages":[{"role":"user","content":"Salut"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -569,7 +594,9 @@ func TestHandler_AnthropicToChat_Stream(t *testing.T) {
 	}
 	mock.setStreamResponse(streamLines)
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "claude-sonnet-4-20250514",
 		Provider:     "openai",
@@ -581,7 +608,7 @@ func TestHandler_AnthropicToChat_Stream(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	reqBody := `{"model":"claude-sonnet-4-20250514","max_tokens":4096,"messages":[{"role":"user","content":"Hi"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -613,7 +640,9 @@ func TestHandler_ResponsesToChat_Stream(t *testing.T) {
 	}
 	mock.setStreamResponse(streamLines)
 
-	store := NewModelStore(mock.client)
+	store := NewModelStore()
+	caller := llm.NewCallerHTTP(mock.client, nil)
+	store.SetCaller(caller)
 	store.Put(UpstreamConfig{
 		ModelName:    "gpt-5",
 		Provider:     "openai",
@@ -625,7 +654,7 @@ func TestHandler_ResponsesToChat_Stream(t *testing.T) {
 		TimeoutSec:   30,
 	})
 
-	router := setupTestRouter(store)
+	router := setupTestRouter(store, caller)
 	reqBody := `{"model":"gpt-5","input":"Explain quantum computing","stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -676,6 +705,13 @@ func TestModelStore_ResolveNotFound(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for nonexistent model")
 	}
+}
+
+func getContent(result *llm.CallResult) string {
+	if result == nil || result.Message == nil {
+		return ""
+	}
+	return result.Message.Content
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -750,5 +786,38 @@ func TestExtractGeminiModelFromPath(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("extractGeminiModelFromPath(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestModelStore_PutBizAndGetBiz(t *testing.T) {
+	store := NewModelStore()
+	biz := BusinessKeys{ProjectID: 1, SessionID: 2, AssistantID: 3, Uin: 4}
+	store.PutBiz("gpt-4o:run-1", biz)
+
+	got := store.GetBiz("gpt-4o:run-1")
+	if got == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if got.ProjectID != 1 || got.SessionID != 2 || got.AssistantID != 3 || got.Uin != 4 {
+		t.Errorf("got %+v, want ProjectID=1 SessionID=2 AssistantID=3 Uin=4", got)
+	}
+}
+
+func TestModelStore_RemoveBiz(t *testing.T) {
+	store := NewModelStore()
+	biz := BusinessKeys{ProjectID: 1}
+	store.PutBiz("gpt-4o:run-1", biz)
+
+	store.RemoveBiz("gpt-4o:run-1")
+
+	if got := store.GetBiz("gpt-4o:run-1"); got != nil {
+		t.Errorf("expected nil after RemoveBiz, got %+v", got)
+	}
+}
+
+func TestModelStore_GetBizNotFound(t *testing.T) {
+	store := NewModelStore()
+	if got := store.GetBiz("nonexistent"); got != nil {
+		t.Errorf("expected nil for nonexistent key, got %+v", got)
 	}
 }

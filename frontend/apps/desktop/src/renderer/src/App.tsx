@@ -1,8 +1,9 @@
 import {
 	CLIENT_UPGRADE_REQUIRED_EVENT,
-	clientUpdateApi,
 	type ClientUpdatePolicy,
 	type ClientUpgradeRequiredEvent,
+	clientUpdateApi,
+	isPrivateDeployment,
 } from "@leros/store";
 import { ThemeProvider } from "@leros/ui/components/common/theme-provider";
 import { Button } from "@leros/ui/components/ui/button";
@@ -19,6 +20,7 @@ import { useEffect, useState } from "react";
 import { HashRouter } from "react-router-dom";
 import { toast } from "sonner";
 import type { DesktopUpdateState } from "../../shared/auto-update";
+import { PrivateDeploymentGate } from "./components/PrivateDeploymentGate";
 import { AppRoutes } from "./routes";
 
 const initialUpdateState: DesktopUpdateState = {
@@ -33,17 +35,38 @@ const versionUpdateImageSrc = new URL(
 	"../../../resources/octopus_version_update.png",
 	import.meta.url,
 ).href;
+const forcedUpdateRefreshIntervalMs = 2 * 60 * 1000;
 
 export default function App() {
 	return (
 		<HashRouter>
-			<ThemeProvider defaultTheme="system">
-				<AppRoutes />
-				<ClientUpdateGate />
+			<ThemeProvider>
+				<MacTitleBarDragRegion />
+				<PrivateDeploymentGate>
+					<AppRoutes />
+					{isPrivateDeployment ? null : <ClientUpdateGate />}
+				</PrivateDeploymentGate>
 				<Toaster />
 			</ThemeProvider>
 		</HashRouter>
 	);
+}
+
+// mac 沉浸式标题栏：仅在 mac 下给 body 挂上标记类，
+// 具体的拖拽区/红绿灯让位样式全部由 globals.css 中的 body.leros-mac-titlebar 规则控制，
+// 拖拽能力通过侧栏品牌行与右侧顶栏的 -webkit-app-region 精细划分，不再使用整块覆盖层。
+function MacTitleBarDragRegion() {
+	const isMac = window.electron?.process?.platform === "darwin";
+
+	useEffect(() => {
+		if (!isMac) return;
+		document.body.classList.add("leros-mac-titlebar");
+		return () => {
+			document.body.classList.remove("leros-mac-titlebar");
+		};
+	}, [isMac]);
+
+	return null;
 }
 
 function ClientUpdateGate() {
@@ -63,7 +86,10 @@ function ClientUpdateGate() {
 			// Version reporting must not block app startup when the server is temporarily unavailable.
 		});
 
-		void window.lerosDesktop.getState().then(setUpdateState).catch(() => undefined);
+		void window.lerosDesktop
+			.getState()
+			.then(setUpdateState)
+			.catch(() => undefined);
 		const unsubscribe = window.lerosDesktop.subscribe(setUpdateState);
 
 		return () => {
@@ -71,6 +97,43 @@ function ClientUpdateGate() {
 			unsubscribe();
 		};
 	}, []);
+
+	useEffect(() => {
+		if (!policy?.force_update) {
+			return;
+		}
+
+		let cancelled = false;
+
+		const refreshUpdateData = async () => {
+			await clientUpdateApi.reportVersion().catch(() => {
+				// Keep the existing dialog state when the policy endpoint is temporarily unavailable.
+			});
+
+			const state = await window.lerosDesktop.getState().catch(() => null);
+			if (!state || cancelled) {
+				return;
+			}
+
+			setUpdateState(state);
+			if (!state.canCheck || state.phase === "checking" || state.phase === "downloading") {
+				return;
+			}
+
+			const nextState = await window.lerosDesktop.checkForUpdates().catch(() => null);
+			if (nextState && !cancelled) {
+				setUpdateState(nextState);
+			}
+		};
+
+		void refreshUpdateData();
+		const intervalId = window.setInterval(refreshUpdateData, forcedUpdateRefreshIntervalMs);
+
+		return () => {
+			cancelled = true;
+			window.clearInterval(intervalId);
+		};
+	}, [policy?.force_update]);
 
 	if (!policy?.force_update) {
 		return null;
@@ -86,6 +149,12 @@ function ClientUpdateGate() {
 			}
 			if (nextState.phase === "up-to-date") {
 				toast.message("当前版本已低于服务端最低要求，请等待新版本发布");
+			}
+			if (nextState.phase === "available") {
+				toast.success(nextState.message);
+			}
+			if (nextState.phase === "error") {
+				toast.error(nextState.message);
 			}
 		} finally {
 			setChecking(false);
@@ -106,7 +175,12 @@ function ClientUpdateGate() {
 
 	const message = policy.message || "当前客户端版本过低，请更新后继续使用";
 	const currentVersion = policy.current_version || updateState.currentVersion;
-	const targetVersion = policy.min_supported_version || policy.latest_version || "最新版本";
+	const targetVersion =
+		updateState.availableVersion ||
+		updateState.downloadedVersion ||
+		policy.latest_version ||
+		policy.min_supported_version ||
+		"最新版本";
 	const statusMessage =
 		updateState.phase === "up-to-date"
 			? "暂未发现可下载的新版本，请稍后重试"

@@ -14,7 +14,6 @@ frontend/
 │   │   │   ├── (shell)/         # 应用壳路由组（LeftRail + 页面内容）
 │   │   │   │   ├── layout.tsx   # 路由页面共享 Shell
 │   │   │   │   ├── workbench/   # /workbench
-│   │   │   │   ├── chat/        # /chat
 │   │   │   │   ├── projects/    # /projects/[projectId] 及子路由
 │   │   │   │   ├── assistants/  # /assistants
 │   │   │   │   ├── tasks/       # /tasks
@@ -188,10 +187,31 @@ pnpm dist:desktop
 
 # 当前系统的未打包目录，适合最快速验证
 pnpm dist:desktop:dir
+
+# 私有化完整安装包（当前系统）
+pnpm dist:desktop:private
+
+# 私有化未打包目录，适合本地快速验证私有化流程
+pnpm dist:desktop:private:dir
 ```
 
+私有化品牌注入（可选，不设则仍为 Lework）：
+
+```bash
+# 只设客户标识，沿用官方 Logo
+LEROS_DEPLOY_MODE=acme pnpm dist:desktop:private:win:x64
+
+# 从 COS 下载 Logo：{S3域名}/fronted/{mode}/logo.svg（没有则再试 logo.png；都没有则打包失败）
+LEROS_DEPLOY_MODE=acme LEROS_DEPLOY_S3_DOMAIN=https://<s3-domain> pnpm dist:desktop:private:win:x64
+
+# 同时替换界面品牌名
+LEROS_DEPLOY_MODE=acme LEROS_DEPLOY_APP_NAME=AcmeAI pnpm dist:desktop:private:win:x64
+```
+
+CI 私有化包上传到 COS `application/private/{mode}/`，官网隐藏入口为 `/download?edition=private&mode={mode}`；SaaS Linux 为 `/download?platform=linux`。
+
 产物输出到 `apps/desktop/dist/`。本地 `dist:*` 命令固定使用 `--publish never`，只生成安装包，不会上传 Release。
-`pnpm dist:desktop` 用于快速验证当前系统包：macOS 默认只生成 ZIP，避免部分本地/沙箱环境无法调用 `hdiutil` 创建 DMG；Windows 默认生成 NSIS 安装包；Linux 默认生成 AppImage 和 `.deb`。`pnpm dist:desktop:dir` 只生成未打包应用目录，适合最快速验证 Electron/Vite 构建和应用启动。正式 macOS Release 请使用 `dist:desktop:mac:arm64` / `dist:desktop:mac:x64` 或 tag workflow。
+`pnpm dist:desktop` 用于快速验证当前系统包：macOS 默认只生成 ZIP，避免部分本地/沙箱环境无法调用 `hdiutil` 创建 DMG；Windows 默认生成 NSIS 安装包；Linux 默认生成 AppImage 和 `.deb`。`pnpm dist:desktop:dir` / `pnpm dist:desktop:private:dir` 只生成未打包应用目录，适合最快速验证 Electron/Vite 构建和应用启动；后者会注入私有化部署标记。正式 macOS Release 请使用 `dist:desktop:mac:arm64` / `dist:desktop:mac:x64` 或 tag workflow。
 
 ### GitHub Release 发布
 
@@ -269,11 +289,10 @@ Web 和 Desktop 使用同一套路由语义。Web 通过 Next.js App Router 暴�
 |------|------|------|
 | `/` | Redirect | Web 和 Desktop 均跳转到 `/workbench` |
 | `/workbench` | Workbench | 工作台首页 |
-| `/chat` | Chat | 通用会话页 |
 | `/projects/:projectId` | Project | 项目会话 tab |
 | `/projects/:projectId/tasks` | Project | 项目任务 tab |
 | `/projects/:projectId/files` | Project | 项目文件 tab |
-| `/projects/:projectId/tasks/:taskId?sessionId=xxx` | TaskDetail | 任务详情和任务会话 |
+| `/projects/:projectId/tasks/:taskId/sessions/:sessionId` | TaskDetail | 任务详情和任务会话 |
 | `/assistants` | Assistants | AI 队友列表 |
 | `/tasks` | Placeholder | 全局任务页占位 |
 | `/skills` | Placeholder | 技能页占位 |
@@ -291,7 +310,7 @@ type AppNavigation = {
   currentPath: string;
   goToRoute(route: ViewMode): void;
   goToProject(projectId: string): void;
-  goToTaskDetail(projectId: string, taskId: string, sessionId?: string | null): void;
+  goToTaskDetail(projectId: string, taskId: string, sessionId: string): void;
 };
 ```
 

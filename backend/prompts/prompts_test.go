@@ -174,15 +174,17 @@ func TestDefaultManagerBuiltinPrompts(t *testing.T) {
 			KeyEventOrchestratorTaskIssueComment, KeyLLMTestConnectivity,
 			KeyAgentNativeTaskCompletion, KeyAgentNativeToolEnforcement,
 			KeyAgentNativeSkillLoading, KeyAgentNativeSkillUsageHint,
+			KeyAgentSystemCommunication, KeyAgentSystemOutputBoundary,
 			KeyAgentSystemMemoryGuidance,
 			KeyAgentSystemPlatformWechat, KeyAgentSystemPlatformFeishu,
 			KeyAgentSystemPlatformSlack, KeyAgentSystemPlatformAPI,
-			KeySessionTitle, KeyWorkTitle, KeyAgentNativeArtifactDeclaration:
+			KeyWorkShortTitle, KeyAgentNativeArtifactDeclaration,
+			KeyAgentSceneBidComparison:
 			matchCount++
 		}
 	}
-	if matchCount != 19 {
-		t.Fatalf("expected 19 built-in keys, matched %d", matchCount)
+	if matchCount != 21 {
+		t.Fatalf("expected 21 built-in keys, matched %d", matchCount)
 	}
 
 	_, err := Run(context.Background(), KeyLLMTestConnectivity, nil)
@@ -191,6 +193,27 @@ func TestDefaultManagerBuiltinPrompts(t *testing.T) {
 	}
 	if atomic.LoadInt32(&execCalled) != 1 {
 		t.Fatal("executor was not called")
+	}
+}
+
+func TestAgentSystemOutputBoundaryRemainsGeneric(t *testing.T) {
+	boundary := Get(KeyAgentSystemOutputBoundary)
+	if !strings.Contains(boundary, "## 对外输出边界") {
+		t.Fatal("expected output boundary heading")
+	}
+
+	for _, forbidden := range []string{
+		"--json",
+		"--user-id",
+		"--project-id",
+		"自动化任务",
+		"Skill code",
+		"leros automation",
+		"leros skill",
+	} {
+		if strings.Contains(boundary, forbidden) {
+			t.Fatalf("generic output boundary must not mention business-specific %q: %s", forbidden, boundary)
+		}
 	}
 }
 

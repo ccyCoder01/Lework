@@ -7,6 +7,8 @@ $runtimeState = Get-ConfiguredDevRuntimeState
 $env:LEROS_DEV = 'true'
 $workspaceMountRoot = "$root\.leros-workspace"
 
+Ensure-LatestBackendBinary -RepoRoot $root
+
 $resolvedWorkerConfig = New-ResolvedWorkerConfig -RepoRoot $root -ServerPort $runtimeState.serverPort
 
 Set-Location $root

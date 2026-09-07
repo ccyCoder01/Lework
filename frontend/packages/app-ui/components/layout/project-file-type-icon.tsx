@@ -1,11 +1,14 @@
-import { ClipboardList } from "lucide-react";
+import { ClipboardList, Folder } from "lucide-react";
 
 const FILE_DOCX_ICON_SRC = new URL("../../assets/icons/file-docx.svg", import.meta.url).href;
 const FILE_XLSX_ICON_SRC = new URL("../../assets/icons/file-xlsx.svg", import.meta.url).href;
 const FILE_PPTX_ICON_SRC = new URL("../../assets/icons/file-pptx.svg", import.meta.url).href;
 const FILE_MD_ICON_SRC = new URL("../../assets/icons/file-md.svg", import.meta.url).href;
+const FILE_HTML_ICON_SRC = new URL("../../assets/icons/file-html.svg", import.meta.url).href;
 const FILE_TEXT_ICON_SRC = new URL("../../assets/icons/file-text.svg", import.meta.url).href;
 const FILE_PDF_ICON_SRC = new URL("../../assets/icons/file-pdf.svg", import.meta.url).href;
+const FILE_PICTURE_ICON_SRC = new URL("../../assets/icons/file-picture.svg", import.meta.url).href;
+const FILE_VIDEO_ICON_SRC = new URL("../../assets/icons/file-video.svg", import.meta.url).href;
 const FILE_PICTURE_JPEG_ICON_SRC = new URL(
 	"../../assets/icons/file-picture-jpeg.svg",
 	import.meta.url,
@@ -32,20 +35,34 @@ export function getProjectFileIconSrc(fileName: string): string {
 	if (lowerPath.endsWith(".png")) {
 		return FILE_PICTURE_PNG_ICON_SRC;
 	}
+	if (
+		lowerPath.endsWith(".gif") ||
+		lowerPath.endsWith(".bmp") ||
+		lowerPath.endsWith(".webp") ||
+		lowerPath.endsWith(".svg")
+	) {
+		return FILE_PICTURE_ICON_SRC;
+	}
+	if (lowerPath.endsWith(".mp4") || lowerPath.endsWith(".mov") || lowerPath.endsWith(".avi")) {
+		return FILE_VIDEO_ICON_SRC;
+	}
 	if (lowerPath.endsWith(".pdf")) {
 		return FILE_PDF_ICON_SRC;
 	}
-	if (lowerPath.endsWith(".docx")) {
+	if (lowerPath.endsWith(".docx") || lowerPath.endsWith(".doc")) {
 		return FILE_DOCX_ICON_SRC;
 	}
 	if (lowerPath.endsWith(".xlsx") || lowerPath.endsWith(".xls") || lowerPath.endsWith(".csv")) {
 		return FILE_XLSX_ICON_SRC;
 	}
-	if (lowerPath.endsWith(".pptx")) {
+	if (lowerPath.endsWith(".pptx") || lowerPath.endsWith(".ppt")) {
 		return FILE_PPTX_ICON_SRC;
 	}
 	if (lowerPath.endsWith(".md") || lowerPath.endsWith(".markdown")) {
 		return FILE_MD_ICON_SRC;
+	}
+	if (lowerPath.endsWith(".html") || lowerPath.endsWith(".htm")) {
+		return FILE_HTML_ICON_SRC;
 	}
 
 	return FILE_TEXT_ICON_SRC;
@@ -54,11 +71,16 @@ export function getProjectFileIconSrc(fileName: string): string {
 /** 文件 Tab 与文件卡片共用的类型图标组件 */
 export function ProjectFileTypeIcon({
 	fileName,
+	nodeType = "file",
 	className = "size-6 object-contain",
 }: {
 	fileName: string;
+	nodeType?: "file" | "folder";
 	className?: string;
 }) {
+	if (nodeType === "folder") {
+		return <Folder className={className} aria-hidden="true" />;
+	}
 	return (
 		<img src={getProjectFileIconSrc(fileName)} alt="" className={className} aria-hidden="true" />
 	);

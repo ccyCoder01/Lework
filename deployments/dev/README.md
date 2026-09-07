@@ -64,7 +64,9 @@ Notes for Windows:
 
 - `stop-dev.cmd` will auto request administrator permission when needed, because Windows may block killing the frontend process tree under normal permission.
 - `start-dev.cmd` keeps using the repo's normal frontend `dev:web` flow, so frontend still hot reloads as usual.
+- `start-dev.cmd` waits for PostgreSQL/NATS health checks, server/worker/frontend ports, and syncs `~/.leros/config.yaml` before reporting ready.
 - If `bundles/leros.exe` is missing, `start-dev.cmd` will rebuild it automatically.
+- If the local database contains duplicate user-org UINs and the backend migration cannot create its unique index, `start-dev.cmd` will explain the conflict and ask whether to reset the local PostgreSQL/NATS volumes. The reset requires explicit `y` confirmation.
 
 The server and worker scripts support `--build` (or `-b`) to rebuild `./bundles/leros` before starting. The scripts load `deployments/dev/.env` before reading YAML config, so values like `${LLM_API_KEY}` in config files are resolved from `.env`.
 
@@ -91,7 +93,7 @@ docker-compose -f docker-compose.dev.yml down
 | API Server   | 8080      | local process  |
 | Worker HTTP  | 8081      | local process  |
 | PostgreSQL   | 5433      | 5432           |
-| NATS         | 4223      | 4222           |
+| NATS         | 14223     | 4222           |
 | NATS Mon.    | 8223      | 8222           |
 | Web Frontend | 3005      | local process  |
 

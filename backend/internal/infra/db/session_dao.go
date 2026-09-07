@@ -23,8 +23,6 @@ func CreateSession(ctx context.Context, db *gorm.DB, session *types.Session) err
 			"type",
 			"uin",
 			"org_id",
-			"assistant_id",
-			"allocated_assistant_id",
 			"status",
 			"title",
 			"title_manually_set",
@@ -72,8 +70,6 @@ func UpdateSession(ctx context.Context, db *gorm.DB, session *types.Session) err
 			"type",
 			"uin",
 			"org_id",
-			"assistant_id",
-			"allocated_assistant_id",
 			"status",
 			"title",
 			"title_manually_set",
@@ -144,12 +140,12 @@ func ListSessions(ctx context.Context, db *gorm.DB, opt *types.PageQuery) ([]*ty
 				query = query.Where("status = ?", filter.Value[0])
 			}
 		case "assistant_id":
-			if len(filter.Value) > 0 {
-				query = query.Where("assistant_id = ?", filter.Value[0])
-			}
-		case "assistant_code":
-			if len(filter.Value) > 0 {
-				query = query.Where("assistant_code = ?", filter.Value[0])
+			if len(filter.Value) > 0 && filter.Value[0] != "" {
+				query = query.Where(`project_id IS NOT NULL AND project_id IN (
+					SELECT r.biz_id FROM leros_resource r
+					INNER JOIN leros_resource_binding rb ON rb.resource_id = r.id AND rb.deleted_at IS NULL
+					WHERE r.org_id = ? AND r.type = ? AND r.deleted_at IS NULL AND rb.assistant_id = ?
+				)`, opt.OrgID, types.ResourceTypeProject, filter.Value[0])
 			}
 		case "keyword":
 			if len(filter.Value) > 0 {
@@ -207,11 +203,6 @@ func IncrementMessageCount(ctx context.Context, db *gorm.DB, id uint) error {
 // UpdateLastMessageAt 更新会话最后消息时间
 func UpdateLastMessageAt(ctx context.Context, db *gorm.DB, id uint, lastMessageAt time.Time) error {
 	return db.WithContext(ctx).Model(&types.Session{}).Where("id = ?", id).Update("last_message_at", lastMessageAt).Error
-}
-
-// UpdateAllocatedAssistantID 更新会话分配的数字员工 ID
-func UpdateAllocatedAssistantID(ctx context.Context, db *gorm.DB, id uint, allocatedAssistantID uint) error {
-	return db.WithContext(ctx).Model(&types.Session{}).Where("id = ?", id).Update("allocated_assistant_id", allocatedAssistantID).Error
 }
 
 // GetSessionsByIDs 批量根据ID查询会话

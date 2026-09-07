@@ -22,6 +22,17 @@ const (
 	LLMModelStatusInactive LLMModelStatus = "inactive"
 )
 
+// LLMModelPurpose 表示LLM模型配置的业务用途。
+// 用途是默认标记（is_default）唯一性的粒度：每个用途下有且仅有一个默认模型。
+type LLMModelPurpose string
+
+const (
+	// LLMModelPurposeConversation 对话用途，用于常规对话推理。
+	LLMModelPurposeConversation LLMModelPurpose = "conversation"
+	// LLMModelPurposeTranslation 翻译用途，用于快速翻译等专用场景。
+	LLMModelPurposeTranslation LLMModelPurpose = "translation"
+)
+
 // LLMModel 定义一个在数据库中持久化的LLM模型配置
 //
 // 该表以“可直接调用的模型配置”为最小管理单元，暂时将供应商、
@@ -30,7 +41,7 @@ type LLMModel struct {
 	gorm.Model
 
 	// 模型所属组织ID，用于隔离不同组织的模型配置
-	OrgID uint `gorm:"column:org_id;type:integer;not null;index;uniqueIndex:idx_llm_model_org_code;uniqueIndex:idx_llm_model_org_default,where:is_default = true AND deleted_at IS NULL"`
+	OrgID uint `gorm:"column:org_id;type:integer;not null;index;uniqueIndex:idx_llm_model_org_code"`
 	// 模型配置编码，在组织内唯一，用于业务配置引用
 	Code string `gorm:"column:code;type:varchar(128);not null;uniqueIndex:idx_llm_model_org_code"`
 	// 模型展示名称，用于前端列表和选择器展示
@@ -61,6 +72,8 @@ type LLMModel struct {
 
 	// 模型状态，inactive状态下不应被新任务选择
 	Status string `gorm:"column:status;type:varchar(32);not null;default:active;index"` // 建议使用 types.LLMModelStatus 定义的常量值
+	// 模型业务用途，默认标记（is_default）按用途各自唯一，由应用层保证，不设唯一索引
+	Purpose LLMModelPurpose `gorm:"column:purpose;type:varchar(32);not null;default:conversation;index"` // 建议使用 types.LLMModelPurpose 定义的常量值
 	// 是否为组织默认模型，业务未显式选择模型时可回退到该模型
 	IsDefault bool `gorm:"column:is_default;type:boolean;default:false;index"`
 	// 是否为系统内置配置，内置配置可用于初始化或演示场景
@@ -105,4 +118,49 @@ func (c LLMModelConfig) Value() (driver.Value, error) {
 		return nil, nil
 	}
 	return json.Marshal(map[string]interface{}(c))
+}
+
+// LLMLimitFields 描述模型上下文窗口与单次输出上限（来源 config.yaml/DB config）。
+type LLMLimitFields struct {
+	Context int `json:"context,omitempty"`
+	Output  int `json:"output,omitempty"`
+}
+
+// LLMSamplingParams 是按字段名存储的采样参数集合，键对齐 OpenAI 兼容服务的 snake_case 字段。
+type LLMSamplingParams struct {
+	TopP             *float64        `json:"top_p,omitempty"`
+	FrequencyPenalty *float64        `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float64        `json:"presence_penalty,omitempty"`
+	Limit            *LLMLimitFields `json:"limit,omitempty"`
+}
+
+// SamplingParamsFromConfig 从扩展配置 map 中解包采样参数。
+// 缺省（无 config 或未声明对应键）返回零值。仅在此处触碰 map 对应键。
+func SamplingParamsFromConfig(c LLMModelConfig) LLMSamplingParams {
+	params := LLMSamplingParams{}
+	if len(c) == 0 {
+		return params
+	}
+	if v, ok := c["top_p"].(float64); ok {
+		params.TopP = &v
+	}
+	if v, ok := c["frequency_penalty"].(float64); ok {
+		params.FrequencyPenalty = &v
+	}
+	if v, ok := c["presence_penalty"].(float64); ok {
+		params.PresencePenalty = &v
+	}
+	if raw, ok := c["limit"].(map[string]interface{}); ok {
+		limit := &LLMLimitFields{}
+		if v, ok := raw["context"].(float64); ok && v > 0 {
+			limit.Context = int(v)
+		}
+		if v, ok := raw["output"].(float64); ok && v > 0 {
+			limit.Output = int(v)
+		}
+		if limit.Context > 0 || limit.Output > 0 {
+			params.Limit = limit
+		}
+	}
+	return params
 }

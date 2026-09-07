@@ -48,6 +48,16 @@ const (
 	MessageTypeFile  MessageType = "file"
 )
 
+// ExecutionMode describes the business/API execution mode requested for a user message.
+type ExecutionMode string
+
+const (
+	// ExecutionModeDefault uses the normal runtime behavior.
+	ExecutionModeDefault ExecutionMode = "default"
+	// ExecutionModePlan requests planning behavior from runtimes that support it.
+	ExecutionModePlan ExecutionMode = "plan"
+)
+
 // MessageStatus 消息状态常量
 type MessageStatus string
 
@@ -153,6 +163,21 @@ type SessionMessage struct {
 
 	// session_message - 时间戳（Unix毫秒），BIGINT，允许为空
 	Timestamp int64 `gorm:"column:timestamp;type:bigint"`
+
+	// session_message - 发送者用户ID（真人发言时有值，AI回复时为nil），BIGINT
+	SenderUin *uint `gorm:"column:sender_uin;type:bigint;default:0"`
+
+	// session_message - 发送者名称（真人=User.Name，AI=DigitalAssistant.Name），VARCHAR(255)
+	SenderName string `gorm:"column:sender_name;type:varchar(255);default:''"`
+
+	// session_message - 关联的 agent run ID（AI 回复消息时填充），VARCHAR(255)
+	RunID string `gorm:"column:run_id;type:varchar(255);default:''"`
+
+	// session_message - 关联的 AI 队友 ID（AI 回复时填充，用户消息为 0），BIGINT，DEFAULT 0，INDEX
+	AssistantID uint `gorm:"column:assistant_id;type:bigint;default:0;index"`
+
+	// session_message - 自动化执行记录主键（首条自动化指令消息），BIGINT，可空，唯一索引
+	AutomationExecutionID *uint `gorm:"column:automation_execution_id;type:bigint;index"`
 }
 
 // TableName 指定SessionMessage结构体对应的数据库表名
@@ -162,18 +187,21 @@ func (SessionMessage) TableName() string {
 
 // MessageUsage stores model token usage for a session message.
 type MessageUsage struct {
-	InputTokens  int `json:"input_tokens,omitempty"`
-	OutputTokens int `json:"output_tokens,omitempty"`
-	TotalTokens  int `json:"total_tokens,omitempty"`
+	TotalTokens       int `json:"total_tokens"`
+	InputTokens       int `json:"input_tokens"`
+	OutputTokens      int `json:"output_tokens"`
+	CacheInputTokens  int `json:"cache_input_tokens"`
+	CacheOutputTokens int `json:"cache_output_tokens"`
 }
 
 // MessageChunk stores one archived runtime event for a completed session message.
 type MessageChunk struct {
-	Seq       int64           `json:"seq,omitempty"`
-	LastSeq   int64           `json:"last_seq,omitempty"`
-	Type      string          `json:"type"`
-	Timestamp int64           `json:"timestamp,omitempty"`
-	Payload   json.RawMessage `json:"payload,omitempty" swaggertype:"object"`
+	Seq         int64           `json:"seq,omitempty"`
+	LastSeq     int64           `json:"last_seq,omitempty"`
+	Type        string          `json:"type"`
+	Timestamp   int64           `json:"timestamp,omitempty"`
+	Payload     json.RawMessage `json:"payload,omitempty" swaggertype:"object"`
+	AssistantID string          `json:"assistant_id,omitempty"`
 }
 
 // MessageArtifact stores one lightweight artifact reference for a session message.
@@ -188,6 +216,7 @@ type MessageArtifact struct {
 	StorageURI   string    `json:"storage_uri,omitempty"`
 	Sha256       string    `json:"sha256,omitempty"`
 	CreatedAt    time.Time `json:"created_at,omitempty"`
+	VersionNo    int       `json:"version_no,omitempty"`
 }
 
 // MessageArtifactSlice stores artifact references in JSONB.
@@ -201,8 +230,10 @@ type MessageAttachment struct {
 	Name         string `json:"name"`
 	MimeType     string `json:"mime_type"`
 	Size         int64  `json:"size"`
-	Purpose      string `json:"purpose,omitempty"`
-	PublicURL    string `json:"PublicURL"` // resolved at runtime, not exposed to front end
+	// AttachmentRole 是工具场景赋予附件的语义角色；空表示普通附件。
+	AttachmentRole string `json:"attachment_role,omitempty"`
+	PublicURL      string `json:"PublicURL"`
+	RelativePath   string `json:"relative_path"`
 }
 
 type MessageAttachmentSlice []MessageAttachment
@@ -308,8 +339,6 @@ func (mu *MessageUsage) Scan(value interface{}) error {
 
 // Value 瀹炵幇 driver.Valuer 鎺ュ彛
 func (mu MessageUsage) Value() (driver.Value, error) {
-	if mu.InputTokens == 0 && mu.OutputTokens == 0 && mu.TotalTokens == 0 {
-		return nil, nil
-	}
+	mu.TotalTokens = mu.InputTokens + mu.OutputTokens
 	return json.Marshal(mu)
 }

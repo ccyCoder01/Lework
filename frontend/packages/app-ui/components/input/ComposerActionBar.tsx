@@ -1,6 +1,6 @@
 "use client";
 
-import { type SkillInstalledItem, skillMarketplaceApi } from "@leros/store";
+import { type PluginComposerOption, skillCodeFromToken } from "@leros/store";
 import {
 	Command,
 	CommandEmpty,
@@ -8,30 +8,54 @@ import {
 	CommandInput,
 	CommandItem,
 	CommandList,
+	CommandSeparator,
 } from "@leros/ui/components/ui/command";
 import { Popover, PopoverContent, PopoverTrigger } from "@leros/ui/components/ui/popover";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@leros/ui/components/ui/tooltip";
 import { cn } from "@leros/ui/lib/utils";
-import { Bot, Plus, Sparkles, WandSparkles } from "lucide-react";
-import { type ReactNode, type RefObject, useEffect, useMemo, useState } from "react";
-import { mockAssistants } from "./mockDirectiveData";
-import type { ComposerSkillOption, StructuredComposerHandle } from "./StructuredComposer";
+import {
+	Bot,
+	Cable,
+	ClipboardPenLine,
+	FileText,
+	Folder,
+	Plus,
+	Sparkles,
+	WandSparkles,
+} from "lucide-react";
+import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from "react";
+import { MCPConnectorIcon } from "../common/MCPConnectorIcon";
+import { renderHighlightedText } from "../common/searchText";
+import { AssistantAvatar } from "../digitalAssistant/AssistantAvatar";
+import type { ComposerAssistantOption, StructuredComposerHandle } from "./StructuredComposer";
+import { getSkillSourceLabel } from "./skillSourceLabel";
 
 type ComposerActionBarProps = {
 	inputValue: string;
 	composerRef: RefObject<StructuredComposerHandle | null>;
 	onUpload?: () => void;
+	onUploadFolder?: () => void;
 	onBeforeAction?: () => boolean;
 	children?: ReactNode;
 	className?: string;
-	projectSkillOptions?: ComposerSkillOption[];
+	assistantOptions?: ComposerAssistantOption[];
+	skillOptions?: PluginComposerOption[];
+	skillsLoading?: boolean;
+	onAssistantPickerOpen?: () => Promise<boolean> | undefined;
+	onSkillPickerOpen?: () => void;
 	disableAssistantAndSkill?: boolean;
-};
-
-type SkillOption = {
-	code: string;
-	label: string;
-	description: string;
-	keywords: string[];
+	assistantSelectionMode?: "single" | "multiple";
+	executionMode?: "default" | "plan";
+	setExecutionMode?: (mode: "default" | "plan") => void;
+	isGenerating?: boolean;
+	/** 连接器候选与选中状态：用于「添加连接器」多选弹窗。已选项在上方独立区域，可在此移除。 */
+	connectorOptions?: PluginComposerOption[];
+	connectorsLoading?: boolean;
+	selectedConnectorIds?: string[];
+	onSelectConnector?: (publicId: string) => void;
+	onRemoveConnector?: (publicId: string) => void;
+	connectorDisabled?: boolean;
+	connectorDisabledReason?: string;
 };
 
 function dedupeValues(values: string[]): string[] {
@@ -44,138 +68,152 @@ function parseSelectedAssistantNames(value: string): string[] {
 	);
 }
 
-function parseSelectedSlashLabels(value: string): string[] {
+function selectedSkillCodesFromComposer(
+	composerRef: RefObject<StructuredComposerHandle | null>,
+	skillOptions: PluginComposerOption[],
+): string[] {
+	const tokens = composerRef.current?.getComposerTokens() ?? [];
 	return dedupeValues(
-		Array.from(value.matchAll(/(?:^|\s)\/([^\s@/]+)/g)).map((match) => match[1] ?? ""),
+		tokens
+			.filter((token) => token.kind === "skill")
+			.map((token) => {
+				const id = skillCodeFromToken(token);
+				if (id) return id;
+				const raw = token.label.replace(/^\/+/, "").trim();
+				return skillOptions.find((skill) => skill.label === raw || skill.code === raw)?.code ?? "";
+			}),
 	);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
-}
-
-function stringFromValue(value: unknown): string {
-	return typeof value === "string" ? value : "";
-}
-
-function skillItemFromValue(value: unknown): SkillInstalledItem | null {
-	if (!isRecord(value)) return null;
-
-	const name = stringFromValue(value.name || value.skill_id || value.id);
-	if (!name) return null;
-
-	return {
-		name,
-		display_name: stringFromValue(value.display_name),
-		description: stringFromValue(value.description),
-		category: stringFromValue(value.category),
-		source: stringFromValue(value.source || value.source_type),
-		trust: stringFromValue(value.trust),
-	};
-}
-
-function normalizeInstalledSkillsPayload(value: unknown): SkillInstalledItem[] {
-	const toItems = (items: unknown[]) =>
-		items.map(skillItemFromValue).filter((item): item is SkillInstalledItem => item !== null);
-
-	if (Array.isArray(value)) return toItems(value);
-	if (!isRecord(value)) return [];
-
-	const nestedData = value.data;
-	if (isRecord(nestedData)) {
-		if (Array.isArray(nestedData.skills)) return toItems(nestedData.skills);
-		if (Array.isArray(nestedData.items)) return toItems(nestedData.items);
-	}
-
-	if (Array.isArray(value.skills)) return toItems(value.skills);
-	if (Array.isArray(value.items)) return toItems(value.items);
-	return [];
-}
-
-function installedSkillToOption(skill: SkillInstalledItem): SkillOption {
-	const label = skill.display_name || skill.name;
-	return {
-		code: skill.name,
-		label,
-		description: skill.description || skill.category || "已安装技能",
-		keywords: [label, skill.name, skill.description, skill.category, skill.source, skill.trust].filter(
-			Boolean,
-		),
-	};
 }
 
 export function ComposerActionBar({
 	inputValue,
 	composerRef,
 	onUpload,
+	onUploadFolder,
 	onBeforeAction,
 	children,
 	className,
-	projectSkillOptions,
+	assistantOptions = [],
+	skillOptions = [],
+	skillsLoading,
+	onAssistantPickerOpen,
+	onSkillPickerOpen,
 	disableAssistantAndSkill = false,
+	assistantSelectionMode = "multiple",
+	executionMode,
+	setExecutionMode,
+	isGenerating,
+	connectorOptions = [],
+	connectorsLoading,
+	selectedConnectorIds = [],
+	onSelectConnector,
+	onRemoveConnector,
+	connectorDisabled = false,
+	connectorDisabledReason,
 }: ComposerActionBarProps) {
 	const [assistantOpen, setAssistantOpen] = useState(false);
+	const [assistantSearch, setAssistantSearch] = useState("");
 	const [skillOpen, setSkillOpen] = useState(false);
 	const [skillSearch, setSkillSearch] = useState("");
-	const [skillOptions, setSkillOptions] = useState<SkillOption[]>([]);
-	const [skillsLoading, setSkillsLoading] = useState(false);
-	const [skillsLoaded, setSkillsLoaded] = useState(false);
-	const [skillsError, setSkillsError] = useState<string | null>(null);
+	const [connectorOpen, setConnectorOpen] = useState(false);
+	const [connectorSearch, setConnectorSearch] = useState("");
+	const [uploadMenuOpen, setUploadMenuOpen] = useState(false);
+	const [assistantRefreshState, setAssistantRefreshState] = useState<
+		"idle" | "loading" | "ready" | "error"
+	>("idle");
+	const assistantRefreshCycleRef = useRef(0);
+	const derivedSkillsLoading = skillOpen && skillsLoading;
+
+	useEffect(() => {
+		if (!skillOpen) return;
+		onSkillPickerOpen?.();
+	}, [onSkillPickerOpen, skillOpen]);
+
+	const handleAssistantOpenChange = (open: boolean) => {
+		setAssistantOpen(open);
+		if (!open) {
+			assistantRefreshCycleRef.current += 1;
+			setAssistantRefreshState("idle");
+			setAssistantSearch("");
+			return;
+		}
+
+		const refreshCycle = ++assistantRefreshCycleRef.current;
+		setAssistantRefreshState("loading");
+		void Promise.resolve(onAssistantPickerOpen?.())
+			.then((succeeded) => {
+				if (refreshCycle !== assistantRefreshCycleRef.current) return;
+				setAssistantRefreshState(succeeded === false ? "error" : "ready");
+			})
+			.catch(() => {
+				if (refreshCycle === assistantRefreshCycleRef.current) setAssistantRefreshState("error");
+			});
+	};
+
+	useEffect(() => {
+		if (connectorDisabled) {
+			setConnectorOpen(false);
+			setConnectorSearch("");
+		}
+	}, [connectorDisabled]);
 
 	const selectedAssistantNames = useMemo(
 		() => parseSelectedAssistantNames(inputValue),
 		[inputValue],
 	);
-	const selectedSlashLabels = useMemo(() => parseSelectedSlashLabels(inputValue), [inputValue]);
-	const selectedSkillLabels = useMemo(
-		() =>
-			selectedSlashLabels.filter((label) =>
-				skillOptions.some((option) => option.label === label || option.code === label),
-			),
-		[selectedSlashLabels, skillOptions],
+	const selectedSkillCodes = useMemo(
+		() => selectedSkillCodesFromComposer(composerRef, skillOptions),
+		[composerRef, inputValue, skillOptions],
 	);
-	const filteredAssistants = useMemo(
-		() => mockAssistants.filter((assistant) => !selectedAssistantNames.includes(assistant.name)),
-		[selectedAssistantNames],
+	const selectedSkillCodeSet = useMemo(
+		() => new Set(selectedSkillCodes.map((code) => code.toLowerCase())),
+		[selectedSkillCodes],
 	);
+	const filteredAssistants = useMemo(() => {
+		const query = assistantSearch.trim().toLowerCase();
+		return assistantOptions.filter((assistant) => {
+			if (
+				assistantSelectionMode === "multiple" &&
+				selectedAssistantNames.includes(assistant.name)
+			) {
+				return false;
+			}
+			if (!query) return true;
+			return [assistant.name, assistant.roleName, assistant.id, assistant.description]
+				.join(" ")
+				.toLowerCase()
+				.includes(query);
+		});
+	}, [assistantOptions, assistantSearch, assistantSelectionMode, selectedAssistantNames]);
 	const filteredSkills = useMemo(() => {
 		const query = skillSearch.trim().toLowerCase();
 		return skillOptions.filter((skill) => {
-			if (selectedSkillLabels.includes(skill.label)) return false;
+			if (selectedSkillCodeSet.has(skill.code.toLowerCase())) return false;
 			if (!query) return true;
-			// 中文注释：技能搜索只按名称/code 匹配，描述和标签不参与搜索，避免弱相关结果排在前面。
-			return [skill.label, skill.code].join(" ").toLowerCase().includes(query);
+			return [skill.label, skill.code, skill.description].join(" ").toLowerCase().includes(query);
 		});
-	}, [selectedSkillLabels, skillOptions, skillSearch]);
-
-	useEffect(() => {
-		if (projectSkillOptions) {
-			setSkillOptions(projectSkillOptions);
-			setSkillsLoaded(true);
-			setSkillsError(null);
-			setSkillsLoading(false);
-			return;
-		}
-		if (!skillOpen || skillsLoaded) return;
-
-		setSkillsLoading(true);
-		setSkillsError(null);
-		skillMarketplaceApi
-			.installed()
-			.then((response) => {
-				const raw = normalizeInstalledSkillsPayload(response.data);
-				setSkillOptions(raw.map(installedSkillToOption));
-				setSkillsLoaded(true);
-			})
-			.catch((error: unknown) => {
-				const message = error instanceof Error ? error.message : "技能加载失败";
-				setSkillsError(message);
-				setSkillOptions([]);
-			})
-			.finally(() => {
-				setSkillsLoading(false);
-			});
-	}, [projectSkillOptions, skillOpen, skillsLoaded]);
+	}, [selectedSkillCodeSet, skillOptions, skillSearch]);
+	const filteredConnectors = useMemo(() => {
+		const query = connectorSearch.trim().toLowerCase();
+		return connectorOptions.filter((connector) => {
+			if (connector.pluginId && selectedConnectorIds.includes(connector.pluginId)) {
+				return false;
+			}
+			if (!query) return true;
+			return [connector.label, connector.code, connector.description]
+				.join(" ")
+				.toLowerCase()
+				.includes(query);
+		});
+	}, [connectorOptions, connectorSearch, selectedConnectorIds]);
+	const selectedConnectors = useMemo(() => {
+		return selectedConnectorIds
+			.map((publicId) => connectorOptions.find((item) => item.pluginId === publicId))
+			.filter((item): item is PluginComposerOption => Boolean(item));
+	}, [connectorOptions, selectedConnectorIds]);
+	const assistantPickerLoading = assistantOpen && assistantRefreshState === "loading";
+	const assistantPickerError =
+		assistantRefreshState === "error" ? "AI 队友加载失败，请重新打开" : null;
 
 	const allowAction = () => (onBeforeAction ? onBeforeAction() : true);
 	const assistantSkillButtonClassName = cn(
@@ -183,23 +221,105 @@ export function ComposerActionBar({
 		disableAssistantAndSkill &&
 			"cursor-not-allowed opacity-45 hover:bg-transparent hover:text-slate-600",
 	);
+	const connectorTriggerContent = (
+		<>
+			<Cable className="size-4" />
+			<span>添加连接器</span>
+			{selectedConnectorIds.length > 0 && (
+				<span className="inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-slate-900 text-[10px] font-medium leading-none text-white">
+					{selectedConnectorIds.length}
+				</span>
+			)}
+		</>
+	);
 
 	return (
 		<div className={cn("flex flex-wrap items-center gap-2", className)}>
-			{onUpload && (
-				<button
-					type="button"
-					onClick={() => {
-						if (!allowAction()) return;
-						onUpload();
-					}}
-					className="inline-flex items-center gap-2 rounded-full px-2 py-1.5 text-sm text-slate-600 transition-colors hover:bg-slate-100 hover:text-slate-900"
-				>
-					<Plus className="size-4" />
-					<span>上传文件</span>
-				</button>
+			{setExecutionMode && (
+				<Tooltip>
+					<TooltipTrigger
+						disabled={isGenerating}
+						aria-label="Plan Mode"
+						aria-pressed={executionMode === "plan"}
+						onClick={() => {
+							if (!allowAction()) return;
+							setExecutionMode(executionMode === "plan" ? "default" : "plan");
+						}}
+						className={cn(
+							"order-1 inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-600 transition-colors hover:bg-slate-100 hover:text-slate-900",
+							executionMode === "plan" &&
+								"bg-[var(--leros-primary-softer)] !text-[var(--leros-primary)] hover:bg-[var(--leros-primary-soft)] hover:!text-[var(--leros-primary)]",
+						)}
+					>
+						<ClipboardPenLine className="size-4" />
+					</TooltipTrigger>
+					<TooltipContent side="top">
+						计划模式会先拆解任务并制定方案，提升复杂任务的执行质量
+					</TooltipContent>
+				</Tooltip>
 			)}
-			<Popover open={assistantOpen} onOpenChange={setAssistantOpen}>
+			{onUpload &&
+				(onUploadFolder ? (
+					<Popover open={uploadMenuOpen} onOpenChange={setUploadMenuOpen}>
+						<PopoverTrigger
+							type="button"
+							onClick={(event) => {
+								if (!allowAction()) {
+									event.preventDefault();
+								}
+							}}
+							className="order-5 inline-flex items-center gap-2 rounded-full px-2 py-1.5 text-sm text-slate-600 transition-colors hover:bg-slate-100 hover:text-slate-900"
+						>
+							<Plus className="size-4" />
+							<span>上传文件</span>
+						</PopoverTrigger>
+						<PopoverContent
+							align="start"
+							side="top"
+							sideOffset={10}
+							collisionAvoidance={{ side: "none", align: "shift", fallbackAxisSide: "none" }}
+							className="w-44 p-1.5"
+						>
+							<button
+								type="button"
+								onClick={() => {
+									if (!allowAction()) return;
+									setUploadMenuOpen(false);
+									onUpload();
+								}}
+								className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
+							>
+								<FileText className="size-4 shrink-0 text-slate-500" />
+								<span>选择文件</span>
+							</button>
+							<button
+								type="button"
+								onClick={() => {
+									if (!allowAction()) return;
+									setUploadMenuOpen(false);
+									onUploadFolder();
+								}}
+								className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-sm text-slate-700 transition-colors hover:bg-slate-100"
+							>
+								<Folder className="size-4 shrink-0 text-slate-500" />
+								<span>选择文件夹</span>
+							</button>
+						</PopoverContent>
+					</Popover>
+				) : (
+					<button
+						type="button"
+						onClick={() => {
+							if (!allowAction()) return;
+							onUpload();
+						}}
+						className="order-5 inline-flex items-center gap-2 rounded-full px-2 py-1.5 text-sm text-slate-600 transition-colors hover:bg-slate-100 hover:text-slate-900"
+					>
+						<Plus className="size-4" />
+						<span>上传文件</span>
+					</button>
+				))}
+			<Popover open={assistantOpen} onOpenChange={handleAssistantOpenChange}>
 				<PopoverTrigger
 					type="button"
 					disabled={disableAssistantAndSkill}
@@ -214,7 +334,7 @@ export function ComposerActionBar({
 							event.preventDefault();
 						}
 					}}
-					className={assistantSkillButtonClassName}
+					className={cn(assistantSkillButtonClassName, "order-4")}
 				>
 					<Bot className="size-4" />
 					<span>召唤AI队友</span>
@@ -225,40 +345,70 @@ export function ComposerActionBar({
 					side="top"
 					sideOffset={10}
 					collisionAvoidance={{ side: "none", align: "shift", fallbackAxisSide: "none" }}
-					className="w-[320px] p-1.5"
+					className="w-[340px] p-1.5"
 				>
-					<div className="mb-1 px-2 py-1 text-xs font-medium text-slate-400">选择 AI 队友</div>
-					<div className="max-h-64 overflow-y-auto">
-						{filteredAssistants.length === 0 ? (
-							<div className="px-3 py-6 text-center text-sm text-slate-400">
-								没有可继续添加的 AI 队友
-							</div>
-						) : (
-							filteredAssistants.map((assistant) => (
-								<button
-									key={assistant.code}
-									type="button"
-									onClick={() => {
-										composerRef.current?.insertAssistant(assistant.name);
-									}}
-									className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left transition-colors hover:bg-slate-100"
-								>
-									<div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-600">
-										<Bot className="size-4" />
-									</div>
-									<div className="min-w-0">
-										<div className="truncate text-sm font-medium text-slate-700">
-											{assistant.name}
-										</div>
-										<div className="truncate text-xs text-slate-400">{assistant.description}</div>
-									</div>
-								</button>
-							))
-						)}
-					</div>
+					<Command shouldFilter={false} className="rounded-xl! bg-transparent p-0">
+						<div className="px-2 py-1 text-sm font-semibold text-slate-800">选择 AI 队友</div>
+						<CommandInput
+							value={assistantSearch}
+							onValueChange={setAssistantSearch}
+							placeholder="搜索 AI 队友"
+							className="placeholder:text-slate-300"
+						/>
+						<CommandSeparator className="mx-1 my-2 bg-slate-200/80" />
+						<CommandList className="max-h-64 px-1">
+							{!assistantPickerLoading && !assistantPickerError && (
+								<CommandEmpty className="py-6 text-slate-400">
+									没有可继续添加的 AI 队友
+								</CommandEmpty>
+							)}
+							<CommandGroup className="p-0">
+								{assistantPickerLoading && (
+									<div className="px-2 py-3 text-xs text-slate-400">加载 AI 队友...</div>
+								)}
+								{assistantPickerError && (
+									<div className="px-2 py-3 text-xs text-red-400">{assistantPickerError}</div>
+								)}
+								{!assistantPickerLoading &&
+									!assistantPickerError &&
+									filteredAssistants.map((assistant) => (
+										<CommandItem
+											// 中文注释：CommandItem 的 value 同时承担活动项标识；不能使用可能重复的名称。
+											key={assistant.id}
+											value={`assistant:${assistant.id}`}
+											onSelect={() => {
+												composerRef.current?.insertAssistant(assistant.name);
+												setAssistantOpen(false);
+												setAssistantSearch("");
+											}}
+											className="rounded-lg px-2 py-1.5"
+										>
+											<AssistantAvatar name={assistant.name} src={assistant.avatarUrl} size="sm" />
+											<div className="min-w-0 flex-1">
+												<div className="truncate font-medium text-slate-700">
+													{renderHighlightedText(assistant.name, assistantSearch)}
+												</div>
+												{/* 中文注释：选择弹窗固定两行，名称在上、角色名称在下。 */}
+												{assistant.roleName ? (
+													<div className="truncate text-xs text-slate-500">
+														{renderHighlightedText(assistant.roleName, assistantSearch)}
+													</div>
+												) : null}
+											</div>
+										</CommandItem>
+									))}
+							</CommandGroup>
+						</CommandList>
+					</Command>
 				</PopoverContent>
 			</Popover>
-			<Popover open={skillOpen} onOpenChange={setSkillOpen}>
+			<Popover
+				open={skillOpen}
+				onOpenChange={(open) => {
+					setSkillOpen(open);
+					if (!open) setSkillSearch("");
+				}}
+			>
 				<PopoverTrigger
 					type="button"
 					disabled={disableAssistantAndSkill}
@@ -273,7 +423,7 @@ export function ComposerActionBar({
 							event.preventDefault();
 						}
 					}}
-					className={assistantSkillButtonClassName}
+					className={cn(assistantSkillButtonClassName, "order-2")}
 				>
 					<WandSparkles className="size-4" />
 					<span>添加技能</span>
@@ -287,36 +437,184 @@ export function ComposerActionBar({
 					className="w-[340px] p-1.5"
 				>
 					<Command shouldFilter={false} className="rounded-xl! bg-transparent p-0">
-						<div className="px-2 py-1 text-xs font-medium text-slate-400">选择技能</div>
+						<div className="px-2 py-1 text-sm font-semibold text-slate-800">选择技能</div>
 						<CommandInput
 							value={skillSearch}
 							onValueChange={setSkillSearch}
 							placeholder="搜索技能"
+							className="placeholder:text-slate-300"
 						/>
-						<CommandList className="max-h-64">
+						<CommandSeparator className="mx-1 my-2 bg-slate-200/80" />
+						<CommandList className="max-h-64 px-1">
 							<CommandEmpty className="py-6 text-slate-400">没有可继续添加的技能</CommandEmpty>
 							<CommandGroup className="p-0">
-								{skillsLoading && (
-									<div className="px-3 py-2 text-xs text-slate-400">技能加载中...</div>
-								)}
-								{!skillsLoading && skillsError && (
-									<div className="px-3 py-2 text-xs text-red-400">{skillsError}</div>
+								{derivedSkillsLoading && (
+									<div className="px-2 py-1.5 text-xs text-slate-400">技能加载中...</div>
 								)}
 								{filteredSkills.map((skill) => (
 									<CommandItem
 										key={skill.code}
 										value={skill.label}
 										onSelect={() => {
-											composerRef.current?.insertSkill(skill.label);
+											composerRef.current?.insertSkill(skill.code);
 										}}
-										className="rounded-xl px-2.5 py-2"
+										className="rounded-lg px-2 py-1.5"
 									>
 										<div className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-violet-50 text-violet-600">
 											<Sparkles className="size-3.5" />
 										</div>
 										<div className="min-w-0 flex-1">
-											<div className="truncate font-medium">/{skill.label}</div>
+											<div className="flex items-center gap-1.5 truncate font-medium">
+												<span className="truncate">
+													{renderHighlightedText(skill.label, skillSearch)}
+												</span>
+												<span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-normal leading-none text-slate-500">
+													{getSkillSourceLabel(skill)}
+												</span>
+											</div>
 											<div className="truncate text-xs text-slate-400">{skill.description}</div>
+										</div>
+									</CommandItem>
+								))}
+							</CommandGroup>
+						</CommandList>
+					</Command>
+				</PopoverContent>
+			</Popover>
+			<Popover
+				open={connectorDisabled ? false : connectorOpen}
+				onOpenChange={(open) => {
+					if (connectorDisabled) return;
+					setConnectorOpen(open);
+					if (!open) setConnectorSearch("");
+				}}
+			>
+				{connectorDisabled ? (
+					<Tooltip>
+						<TooltipTrigger
+							type="button"
+							aria-disabled="true"
+							aria-label={`添加连接器：${connectorDisabledReason ?? "当前不可用"}`}
+							onClick={(event) => event.preventDefault()}
+							className={cn(
+								assistantSkillButtonClassName,
+								"order-3 cursor-not-allowed opacity-45 hover:bg-transparent hover:text-slate-600",
+							)}
+						>
+							{connectorTriggerContent}
+						</TooltipTrigger>
+						<TooltipContent side="top">
+							{connectorDisabledReason ?? "当前无法添加连接器"}
+						</TooltipContent>
+					</Tooltip>
+				) : (
+					<PopoverTrigger
+						type="button"
+						disabled={disableAssistantAndSkill}
+						onClick={(event) => {
+							if (disableAssistantAndSkill) {
+								event.preventDefault();
+								return;
+							}
+							if (connectorOpen) return;
+							if (event.defaultPrevented) return;
+							if (!allowAction()) {
+								event.preventDefault();
+							}
+						}}
+						className={cn(assistantSkillButtonClassName, "order-3")}
+					>
+						{connectorTriggerContent}
+					</PopoverTrigger>
+				)}
+				{/* 中文注释：固定在按钮上方，避免视口碰撞策略把选择弹窗动态翻到下方。 */}
+				<PopoverContent
+					align="start"
+					side="top"
+					sideOffset={10}
+					collisionAvoidance={{ side: "none", align: "shift", fallbackAxisSide: "none" }}
+					className="w-[340px] p-1.5"
+				>
+					<Command shouldFilter={false} className="rounded-xl! bg-transparent p-0">
+						<div className="px-2 py-1 text-sm font-semibold text-slate-800">选择连接器</div>
+						<CommandInput
+							value={connectorSearch}
+							onValueChange={setConnectorSearch}
+							placeholder="搜索连接器"
+							className="placeholder:text-slate-300"
+						/>
+						<CommandSeparator className="mx-1 my-2 bg-slate-200/80" />
+						<CommandList className="max-h-72 overflow-y-auto px-1">
+							{selectedConnectors.length > 0 && (
+								<>
+									<div className="px-2 py-1 text-xs font-semibold text-slate-400">已选连接器</div>
+									<CommandGroup className="p-0">
+										{selectedConnectors.map((connector) => {
+											const publicId = connector.pluginId ?? connector.code;
+											return (
+												<CommandItem
+													key={publicId}
+													value={`selected:${connector.label}`}
+													onSelect={() => {
+														if (onRemoveConnector) {
+															onRemoveConnector(publicId);
+														}
+													}}
+													className="rounded-lg px-2 py-1.5"
+												>
+													<MCPConnectorIcon
+														code={connector.code}
+														name={connector.label}
+														className="size-7 shrink-0 rounded-lg"
+													/>
+													<div className="min-w-0 flex-1">
+														<span className="truncate font-medium text-slate-700">
+															{connector.label}
+														</span>
+													</div>
+													<span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500">
+														已选
+													</span>
+												</CommandItem>
+											);
+										})}
+									</CommandGroup>
+									<CommandSeparator className="mx-1 my-2 bg-slate-200/80" />
+								</>
+							)}
+							<div className="px-2 pb-1 pt-1 text-xs font-semibold text-slate-400">可选连接器</div>
+							<CommandEmpty className="py-6 text-slate-400">
+								{connectorOptions.length === 0 && !connectorsLoading
+									? "没有可用的连接器"
+									: "没有可继续添加的连接器"}
+							</CommandEmpty>
+							<CommandGroup className="p-0">
+								{connectorsLoading && connectorOptions.length === 0 && (
+									<div className="px-2 py-1.5 text-xs text-slate-400">连接器加载中...</div>
+								)}
+								{filteredConnectors.map((connector) => (
+									<CommandItem
+										key={connector.pluginId ?? connector.code}
+										value={connector.label}
+										onSelect={() => {
+											if (connector.pluginId && onSelectConnector) {
+												onSelectConnector(connector.pluginId);
+											}
+										}}
+										className="rounded-lg px-2 py-1.5"
+									>
+										<MCPConnectorIcon
+											code={connector.code}
+											name={connector.label}
+											className="size-7 shrink-0 rounded-lg"
+										/>
+										<div className="min-w-0 flex-1">
+											<div className="flex items-center gap-1.5 truncate font-medium">
+												<span className="truncate">
+													{renderHighlightedText(connector.label, connectorSearch)}
+												</span>
+											</div>
+											<div className="truncate text-xs text-slate-400">{connector.description}</div>
 										</div>
 									</CommandItem>
 								))}

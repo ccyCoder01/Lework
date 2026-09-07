@@ -1,4 +1,4 @@
-// Package claude 将 Claude Code 适配到 Leros 外部 CLI 引擎接口。
+// Package claude adapts Claude Code to the agent Runtime contract.
 package claude
 
 import (
@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/insmtx/Leros/backend/agent/runtime/externalcli"
+	"github.com/insmtx/Leros/backend/agent/runtime/internal/cli"
 )
 
 // Adapter 通过 Claude Code 执行提示。
@@ -26,15 +26,6 @@ func NewAdapter(binary string, extraEnv map[string]string) *Adapter {
 // Prepare performs provider-specific workspace setup.
 func (a *Adapter) Prepare(_ context.Context, _ string) error {
 	return nil
-}
-
-// GetSkillDir returns the skill directory path for Claude Code.
-func (a *Adapter) GetSkillDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".claude", "skills")
 }
 
 func expandPath(pathValue string) string {
@@ -56,7 +47,7 @@ func expandPath(pathValue string) string {
 }
 
 // Invoke starts Claude Code and returns its process activity stream.
-func (a *Adapter) Invoke(ctx context.Context, req externalcli.InvocationRequest) (*externalcli.Invocation, error) {
+func (a *Adapter) Invoke(ctx context.Context, req cli.InvocationRequest) (*cli.Invocation, error) {
 	handle, err := a.invoker.Invoke(ctx, req)
 	if err != nil {
 		return nil, err
@@ -64,4 +55,4 @@ func (a *Adapter) Invoke(ctx context.Context, req externalcli.InvocationRequest)
 	return handle, nil
 }
 
-var _ externalcli.Invoker = (*Adapter)(nil)
+var _ cli.Invoker = (*Adapter)(nil)

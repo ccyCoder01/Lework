@@ -1,19 +1,15 @@
 package modelrouter
 
-import (
-	"strings"
+import "strings"
 
-	"github.com/insmtx/Leros/backend/internal/worker/identity"
-)
-
-// WorkerProxyBaseURL returns the built-in worker model proxy BaseURL.
-// The proxy is registered at identity.WorkerAddr() by RegisterRoutes.
+// ProxyBaseURL returns the built-in worker model proxy BaseURL.
+// workerAddr is the worker's listen address (e.g., ":8081" or "127.0.0.1:8081").
 // Requests sent to this address are transparently routed to the upstream provider
 // according to the config registered in the worker-scoped ModelStore.
 //
-// Returns empty string when the worker address is not yet configured.
-func WorkerProxyBaseURL() string {
-	addr := strings.TrimSpace(identity.WorkerAddr())
+// Returns empty string when workerAddr is empty.
+func ProxyBaseURL(workerAddr string) string {
+	addr := strings.TrimSpace(workerAddr)
 	if addr == "" {
 		return ""
 	}

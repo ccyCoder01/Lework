@@ -17,7 +17,12 @@ const (
 
 // ContextBuilder 通用层 — 所有引擎共享。
 const (
-	KeyAgentSystemMemoryGuidance = "agent.system.memory_guidance" // Memory 工具指导：何时保存/不保存记忆
+	KeyAgentSystemCommunication       = "agent.system.communication"         // 沟通规范：文本沟通、语言、表情符号约束
+	KeyAgentSystemOutputBoundary      = "agent.system.output_boundary"       // 对外输出边界：不披露内部实现和系统关联数据
+	KeyAgentSystemMemoryGuidance      = "agent.system.memory_guidance"       // Memory 工具指导：何时保存/不保存记忆
+	KeyAgentSystemMultiSpeakerContext = "agent.system.multi_speaker_context" // 多队友会话说明：对话摘要中用户/队友发言的角色区分
+	KeyAgentSceneBidComparison        = "agent.scene.bid_comparison"         // 标书对比场景：以 main 为基准逐份对照 compare 文件
+	KeyAgentSceneSalaryAccounting     = "agent.scene.salary_accounting"      // 工资核算场景：加载工资核算 Skill 处理分区资料
 )
 
 // 平台格式指导 — 按消息通道注入对应的格式约束。
@@ -38,5 +43,5 @@ const (
 
 const KeyLLMTestConnectivity = "llm.test.connectivity"
 
-const KeySessionTitle = "session.title.generate"
-const KeyWorkTitle = "work.title.generate"
+const KeyWorkShortTitle = "work.short_title.generate"
+const KeyFeedbackSummarize = "feedback.summarize"

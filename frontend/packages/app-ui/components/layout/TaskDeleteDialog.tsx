@@ -22,7 +22,8 @@ export function TaskDeleteDialog({ task, open, onOpenChange }: TaskDeleteDialogP
 	const { deleteTask } = useLayoutStore((s) => s);
 
 	const handleDelete = async () => {
-		await deleteTask(task.id);
+		const deleted = await deleteTask(task.id);
+		if (!deleted) return;
 		onOpenChange(false);
 	};
 

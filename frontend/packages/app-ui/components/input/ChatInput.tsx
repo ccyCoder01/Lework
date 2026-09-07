@@ -1,10 +1,26 @@
 "use client";
 
-import { type ProjectSkill, useChatStore, useLayoutStore } from "@leros/store";
+import {
+	ASSISTANT_REPLY_TIMEOUT_RETRY_HINT,
+	COMPOSER_UPLOAD_ACCEPT,
+	COMPOSER_UPLOAD_EMPTY_FILE_MESSAGE,
+	COMPOSER_UPLOAD_SUCCESS_MESSAGE,
+	COMPOSER_UPLOAD_TYPE_REJECTED_MESSAGE,
+	getComposerUploadAccept,
+	hasComposerSkillTokens,
+	isComposerUploadAllowedFile,
+	isEmptyUploadFile,
+	isSystemDefaultAssistant,
+	type ProjectMember,
+	prepareOutgoingComposer,
+	projectFileApi,
+	useChatStore,
+	useDAStore,
+	useLayoutStore,
+} from "@leros/store";
 import type {
 	ApprovalAction,
 	ApprovalRequest,
-	Attachment,
 	ComposerToken,
 	Message,
 	MessageMetadata,
@@ -13,37 +29,56 @@ import type {
 import { Badge } from "@leros/ui/components/ui/badge";
 import { Button } from "@leros/ui/components/ui/button";
 import { Checkbox } from "@leros/ui/components/ui/checkbox";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@leros/ui/components/ui/tooltip";
+import { getRequestErrorMessage } from "@leros/ui/lib/request";
 import { cn } from "@leros/ui/lib/utils";
 import {
 	AlertCircle,
 	AtSign,
 	ChevronDown,
 	CircleStop,
+	ClipboardPenLine,
 	LoaderCircle,
 	Paperclip,
-	ClipboardList,
 	SendHorizonal,
 	ShieldAlert,
-	X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import { isAssistantAvailable } from "../digitalAssistant/assistantStatus";
 import type { AppNavigation } from "../layout";
+import {
+	applyDocxSelectionDraftToComposer,
+	type DocxSelectionComposerDraft,
+	docxSelectionComposerActions,
+	type PendingDocxVersionSync,
+	removeDocxReferenceFromComposer,
+	useDocxSelectionComposerStore,
+} from "../layout/docx-selection-composer-store";
+import { buildDocxSelectionPromptRequest } from "../layout/docx-selection-edit";
+import { openPendingAttachmentPreview } from "../layout/file-preview-store";
 import {
 	getProjectChatLayoutClasses,
 	type ProjectChatLayoutMode,
 } from "../layout/project-chat-layout";
+import { getLatestProjectFileVersion } from "../layout/project-file-version-sync";
+import {
+	hasMultipleHumanProjectMembers,
+	PROJECT_MCP_COLLABORATION_WARNING,
+} from "../layout/project-mcp-collaboration-warning";
+import { AttachmentPreview } from "./AttachmentPreview";
 import { ComposerActionBar } from "./ComposerActionBar";
-import { PlanConfirmationInput } from "./PlanConfirmationInput";
 import { QuestionAnswerInput } from "./QuestionAnswerInput";
 import {
-	type ComposerSkillOption,
+	type ComposerAssistantOption,
 	StructuredComposer,
 	type StructuredComposerHandle,
 } from "./StructuredComposer";
+import { FOLDER_UPLOAD_SIZE_EXCEEDED_MESSAGE, isFolderUploadSizeExceeded } from "./upload-folder";
+import { useComposerConnectorOptions } from "./useComposerConnectorOptions";
+import { useComposerSkillOptions } from "./useComposerSkillOptions";
 
-// 只放开当前已有稳定预览能力的文档类型，避免上传后落到不可预览的兜底体验。
-export const PROJECT_ATTACHMENT_ACCEPT = "image/*,.pdf,.txt,.md,.json,.xlsx,.xls,.csv,.docx,.pptx";
+export const PROJECT_ATTACHMENT_ACCEPT = COMPOSER_UPLOAD_ACCEPT;
 
 export function ChatInput({
 	variant = "default",
@@ -55,177 +90,480 @@ export function ChatInput({
 	projectLayoutMode?: ProjectChatLayoutMode;
 	navigation?: AppNavigation;
 }) {
+	const projectAttachmentAccept = getComposerUploadAccept(
+		typeof navigator === "undefined" ? undefined : navigator.platform,
+	);
 	const {
 		activeSessionId,
 		inputText,
 		inputAttachments,
 		isGenerating,
+		cancellingSessionId,
+		suppressedReplySessionId,
 		messagesMap,
 		messageIds,
+		streamingMessageId,
 		selectedModel,
 		executionMode,
 		modelOptions,
 		setInputText,
-		sendMessage,
 		sendProjectMessage,
+		sendTaskRoomMessage,
 		submitApprovalDecision,
 		submitQuestionAnswer,
 		cancelGeneration,
 		addAttachment,
 		addUploadedAttachment,
+		addUploadedFolderAttachment,
 		removeAttachment,
 		setInputFocused,
 		setSelectedModel,
 		setExecutionMode,
 	} = useChatStore((s) => s);
-	const { activeProjectId, activeTaskDetailProjectId, currentView, projects } = useLayoutStore(
-		(s) => s,
-	);
+	const isCancelling = Boolean(activeSessionId && cancellingSessionId === activeSessionId);
+	const isAwaitingRun = streamingMessageId
+		? messagesMap[streamingMessageId]?.status === "waiting"
+		: false;
+	const {
+		activeProjectId,
+		activeTaskDetailProjectId,
+		activeTaskDetailTaskId,
+		activeTaskDetailSessionId,
+		currentView,
+		projectComposerPrefill,
+		projects,
+		consumeProjectComposerPrefill,
+	} = useLayoutStore((s) => s);
+	const { assistants, assistantsLoaded, fetchAssistants } = useDAStore((s) => s);
 
 	const composerRef = useRef<StructuredComposerHandle | null>(null);
+	const lastAppliedSelectionDraftRef = useRef<{
+		id: string;
+		suggestedPrompt?: string;
+	} | null>(null);
 	const fileInputRef = useRef<HTMLInputElement>(null);
-	const previousProjectSkillLabelsRef = useRef<string[] | null>(null);
+	const folderInputRef = useRef<HTMLInputElement>(null);
+	const previousProjectSkillCodesRef = useRef<string[] | null>(null);
+	const previousConnectorProjectIdRef = useRef<string | null | undefined>(undefined);
 	const [showModelDropdown, setShowModelDropdown] = useState(false);
+	const { draft: docxSelectionDraft } = useDocxSelectionComposerStore();
 
 	const currentModel = modelOptions.find((m) => m.id === selectedModel);
 	const isProjectVariant = variant === "project";
 	const projectLayout = getProjectChatLayoutClasses(projectLayoutMode);
-	const canSend = Boolean(inputText.trim());
+	const isReplyLocked =
+		Boolean(suppressedReplySessionId) &&
+		(suppressedReplySessionId === activeSessionId ||
+			suppressedReplySessionId === activeTaskDetailSessionId);
+	const composerLocked = isGenerating || isReplyLocked;
+	const canSend =
+		Boolean(inputText.trim()) &&
+		!composerLocked &&
+		!inputAttachments.some((attachment) => attachment.uploadStatus === "uploading");
 	const pendingApproval = findPendingApproval(messageIds, messagesMap, activeSessionId);
 	const pendingQuestion = findPendingQuestion(messageIds, messagesMap, activeSessionId);
 	const currentProjectId = activeTaskDetailProjectId ?? activeProjectId;
 	const currentProject = projects.find((project) => project.id === currentProjectId);
-	const projectSkillOptions = useMemo<ComposerSkillOption[] | undefined>(() => {
-		if (!isProjectVariant) return undefined;
-		return (currentProject?.skills ?? []).map(projectSkillToComposerOption);
-	}, [currentProject?.skills, isProjectVariant]);
-	const projectSkillLabels = useMemo(
-		() => projectSkillOptions?.map((skill) => skill.label) ?? [],
-		[projectSkillOptions],
+	const projectConnectorsDisabled =
+		isProjectVariant && hasMultipleHumanProjectMembers(currentProject?.members ?? []);
+	const { skillOptions, skillsLoading, reloadSkillOptions } = useComposerSkillOptions(
+		isProjectVariant ? currentProjectId : null,
+		true,
+		isProjectVariant ? "project" : "all",
 	);
+	const handleSkillPickerOpen = useCallback(() => {
+		void reloadSkillOptions();
+	}, [reloadSkillOptions]);
+	const handleAssistantPickerOpen = useCallback(() => fetchAssistants(), [fetchAssistants]);
+	const { connectorOptions, connectorsLoading } = useComposerConnectorOptions({
+		projectId: isProjectVariant ? currentProjectId : null,
+	});
+	const [selectedConnectorIds, setSelectedConnectorIds] = useState<string[]>([]);
+	const handleSelectConnector = useCallback(
+		(publicId: string) => {
+			if (projectConnectorsDisabled) return;
+			setSelectedConnectorIds((prev) => (prev.includes(publicId) ? prev : [...prev, publicId]));
+		},
+		[projectConnectorsDisabled],
+	);
+	const handleRemoveConnector = useCallback((publicId: string) => {
+		setSelectedConnectorIds((prev) => prev.filter((id) => id !== publicId));
+	}, []);
+	const projectAssistantOptions = useMemo<ComposerAssistantOption[] | undefined>(() => {
+		if (!isProjectVariant) return undefined;
+		return (
+			(currentProject?.members ?? [])
+				// 中文注释：项目默认 AI 员工用于兜底分配，不作为输入框里可手动召唤的候选项展示。
+				.filter(
+					(member) =>
+						member.type === "assistant" &&
+						!member.isDefault &&
+						!isSystemDefaultAssistant(member.publicId),
+				)
+				.flatMap((member) => {
+					const assistant = assistants.find(
+						(item) =>
+							(member.publicId && item.publicId === member.publicId) ||
+							(member.memberId > 0 && item.id === member.memberId),
+					);
+					// 中文注释：项目快照可能保留已删除或已停止的队友，@ 候选只开放当前仍部署就绪的成员。
+					if (assistant && !isAssistantAvailable(assistant)) return [];
+					if (!assistant && assistantsLoaded) return [];
+					return [
+						projectMemberToComposerAssistantOption(
+							assistant
+								? {
+										...member,
+										name: assistant.name,
+										roleName: assistant.roleName,
+										description: assistant.description,
+										avatarUrl: assistant.avatar,
+									}
+								: member,
+						),
+					];
+				})
+		);
+	}, [assistants, assistantsLoaded, currentProject?.members, isProjectVariant]);
+	const projectSkillCodes = useMemo(
+		() => skillOptions?.filter((skill) => skill.projectAssociated).map((skill) => skill.code) ?? [],
+		[skillOptions],
+	);
+	const isNewProjectTaskView = isProjectVariant && currentView === "project";
+	const activeProjectComposerPrefill =
+		isProjectVariant &&
+		currentView === "project" &&
+		activeProjectId &&
+		projectComposerPrefill?.projectId === activeProjectId
+			? projectComposerPrefill
+			: undefined;
+
+	useEffect(() => {
+		if (!docxSelectionDraft || lastAppliedSelectionDraftRef.current?.id === docxSelectionDraft.id) {
+			return;
+		}
+		const currentTokens = composerRef.current?.getComposerTokens() ?? [];
+		const next = applyDocxSelectionDraftToComposer({
+			value: inputText,
+			tokens: currentTokens,
+			draft: docxSelectionDraft,
+			previousSuggestedPrompt: lastAppliedSelectionDraftRef.current?.suggestedPrompt,
+		});
+		lastAppliedSelectionDraftRef.current = {
+			id: docxSelectionDraft.id,
+			suggestedPrompt: docxSelectionDraft.suggestedPrompt,
+		};
+		if (composerRef.current) {
+			composerRef.current.setContent(next.value, next.tokens);
+		} else {
+			setInputText(next.value);
+		}
+		setInputFocused(true);
+	}, [docxSelectionDraft, inputText, setInputFocused, setInputText]);
 
 	useEffect(() => {
 		if (!isProjectVariant) {
-			previousProjectSkillLabelsRef.current = null;
+			previousProjectSkillCodesRef.current = null;
 			return;
 		}
 
-		const previousLabels = previousProjectSkillLabelsRef.current;
-		previousProjectSkillLabelsRef.current = projectSkillLabels;
-		if (!previousLabels) return;
+		const previousCodes = previousProjectSkillCodesRef.current;
+		previousProjectSkillCodesRef.current = projectSkillCodes;
+		if (!previousCodes) return;
 
-		const currentLabels = new Set(projectSkillLabels);
-		const removedLabels = previousLabels.filter((label) => !currentLabels.has(label));
-		if (removedLabels.length === 0) return;
+		const currentCodes = new Set(projectSkillCodes);
+		const removedCodes = previousCodes.filter((code) => !currentCodes.has(code));
+		if (removedCodes.length === 0) return;
 
-		const nextInput = removeSkillDirectives(inputText, removedLabels);
-		if (nextInput !== inputText) {
-			// 中文注释：项目维度移除技能后，同步清理输入框中已经插入的对应技能指令。
-			setInputText(nextInput);
+		// 中文注释：项目维度移除技能后，按 token.id（catalog code）清理输入框里的技能 mention。
+		if (!composerRef.current) return;
+		for (const code of removedCodes) {
+			composerRef.current.removeSkill(code);
 		}
-	}, [inputText, isProjectVariant, projectSkillLabels, setInputText]);
+	}, [isProjectVariant, projectSkillCodes]);
+
+	// 中文注释：连接器关联是项目级配置，切换项目后清空已选连接器，避免跨项目残留。
+	useEffect(() => {
+		const key = isProjectVariant ? currentProjectId : undefined;
+		if (previousConnectorProjectIdRef.current === key) {
+			return;
+		}
+		previousConnectorProjectIdRef.current = key;
+		if (selectedConnectorIds.length > 0) {
+			setSelectedConnectorIds([]);
+		}
+	}, [currentProjectId, isProjectVariant, selectedConnectorIds.length]);
+
+	// 中文注释：项目进入多人真人协作状态后立即清理旧选择，避免成员变更与发送并发时携带连接器。
+	useEffect(() => {
+		if (projectConnectorsDisabled && selectedConnectorIds.length > 0) {
+			setSelectedConnectorIds([]);
+		}
+	}, [projectConnectorsDisabled, selectedConnectorIds.length]);
 
 	const submitMessage = useCallback(async () => {
-		// 中文注释：输入区先做一次生成态拦截，避免回车绕过按钮态再次触发发送。
+		// 中文注释：真实 SessionEvents 当前由单条 SSE 连接接管，生成中先阻止重复发送。
 		if (isGenerating) return;
-		// 仅上传附件而无文字时接口会报错，因此必须输入内容才可发送
+		if (inputAttachments.some((attachment) => attachment.uploadStatus === "uploading")) return;
+		// 中文注释：客户端超时报错未落库，停留当前对话窗口时禁止续聊，避免第二轮真人消息落库分叉。
+		if (isReplyLocked) {
+			toast.error(`当前回复已超时，${ASSISTANT_REPLY_TIMEOUT_RETRY_HINT}`);
+			return;
+		}
 		const trimmedInput = inputText.trim();
 		if (trimmedInput) {
-			const composerMetadata = buildComposerMetadata(
-				inputText,
-				composerRef.current?.getComposerTokens() ?? [],
-			);
-			if (isProjectVariant && currentView === "project") {
-				const taskEntry = await sendProjectMessage(
-					trimmedInput,
-					activeProjectId,
-					inputAttachments,
-					composerMetadata,
-				);
-				if (taskEntry?.project_id && taskEntry?.task_id) {
-					// 中文注释：项目首页创建出真实任务后，立即跳到任务详情页，避免仍停留在项目首页的新建任务视图。
-					navigation?.goToTaskDetail(
-						taskEntry.project_id,
-						taskEntry.task_id,
-						taskEntry.session_id ?? null,
-					);
+			const composerTokens = composerRef.current?.getComposerTokens() ?? [];
+			const prepared = prepareOutgoingComposer(inputText, composerTokens);
+			const activeSelectionReference = docxSelectionDraft
+				? composerTokens.find(
+						(token) =>
+							token.kind === "reference" &&
+							token.id === docxSelectionDraft.referenceId &&
+							inputText.slice(token.start, token.end) === token.label,
+					)
+				: undefined;
+			let outgoingContent = prepared.content;
+			const outgoingAttachments = inputAttachments;
+			let composerMetadata = prepared.metadata;
+			let pendingVersionSync: PendingDocxVersionSync | null = null;
+
+			if (docxSelectionDraft && activeSelectionReference) {
+				const visibleSnapshot = removeDocxReferenceFromComposer(inputText, composerTokens);
+				const userPrompt = visibleSnapshot.value.trim();
+				if (!userPrompt) {
+					toast.info("请补充希望如何修改这段内容");
+					return;
 				}
+				const request = buildDocxSelectionPromptRequest({
+					prompt: userPrompt,
+					file: docxSelectionDraft.file,
+					selection: docxSelectionDraft.selection,
+				});
+				if (
+					!docxSelectionDraft.file.versionPublicId &&
+					!docxSelectionDraft.file.publicId &&
+					!docxSelectionDraft.file.projectPath
+				) {
+					toast.error("当前文件缺少可编辑的文件标识");
+					return;
+				}
+				outgoingContent = request.content;
+				const visibleMetadata = buildComposerMetadata(inputText, composerTokens);
+				composerMetadata = {
+					...prepared.metadata,
+					displayContent: trimmedInput,
+					displayComposerTokens: visibleMetadata?.composerTokens,
+				};
+				pendingVersionSync = await resolveDocxVersionSync(docxSelectionDraft);
+			}
+
+			let submitted: unknown;
+			if (
+				isProjectVariant &&
+				currentView === "taskDetail" &&
+				activeTaskDetailProjectId &&
+				activeTaskDetailTaskId &&
+				activeTaskDetailSessionId
+			) {
+				submitted = await sendTaskRoomMessage(
+					outgoingContent,
+					{
+						projectId: activeTaskDetailProjectId,
+						taskId: activeTaskDetailTaskId,
+						sessionId: activeTaskDetailSessionId,
+						metadata: composerMetadata,
+						connectorIds: projectConnectorsDisabled ? [] : selectedConnectorIds,
+					},
+					outgoingAttachments,
+				);
+			} else if (isProjectVariant && currentView === "project") {
+				try {
+					const taskEntry = await sendProjectMessage(
+						outgoingContent,
+						activeProjectId,
+						outgoingAttachments,
+						composerMetadata,
+						{ connectorIds: projectConnectorsDisabled ? [] : selectedConnectorIds },
+					);
+					submitted = taskEntry;
+					if (taskEntry?.project_id && taskEntry?.task_id && taskEntry.session_id) {
+						// 中文注释：项目首页创建出真实任务后，立即跳到任务详情页，避免仍停留在项目首页的新建任务视图。
+						navigation?.goToTaskDetail(
+							taskEntry.project_id,
+							taskEntry.task_id,
+							taskEntry.session_id,
+						);
+					}
+				} catch (err) {
+					console.error("ChatInput createInitialMessage error:", err);
+					toast.error(`创建任务失败：${getRequestErrorMessage(err) ?? "请稍后重试"}`);
+					return;
+				}
+			} else {
+				// 中文注释：任务详情依赖路径中的 sessionId；未知场景拒绝发送。
 				return;
 			}
-			sendMessage(trimmedInput, inputAttachments, composerMetadata);
+
+			if (!submitted) return;
+			const hasInvokedSkill = hasComposerSkillTokens(outgoingContent);
+			if (isProjectVariant && currentProjectId && hasInvokedSkill) {
+				void reloadSkillOptions();
+			}
+			// 中文注释：发送成功后清空已选连接器；失败时不进入这里，保留以便重试。
+			setSelectedConnectorIds([]);
+			if (docxSelectionDraft && activeSelectionReference) {
+				docxSelectionComposerActions.markSubmitted(pendingVersionSync);
+				docxSelectionComposerActions.clearDraft(docxSelectionDraft.id);
+				lastAppliedSelectionDraftRef.current = null;
+			} else if (docxSelectionDraft) {
+				// 中文注释：用户手动删掉引用 token 后，本次按普通消息发送，同时清除失效的选区草稿。
+				docxSelectionComposerActions.clearDraft(docxSelectionDraft.id);
+				lastAppliedSelectionDraftRef.current = null;
+			}
 		}
 	}, [
 		inputText,
 		inputAttachments,
 		isProjectVariant,
+		currentProjectId,
 		currentView,
 		activeProjectId,
+		activeTaskDetailProjectId,
+		activeTaskDetailTaskId,
+		activeTaskDetailSessionId,
 		isGenerating,
+		isReplyLocked,
+		docxSelectionDraft,
 		navigation,
-		sendMessage,
 		sendProjectMessage,
+		sendTaskRoomMessage,
+		reloadSkillOptions,
+		selectedConnectorIds,
+		projectConnectorsDisabled,
 	]);
+
+	const uploadProjectAttachment = useCallback(
+		async (file: File) => {
+			if (!isProjectVariant || !currentProjectId) {
+				return false;
+			}
+			try {
+				const { cancelled } = await addUploadedAttachment(currentProjectId, file);
+				if (cancelled) return true;
+				toast.success(COMPOSER_UPLOAD_SUCCESS_MESSAGE);
+				return true;
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "文件上传失败";
+				console.error("ChatInput upload project attachment error:", err);
+				toast.error(message);
+				return true;
+			}
+		},
+		[currentProjectId, addUploadedAttachment, isProjectVariant],
+	);
 
 	const handlePasteFiles = useCallback(
 		(e: React.ClipboardEvent<HTMLElement>) => {
 			const files = Array.from(e.clipboardData.files);
+			if (!files.length) return;
+
 			for (const file of files) {
-				if (file.type.startsWith("image/") || file.type.startsWith("text/")) {
-					addAttachment(file);
+				if (isEmptyUploadFile(file)) {
+					toast.error(COMPOSER_UPLOAD_EMPTY_FILE_MESSAGE);
+					continue;
 				}
+				if (!isComposerUploadAllowedFile(file)) {
+					toast.error(COMPOSER_UPLOAD_TYPE_REJECTED_MESSAGE);
+					continue;
+				}
+				void uploadProjectAttachment(file).then((uploaded) => {
+					if (!uploaded) {
+						addAttachment(file);
+					}
+				});
 			}
 		},
-		[addAttachment],
+		[addAttachment, uploadProjectAttachment],
 	);
 
 	const handleFileSelect = useCallback(
 		async (e: React.ChangeEvent<HTMLInputElement>) => {
 			const files = Array.from(e.target.files ?? []);
-			const projectId = activeProjectId;
 			for (const file of files) {
-				if (isProjectVariant && projectId) {
-					try {
-						const { message } = await addUploadedAttachment(projectId, file);
-						toast.success(message || "文件上传成功");
-					} catch (err) {
-						const message = err instanceof Error ? err.message : "文件上传失败";
-						console.error("ChatInput upload project attachment error:", err);
-						toast.error(message);
-					}
+				if (isEmptyUploadFile(file)) {
+					toast.error(COMPOSER_UPLOAD_EMPTY_FILE_MESSAGE);
 					continue;
 				}
-				addAttachment(file);
+				if (!isComposerUploadAllowedFile(file)) {
+					toast.error(COMPOSER_UPLOAD_TYPE_REJECTED_MESSAGE);
+					continue;
+				}
+				const uploaded = await uploadProjectAttachment(file);
+				if (!uploaded) {
+					addAttachment(file);
+				}
 			}
 			e.target.value = "";
 		},
-		[activeProjectId, addAttachment, addUploadedAttachment, isProjectVariant],
+		[addAttachment, uploadProjectAttachment],
+	);
+
+	const handleFolderSelect = useCallback(
+		async (e: React.ChangeEvent<HTMLInputElement>) => {
+			const files = Array.from(e.target.files ?? []);
+			e.target.value = "";
+			if (!files.length) return;
+
+			if (isFolderUploadSizeExceeded(files)) {
+				toast.error(FOLDER_UPLOAD_SIZE_EXCEEDED_MESSAGE, { position: "bottom-right" });
+				return;
+			}
+
+			if (!isProjectVariant || !currentProjectId) {
+				toast.error("请在项目对话中上传文件夹");
+				return;
+			}
+
+			try {
+				const { message, cancelled } = await addUploadedFolderAttachment(currentProjectId, files);
+				if (cancelled) return;
+				if (message.includes("已跳过")) {
+					toast.info(message, { position: "bottom-right" });
+				} else {
+					toast.success(message || "文件夹上传成功");
+				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "文件夹上传失败";
+				console.error("ChatInput upload folder error:", err);
+				toast.error(message, { position: "bottom-right" });
+			}
+		},
+		[addUploadedFolderAttachment, currentProjectId, isProjectVariant],
 	);
 
 	const handleSend = useCallback(() => {
 		submitMessage();
 	}, [submitMessage]);
 
+	const handlePlanAnswer = useCallback(
+		(messageId: string, requestId: string, answers: string[][]) => {
+			// Determine execution mode from answer: "Yes" → default, "No" → plan
+			const yesAnswer = answers.some((ans) => ans.length > 0 && ans[0]?.toLowerCase() === "yes");
+			setExecutionMode(yesAnswer ? "default" : "plan");
+			submitQuestionAnswer(messageId, requestId, answers);
+		},
+		[submitQuestionAnswer, setExecutionMode],
+	);
+
 	if (pendingQuestion) {
-		if (pendingQuestion.question.interactionType === "plan_confirmation") {
-			return (
-				<PlanConfirmationInput
-					question={pendingQuestion.question}
-					messageId={pendingQuestion.message.id}
-					variant={variant}
-					projectLayout={projectLayout}
-					onAnswer={submitQuestionAnswer}
-					onExecute={() => setExecutionMode("default")}
-					onRevise={() => setExecutionMode("plan")}
-				/>
-			);
-		}
+		const isPlanConfirmation = pendingQuestion.question.interactionType === "plan_confirmation";
 		return (
 			<QuestionAnswerInput
 				question={pendingQuestion.question}
 				messageId={pendingQuestion.message.id}
 				variant={variant}
 				projectLayout={projectLayout}
-				onAnswer={submitQuestionAnswer}
+				onAnswer={isPlanConfirmation ? handlePlanAnswer : submitQuestionAnswer}
 			/>
 		);
 	}
@@ -251,44 +589,73 @@ export function ChatInput({
 			)}
 		>
 			<div className={cn("mx-auto w-full max-w-[1040px]", isProjectVariant && projectLayout.inner)}>
-				{inputAttachments.length > 0 && (
-					<AttachmentPreview attachments={inputAttachments} onRemove={removeAttachment} />
-				)}
 				<div
 					className={cn(
 						// 中文注释：focus 时使用无偏移阴影，避免 shadow-xl 只在下方显影
 						"relative rounded-2xl bg-white/95 shadow-sm ring-1 ring-slate-200/70 transition-all focus-within:shadow-[0_0_24px_rgba(15,23,42,0.12)] focus-within:ring-slate-200/70",
-						isProjectVariant && "rounded-2xl bg-white px-4 py-2 ring-slate-200",
+						isProjectVariant && "flex flex-col rounded-2xl bg-white px-4 py-2 ring-slate-200",
 					)}
 				>
-					<StructuredComposer
-						ref={composerRef}
-						value={inputText}
-						onChange={setInputText}
-						onSubmit={submitMessage}
-						onPasteFiles={handlePasteFiles}
-						onFocus={() => setInputFocused(true)}
-						onBlur={() => setInputFocused(false)}
-						placeholder={
-							isProjectVariant
-								? "这会儿帮你做些什么？@引用项目"
-								: "请描述您的问题，支持 Ctrl+V 粘贴图片。输入 @ 提及成员，/ 使用命令，# 引用工作项。"
-						}
-						isProjectVariant={isProjectVariant}
-						projectSkillOptions={projectSkillOptions}
-					/>
 					<input
 						ref={fileInputRef}
 						type="file"
 						className="hidden"
-						accept={PROJECT_ATTACHMENT_ACCEPT}
+						accept={projectAttachmentAccept}
 						multiple
 						onChange={handleFileSelect}
 					/>
+					<input
+						ref={folderInputRef}
+						type="file"
+						className="hidden"
+						multiple
+						onChange={handleFolderSelect}
+						{...({
+							webkitdirectory: "",
+							directory: "",
+						} as React.InputHTMLAttributes<HTMLInputElement>)}
+					/>
+					{inputAttachments.length > 0 && (
+						<AttachmentPreview
+							attachments={inputAttachments}
+							onPreview={openPendingAttachmentPreview}
+							onRemove={removeAttachment}
+						/>
+					)}
+					<div className="min-w-0">
+						<StructuredComposer
+							ref={composerRef}
+							value={inputText}
+							onChange={setInputText}
+							onSubmit={submitMessage}
+							submitDisabled={!canSend}
+							onPasteFiles={handlePasteFiles}
+							onFocus={() => setInputFocused(true)}
+							onBlur={() => setInputFocused(false)}
+							placeholder={
+								isReplyLocked
+									? `当前回复已超时，${ASSISTANT_REPLY_TIMEOUT_RETRY_HINT}`
+									: isProjectVariant
+										? isNewProjectTaskView
+											? "在这里输入需求或描述目标。使用@召唤队友、/调用技能..."
+											: "继续帮你做什么？"
+										: "请描述您的问题，支持 Ctrl+V 粘贴图片。输入 @ 提及成员，/ 使用命令，# 引用工作项。"
+							}
+							isProjectVariant={isProjectVariant}
+							assistantOptions={projectAssistantOptions}
+							onAssistantPickerOpen={handleAssistantPickerOpen}
+							skillOptions={skillOptions}
+							skillsLoading={skillsLoading}
+							onSkillPickerOpen={handleSkillPickerOpen}
+							assistantSelectionMode="single"
+							prefill={activeProjectComposerPrefill}
+							onPrefillConsumed={consumeProjectComposerPrefill}
+						/>
+					</div>
 					<div
 						className={cn(
-							"flex items-center justify-between px-4 pb-3",
-							isProjectVariant && "px-0 pb-0",
+							"flex items-center justify-between",
+							isProjectVariant ? "border-t border-[var(--leros-chat-ai-border)] pt-3" : "px-4 pb-3",
 						)}
 					>
 						<div className="flex items-center gap-1">
@@ -297,10 +664,46 @@ export function ChatInput({
 									inputValue={inputText}
 									composerRef={composerRef}
 									onUpload={() => fileInputRef.current?.click()}
-									projectSkillOptions={projectSkillOptions}
+									onUploadFolder={() => folderInputRef.current?.click()}
+									assistantOptions={projectAssistantOptions}
+									onAssistantPickerOpen={handleAssistantPickerOpen}
+									skillOptions={skillOptions}
+									skillsLoading={skillsLoading}
+									onSkillPickerOpen={handleSkillPickerOpen}
+									assistantSelectionMode="single"
+									executionMode={executionMode}
+									setExecutionMode={setExecutionMode}
+									isGenerating={composerLocked}
+									connectorOptions={connectorOptions}
+									connectorsLoading={connectorsLoading}
+									selectedConnectorIds={projectConnectorsDisabled ? [] : selectedConnectorIds}
+									onSelectConnector={handleSelectConnector}
+									onRemoveConnector={handleRemoveConnector}
+									connectorDisabled={projectConnectorsDisabled}
+									connectorDisabledReason={PROJECT_MCP_COLLABORATION_WARNING}
 								/>
 							) : (
 								<>
+									<Tooltip>
+										<TooltipTrigger
+											aria-label="Plan Mode"
+											aria-pressed={executionMode === "plan"}
+											disabled={composerLocked}
+											onClick={() =>
+												setExecutionMode(executionMode === "plan" ? "default" : "plan")
+											}
+											className={cn(
+												"inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-400 transition-colors hover:text-slate-600 hover:bg-slate-100",
+												executionMode === "plan" &&
+													"bg-[var(--leros-primary-softer)] !text-[var(--leros-primary)] hover:bg-[var(--leros-primary-soft)]",
+											)}
+										>
+											<ClipboardPenLine className="size-4" />
+										</TooltipTrigger>
+										<TooltipContent side="top">
+											计划模式会先拆解任务并制定方案，提升复杂任务的执行质量
+										</TooltipContent>
+									</Tooltip>
 									<Button
 										variant="ghost"
 										size="icon-sm"
@@ -356,23 +759,6 @@ export function ChatInput({
 							)}
 						</div>
 						<div className="flex items-center gap-2">
-							<Button
-								type="button"
-								variant={executionMode === "plan" ? "secondary" : "ghost"}
-								size="sm"
-								disabled={isGenerating}
-								aria-pressed={executionMode === "plan"}
-								onClick={() =>
-									setExecutionMode(executionMode === "plan" ? "default" : "plan")
-								}
-								className={cn(
-									"h-8 gap-1.5 text-xs",
-									executionMode === "plan" && "bg-blue-50 text-blue-700 hover:bg-blue-100",
-								)}
-							>
-								<ClipboardList className="size-3.5" />
-								Plan Mode
-							</Button>
 							{isGenerating ? (
 								<Button
 									variant={isProjectVariant ? "ghost" : "outline"}
@@ -382,9 +768,11 @@ export function ChatInput({
 										isProjectVariant && "size-9 rounded-xl",
 									)}
 									onClick={cancelGeneration}
+									disabled={isCancelling || isAwaitingRun}
 								>
 									<CircleStop className={cn("size-3.5", !isProjectVariant && "mr-1")} />
-									{!isProjectVariant && "停止"}
+									{!isProjectVariant &&
+										(isCancelling ? "停止中…" : isAwaitingRun ? "准备中…" : "停止")}
 								</Button>
 							) : (
 								<Button
@@ -448,6 +836,8 @@ function findPendingApproval(
 		if (!message) continue;
 		if (activeSessionId && message.conversationId !== activeSessionId) continue;
 
+		if (message.status === "failed" || message.status === "completed") continue;
+
 		const approval = [...(message.approvals ?? [])]
 			.reverse()
 			.find(
@@ -467,20 +857,24 @@ type PendingQuestionRef = {
 function findPendingQuestion(
 	messageIds: string[],
 	messagesMap: Record<string, Message>,
-	activeSessionId: string | null,
+	_activeSessionId: string | null,
 ): PendingQuestionRef | null {
-	for (let index = messageIds.length - 1; index >= 0; index -= 1) {
-		const message = messagesMap[messageIds[index] ?? ""];
-		if (!message) continue;
-		if (activeSessionId && message.conversationId !== activeSessionId) continue;
+	// Only check the last message — a question is only "active" if it's the
+	// most recent interaction and hasn't been answered yet.
+	const lastId = messageIds[messageIds.length - 1];
+	if (!lastId) return null;
+	const lastMessage = messagesMap[lastId];
+	if (!lastMessage?.questions?.length) return null;
+	if (lastMessage.status === "failed" || lastMessage.status === "completed") return null;
 
-		const question = [...(message.questions ?? [])]
-			.reverse()
-			.find(
-				(item) =>
-					item.status === "pending" || item.status === "submitting" || item.status === "error",
-			);
-		if (question) return { message, question };
+	const question = lastMessage.questions[lastMessage.questions.length - 1];
+	if (
+		question &&
+		(question.status === "pending" ||
+			question.status === "submitting" ||
+			question.status === "error")
+	) {
+		return { message: lastMessage, question };
 	}
 	return null;
 }
@@ -502,32 +896,51 @@ function buildComposerMetadata(
 	return composerTokens.length > 0 ? { composerTokens } : undefined;
 }
 
-function projectSkillToComposerOption(skill: ProjectSkill): ComposerSkillOption {
+async function resolveDocxVersionSync(
+	draft: DocxSelectionComposerDraft,
+): Promise<PendingDocxVersionSync | null> {
+	const { file } = draft;
+	const chainFilePublicId = file.publicId || file.versionPublicId;
+	if (!file.projectId || !chainFilePublicId || !file.publicId) return null;
+
+	let baselinePublicId = file.publicId;
+	let baselineVersionNo = file.versionNo ?? 0;
+	try {
+		const response = await projectFileApi.versions(file.projectId, chainFilePublicId);
+		if (response.data.code === 0) {
+			const latest = getLatestProjectFileVersion(response.data.data);
+			if (latest) {
+				baselinePublicId = latest.public_id;
+				baselineVersionNo = latest.version_no;
+			}
+		}
+	} catch (error) {
+		console.warn("Resolve DOCX version baseline error:", error);
+	}
+
 	return {
-		code: skill.code,
-		label: skill.name,
-		description: skill.description || skill.category || "项目技能",
-		keywords: [
-			skill.name,
-			skill.code,
-			skill.description,
-			skill.category,
-			skill.source,
-			skill.trust,
-		].filter((item): item is string => Boolean(item)),
+		id: `docx-selection-submit-${Date.now()}`,
+		projectId: file.projectId,
+		taskId: file.taskId,
+		chainFilePublicId,
+		expectedPreviewPublicId: file.publicId,
+		baselinePublicId,
+		baselineVersionNo,
+		selectedVersionPublicId: draft.selectedVersionPublicId,
 	};
 }
 
-function removeSkillDirectives(value: string, removedLabels: string[]): string {
-	let nextValue = value;
-	for (const label of removedLabels) {
-		nextValue = nextValue.replace(new RegExp(`(^|\\s)/${escapeRegExp(label)}(?=\\s|$)`, "g"), "$1");
-	}
-	return nextValue.replace(/[ \t]{2,}/g, " ").trimStart();
-}
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function projectMemberToComposerAssistantOption(member: ProjectMember): ComposerAssistantOption {
+	const id = member.publicId || String(member.memberId);
+	return {
+		id,
+		code: id,
+		name: member.name,
+		roleName: member.roleName,
+		// 中文注释：DetailProject 当前可能只返回成员基础信息，这里用项目队友信息补齐输入框候选项。
+		description: member.description || (member.isDefault ? "默认 AI 队友" : "AI 队友"),
+		avatarUrl: member.avatarUrl,
+	};
 }
 
 function ApprovalDecisionInput({
@@ -707,37 +1120,4 @@ function getApprovalDetail(approval: ApprovalRequest): string {
 	if (typeof url === "string" && url.trim()) return url.trim();
 
 	return "";
-}
-
-function AttachmentPreview({
-	attachments,
-	onRemove,
-}: {
-	attachments: Attachment[];
-	onRemove: (id: string) => void;
-}) {
-	return (
-		<div data-slot="attachment-preview" className="mb-3 flex flex-wrap gap-2">
-			{attachments.map((att) => (
-				<div
-					key={att.id}
-					className="flex items-center gap-2 rounded-lg bg-white/90 px-3 py-2 text-sm shadow-sm ring-1 ring-slate-200/70"
-				>
-					{att.type === "image" && att.url ? (
-						<img src={att.url} alt={att.name} className="size-8 rounded object-cover" />
-					) : (
-						<Paperclip className="size-3.5 text-slate-400" />
-					)}
-					<span className="text-slate-600 truncate max-w-[120px]">{att.name}</span>
-					<button
-						type="button"
-						onClick={() => onRemove(att.id)}
-						className="text-slate-400 hover:text-slate-600 transition-colors"
-					>
-						<X className="size-3.5" />
-					</button>
-				</div>
-			))}
-		</div>
-	);
 }

@@ -1,0 +1,39 @@
+FROM registry.yygu.cn/library/node:24
+
+# GitLab 桌面 Windows 交叉打包镜像：把 Wine（含 wine32）预装进 Harbor，避免每次 job 现场下载。
+# NSIS 抽出 __uninstaller.exe 需要能跑 32 位 Windows PE，不能只装 wine64。
+# 构建并推送：
+#   docker build -f deployments/build/Dockerfile.desktop-ci-win -t registry.yygu.cn/library/node:24-wine .
+#   docker push registry.yygu.cn/library/node:24-wine
+# 之后把 .gitlab-ci.yml 里 desktop-build-win-x64 的 image 改成该标签。
+
+ENV WINEDLLOVERRIDES="mscoree,mshtml=" \
+    WINEDEBUG=-all
+
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i \
+        -e 's|http://deb.debian.org/debian|https://mirrors.aliyun.com/debian|g' \
+        -e 's|https://deb.debian.org/debian|https://mirrors.aliyun.com/debian|g' \
+        -e 's|http://security.debian.org/debian-security|https://mirrors.aliyun.com/debian-security|g' \
+        -e 's|https://security.debian.org/debian-security|https://mirrors.aliyun.com/debian-security|g' \
+        -e 's|http://security.debian.org|https://mirrors.aliyun.com/debian-security|g' \
+        -e 's|https://security.debian.org|https://mirrors.aliyun.com/debian-security|g' \
+        /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    if [ -f /etc/apt/sources.list ]; then \
+      sed -i \
+        -e 's|http://deb.debian.org/debian|https://mirrors.aliyun.com/debian|g' \
+        -e 's|https://deb.debian.org/debian|https://mirrors.aliyun.com/debian|g' \
+        -e 's|http://security.debian.org/debian-security|https://mirrors.aliyun.com/debian-security|g' \
+        -e 's|https://security.debian.org/debian-security|https://mirrors.aliyun.com/debian-security|g' \
+        -e 's|http://security.debian.org|https://mirrors.aliyun.com/debian-security|g' \
+        -e 's|https://security.debian.org|https://mirrors.aliyun.com/debian-security|g' \
+        /etc/apt/sources.list; \
+    fi; \
+    dpkg --add-architecture i386; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends python3-venv ca-certificates wine wine64 wine32; \
+    rm -rf /var/lib/apt/lists/*; \
+    wine --version; \
+    dpkg-query -W wine32 wine32:i386 wine64 wine

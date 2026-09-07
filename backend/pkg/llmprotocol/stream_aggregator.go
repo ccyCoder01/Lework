@@ -68,6 +68,14 @@ func NewStreamAggregator() *StreamAggregator {
 	}
 }
 
+// GetUsage returns the accumulated token usage, or nil if no usage was reported.
+func (sa *StreamAggregator) GetUsage() *IRUsage {
+	if sa == nil {
+		return nil
+	}
+	return sa.usage
+}
+
 // ProcessIREvent processes a single IR stream event and returns zero or more
 // corrected IR events. Callers must feed the returned events to the entry
 // adapter in order.

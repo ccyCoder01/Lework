@@ -7,6 +7,8 @@ $runtimeState = Get-ConfiguredDevRuntimeState
 $env:LEROS_STORAGE_LOCAL_DIR = "$root\leros-storage"
 $workspaceMountRoot = "$root\.leros-workspace"
 
+Ensure-LatestBackendBinary -RepoRoot $root
+
 if (-not (Test-Path $env:LEROS_STORAGE_LOCAL_DIR)) {
     New-Item -ItemType Directory -Path $env:LEROS_STORAGE_LOCAL_DIR | Out-Null
 }

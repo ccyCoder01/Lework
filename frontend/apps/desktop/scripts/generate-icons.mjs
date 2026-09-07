@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -6,23 +7,48 @@ import sharp from 'sharp'
 
 const currentDir = dirname(fileURLToPath(import.meta.url))
 const appDir = resolve(currentDir, '..')
-const sourceLogo = resolve(appDir, '../../packages/app-ui/assets/logo.svg')
+const defaultLogo = resolve(appDir, '../../packages/app-ui/assets/logo.svg')
 const sourceTrayLogo = resolve(appDir, '../../packages/app-ui/assets/logo-white.svg')
+const injectedLogoSvg = join(appDir, 'src/renderer/public/brand/logo.svg')
+const injectedLogoPng = join(appDir, 'src/renderer/public/brand/logo.png')
+const sourceLogo = existsSync(injectedLogoSvg)
+  ? injectedLogoSvg
+  : existsSync(injectedLogoPng)
+    ? injectedLogoPng
+    : defaultLogo
+const sourceTrayLogoResolved = sourceLogo === defaultLogo ? sourceTrayLogo : sourceLogo
 const resourcesDir = join(appDir, 'resources')
 
 const iconPngPath = join(resourcesDir, 'icon.png')
+const iconMacPngPath = join(resourcesDir, 'icon-mac.png')
 const iconIcoPath = join(resourcesDir, 'icon.ico')
 const trayIconPngPath = join(resourcesDir, 'tray-icon.png')
+const linuxIconsDir = join(resourcesDir, 'linux-icons')
+const linuxIconSizes = [16, 24, 32, 48, 64, 96, 128, 256, 512]
+
+// 中文注释：macOS 图标底板采用白色（与 VS Code、企业微信等应用一致），让彩色 logo 主体突出。
+const macIconBackgroundTop = '#ffffff'
+const macIconBackgroundBottom = '#ffffff'
 
 await mkdir(resourcesDir, { recursive: true })
+await mkdir(linuxIconsDir, { recursive: true })
 await sharp(await renderIcon(1024)).toFile(iconPngPath)
-await sharp(await renderIcon(128, { source: sourceTrayLogo, logoScale: 0.9 })).toFile(trayIconPngPath)
+await sharp(await renderMacIcon(1024)).toFile(iconMacPngPath)
+await sharp(await renderIcon(128, { source: sourceTrayLogoResolved, logoScale: 0.9 })).toFile(trayIconPngPath)
+
+// 中文注释：银河麒麟/UKUI 等桌面只会从标准 hicolor 尺寸目录中查找任务栏图标，
+// 不能只依赖 1024x1024 图标，因此为 Linux 安装包生成完整的 freedesktop 图标集。
+await Promise.all(
+  linuxIconSizes.map(async (size) => {
+    await sharp(await renderIcon(size)).toFile(join(linuxIconsDir, `${size}x${size}.png`))
+  }),
+)
 
 // 中文注释：Windows 安装包和快捷方式优先读取 ICO 资源，因此这里额外生成多尺寸桌面图标。
 await generateWindowsIcon(iconIcoPath)
 
 async function renderIcon(size, options = {}) {
-  // 中文注释：桌面图标直接使用透明底主体，并尽量放大到接近满幅但避免裁边。
+  // 中文注释：Windows/Linux 使用透明底主体，并尽量放大到接近满幅但避免裁边。
   const source = options.source ?? sourceLogo
   const logoScale = options.logoScale ?? (size <= 64 ? 1 : 0.98)
   const logoSize = Math.round(size * logoScale)
@@ -46,6 +72,44 @@ async function renderIcon(size, options = {}) {
     .toBuffer()
 }
 
+async function renderMacIcon(size, options = {}) {
+  // 中文注释：按照 Apple 图标规范绘制——1024 画布中图标本体是 824 的圆角方块（约 80.5%），
+  // 四周保留透明边距，圆角半径约为本体的 22.5%，这样 Dock 中的大小和圆角才能与系统应用一致。
+  const source = options.source ?? sourceLogo
+  const plateScale = 824 / 1024
+  const plateSize = Math.round(size * plateScale)
+  const plateOffset = Math.round((size - plateSize) / 2)
+  const cornerRadius = Math.round(plateSize * 0.225)
+
+  // 中文注释：logo 相对底板缩放，保证章鱼在圆角底板内留出呼吸空间。
+  const logoScale = options.logoScale ?? 0.72
+  const logoSize = Math.round(plateSize * logoScale)
+  const logoOffset = Math.round((size - logoSize) / 2)
+
+  const background = Buffer.from(
+    `<svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="${macIconBackgroundTop}" />
+          <stop offset="100%" stop-color="${macIconBackgroundBottom}" />
+        </linearGradient>
+      </defs>
+      <rect x="${plateOffset}" y="${plateOffset}" width="${plateSize}" height="${plateSize}"
+        rx="${cornerRadius}" ry="${cornerRadius}" fill="url(#bg)" />
+    </svg>`,
+  )
+
+  const logo = await sharp(source)
+    .resize(logoSize, logoSize, { fit: 'contain' })
+    .png()
+    .toBuffer()
+
+  return sharp(background)
+    .composite([{ input: logo, left: logoOffset, top: logoOffset }])
+    .png()
+    .toBuffer()
+}
+
 async function generateWindowsIcon(iconIcoPath) {
   const iconSizes = [256, 128, 64, 48, 32, 16]
   const iconPngBuffers = await Promise.all(iconSizes.map((size) => renderIcon(size)))
@@ -53,3 +117,5 @@ async function generateWindowsIcon(iconIcoPath) {
 
   await writeFile(iconIcoPath, iconIcoBuffer)
 }
+
+export { linuxIconSizes, renderIcon, renderMacIcon }

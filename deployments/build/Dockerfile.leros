@@ -1,6 +1,7 @@
 ARG BUILDPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
+ARG BUILD_TAGS=
 
 FROM registry.yygu.cn/library/golang:1.25 AS builder
 
@@ -25,16 +26,22 @@ COPY . .
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG BUILD_TAGS
 
 # Build the application with module cache mounted
 RUN --mount=type=cache,target=/go/ \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -v -o /build/leros ./backend/cmd/leros/
+    go build -tags="${BUILD_TAGS}" -ldflags="-s -w" -v -o /build/leros ./backend/cmd/leros/
 
 FROM registry.yygu.cn/insmtx/leros-base:latest
 
+COPY --from=builder /usr/share/zoneinfo/Asia/Shanghai /usr/share/zoneinfo/Asia/Shanghai
+RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+ENV TZ=Asia/Shanghai
+
 COPY --from=builder /build/leros /leros
 COPY --from=builder /build/backend/skills /app/backend/skills
+COPY --from=builder /build/deployments/dev/seed /app/deployments/dev/seed
 
 WORKDIR /app
 

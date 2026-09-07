@@ -2,23 +2,28 @@ package service
 
 import (
 	"testing"
+
+	"github.com/insmtx/Leros/backend/internal/consts"
 )
 
 func TestIsPathAllowed(t *testing.T) {
+	uploads := consts.RepoDirUploads
+	artifacts := consts.RepoDirArtifacts
+
 	tests := []struct {
 		path    string
 		allowed bool
 	}{
-		{"uploads/readme.md", true},
-		{"uploads/sub/dir/file.txt", true},
-		{"artifacts/report.pdf", true},
-		{"artifacts/", true},
+		{uploads + "/readme.md", true},
+		{uploads + "/sub/dir/file.txt", true},
+		{artifacts + "/report.pdf", true},
+		{artifacts + "/", true},
 		{"src/main.go", false},
 		{"", false},
-		{"uploads", false},
-		{"artifacts", false},
+		{uploads, false},
+		{artifacts, false},
 		{"config.yaml", false},
-		{"uploads_evil/file.txt", false},
+		{uploads + "_evil/file.txt", false},
 	}
 
 	for _, tt := range tests {
@@ -27,14 +32,6 @@ func TestIsPathAllowed(t *testing.T) {
 			t.Errorf("isPathAllowed(%q) = %v, want %v", tt.path, result, tt.allowed)
 		}
 	}
-}
-
-func TestBuildFileTreeFromProjectFiles(t *testing.T) {
-	t.Skip("buildFileTreeFromProjectFiles 现在依赖 db 查询 FileUpload 表，需要在集成测试中覆盖")
-}
-
-func TestBuildFileTreeFromProjectFiles_Empty(t *testing.T) {
-	t.Skip("buildFileTreeFromProjectFiles 现在依赖 db 查询 FileUpload 表，需要在集成测试中覆盖")
 }
 
 func TestMimeTypeByExt(t *testing.T) {

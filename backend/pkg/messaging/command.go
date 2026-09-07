@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/insmtx/Leros/backend/types"
 )
 
 // CommandType 表示 server 发给 worker 的命令类型。
@@ -18,8 +20,8 @@ const (
 	CommandTypeApprovalResolve CommandType = "approval.resolve"
 	// CommandTypeQuestionAnswer 发送问题答案给 Worker。
 	CommandTypeQuestionAnswer CommandType = "question.answer"
-	// CommandTypeSkill 统一 skill 管理命令。
-	CommandTypeSkill CommandType = "skill.manage"
+	// CommandTypeProjectFileRestore 请求 Worker 恢复项目文件历史版本。
+	CommandTypeProjectFileRestore CommandType = "project.file.restore"
 )
 
 // Lane 表示命令分发到哪个 lane subject。
@@ -29,7 +31,7 @@ const (
 	LaneRun         Lane = "cmd.run"
 	LaneControl     Lane = "cmd.control"
 	LaneInteraction Lane = "cmd.interaction"
-	LaneSkill       Lane = "cmd.skill"
+	LaneFile        Lane = "cmd.file"
 )
 
 // CommandLane 根据命令类型返回对应的 lane。
@@ -41,8 +43,8 @@ func CommandLane(cmdType CommandType) Lane {
 		return LaneControl
 	case CommandTypeApprovalResolve, CommandTypeQuestionAnswer:
 		return LaneInteraction
-	case CommandTypeSkill:
-		return LaneSkill
+	case CommandTypeProjectFileRestore:
+		return LaneFile
 	default:
 		return LaneRun
 	}
@@ -58,7 +60,7 @@ type WorkerCommand = Envelope[WorkerCommandBody]
 //   - run.cancel:        CancelRunCommandPayload
 //   - approval.resolve:  ApprovalResolveCommandPayload
 //   - question.answer:   QuestionAnswerCommandPayload
-//   - skill.manage:      SkillCommandPayload
+//   - project.file.restore: ProjectFileRestoreCommandPayload
 type WorkerCommandBody struct {
 	CommandType CommandType     `json:"command_type"`
 	Payload     json.RawMessage `json:"payload,omitempty"`
@@ -88,11 +90,43 @@ type RunCommandPayload struct {
 	Actor     ActorContext     `json:"actor"`
 	Execution ExecutionTarget  `json:"execution"`
 	Workspace WorkspaceOptions `json:"workspace,omitempty"`
+	Project   ProjectContext   `json:"project,omitempty"`
 	Input     TaskInput        `json:"input"`
 
-	Model   ModelOptions   `json:"model,omitempty"`
-	Runtime RuntimeOptions `json:"runtime,omitempty"`
-	Policy  TaskPolicy     `json:"policy,omitempty"`
+	Model   ModelOptions     `json:"model,omitempty"`
+	Runtime RuntimeOptions   `json:"runtime,omitempty"`
+	Policy  TaskPolicy       `json:"policy,omitempty"`
+	Plugins []PluginSnapshot `json:"plugins,omitempty"`
+
+	// 业务主键 ID，用于 llm_history 等调用记录关联。
+	// 以下均为对应表的自增主键（int），区别于其它字段中的 public_id（string）。
+	//
+	//   ProjectID   leros_project.id          -> 区别于 Workspace.ProjectID（project public_id）
+	//   SessionID   leros_session.id          -> 区别于 RouteContext.SessionID（session public_id）
+	//   MessageID   leros_session_message.id  -> 当前触发 run 的消息主键
+	//   AssistantID       leros_digital_assistant.id          -> 区别于 Execution.AssistantPublicID（assistant public_id）
+	//   AssistantPublicID leros_digital_assistant.public_id    -> 用于 worker 侧展示和对外追溯
+	//   Uin               leros_user.id                        -> 区别于 ActorContext.UserID（fmt.Sprintf("%d", uin)）
+	ProjectID         uint   `json:"project_id"`
+	SessionID         uint   `json:"session_id"`
+	MessageID         uint   `json:"message_id"`
+	AssistantID       uint   `json:"assistant_id"`
+	AssistantPublicID string `json:"assistant_public_id,omitempty"`
+	Uin               uint   `json:"uin"`
+
+	// NotAfter Worker 最晚允许开始时间（RFC3339，UTC）。超过该时间 Worker 应拒绝执行。
+	// 需要持久化进 worker inbox，崩溃恢复时仍能生效。
+	NotAfter string `json:"not_after,omitempty"`
+}
+
+// PluginSnapshot is the immutable plugin revision selected when a run is published.
+// Definition is the immutable plugin configuration selected for this run.
+type PluginSnapshot struct {
+	PluginID   string          `json:"plugin_id"`
+	Code       string          `json:"code"`
+	Kind       string          `json:"kind"`
+	Revision   int             `json:"revision"`
+	Definition json.RawMessage `json:"definition"`
 }
 
 // CancelRunCommandPayload 是 run.cancel 命令的 payload。
@@ -112,15 +146,22 @@ type QuestionAnswerCommandPayload struct {
 	Answers [][]string `json:"answers"`
 }
 
-// SkillCommandPayload 是 skill.manage 命令的 payload。
-type SkillCommandPayload struct {
-	Action  string `json:"action"`             // "install" | "list" | "uninstall" | "detail" | "import"
-	Source  string `json:"source,omitempty"`   // "Leros" | "github" | "skills-sh" | "url"
-	SkillID string `json:"skill_id,omitempty"` // install identifier
-	Version string `json:"version,omitempty"`  // optional version for install
-	Name    string `json:"name,omitempty"`     // for uninstall / detail: the skill name
-	// DownloadURL is the URL from which the worker downloads the skill file during "import".
-	DownloadURL string `json:"download_url,omitempty"`
+// ProjectFileRestoreCommandPayload 是 project.file.restore 命令的 payload。
+type ProjectFileRestoreCommandPayload struct {
+	ProjectPublicID string `json:"project_public_id"`
+	RelativePath    string `json:"relative_path"`
+	Branch          string `json:"branch,omitempty"`
+	DownloadURL     string `json:"download_url"`
+	AuthorName      string `json:"author_name,omitempty"`
+	AuthorEmail     string `json:"author_email,omitempty"`
+}
+
+// ProjectFileRestoreResult 是 Worker 完成项目文件恢复后的同步响应。
+type ProjectFileRestoreResult struct {
+	Success      bool   `json:"success"`
+	RelativePath string `json:"relative_path,omitempty"`
+	CommitSHA    string `json:"commit_sha,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 // ---- Command Builders ----
@@ -213,8 +254,8 @@ func NewQuestionAnswerCommand(envID string, route RouteContext, payload Question
 	}
 }
 
-// NewSkillCommand 构造一个 skill.manage WorkerCommand。
-func NewSkillCommand(envID string, route RouteContext, payload SkillCommandPayload, replyTo string) WorkerCommand {
+// NewProjectFileRestoreCommand 构造 project.file.restore WorkerCommand。
+func NewProjectFileRestoreCommand(envID string, route RouteContext, payload ProjectFileRestoreCommandPayload) WorkerCommand {
 	raw, _ := json.Marshal(payload)
 	return WorkerCommand{
 		ID:        envID,
@@ -222,9 +263,8 @@ func NewSkillCommand(envID string, route RouteContext, payload SkillCommandPaylo
 		CreatedAt: time.Now().UTC(),
 		Route:     route,
 		Body: WorkerCommandBody{
-			CommandType: CommandTypeSkill,
+			CommandType: CommandTypeProjectFileRestore,
 			Payload:     raw,
-			ReplyTo:     replyTo,
 		},
 	}
 }
@@ -296,9 +336,15 @@ type ActorContext struct {
 }
 
 type ExecutionTarget struct {
-	AssistantID string   `json:"assistant_id,omitempty"`
-	Skills      []string `json:"skills,omitempty"`
-	Tools       []string `json:"tools,omitempty"`
+	// AssistantID 是 leros_digital_assistant.id，自增主键，用于 llm_history 关联。
+	AssistantID uint `json:"assistant_id,omitempty"`
+	// AssistantPublicID 是 leros_digital_assistant.public_id，用于 worker 侧日志展示。
+	AssistantPublicID string   `json:"assistant_public_id,omitempty"`
+	AssistantName     string   `json:"assistant_name,omitempty"`
+	AssistantDesc     string   `json:"assistant_desc,omitempty"`
+	SystemPrompt      string   `json:"system_prompt,omitempty"`
+	Skills            []string `json:"skills,omitempty"`
+	Tools             []string `json:"tools,omitempty"`
 }
 
 type WorkspaceOptions struct {
@@ -306,16 +352,39 @@ type WorkspaceOptions struct {
 	TaskID    string `json:"task_id,omitempty"`
 }
 
+// ProjectContext carries project business context to the worker.
+type ProjectContext struct {
+	Name        string        `json:"name,omitempty"`
+	Description string        `json:"description,omitempty"`
+	Objective   string        `json:"objective,omitempty"`
+	Members     []MemberBrief `json:"members,omitempty"`
+}
+
+// MemberBrief is a lightweight project member snapshot.
+type MemberBrief struct {
+	MemberID      uint   `json:"member_id"`
+	MemberType    string `json:"member_type"` // user / assistant
+	MemberRole    string `json:"member_role"` // owner / admin / member / viewer
+	Name          string `json:"name"`
+	IsDefault     bool   `json:"is_default,omitempty"`
+	IsCurrentExec bool   `json:"is_current_exec,omitempty"` // marks the assistant executing this run
+	IsCurrentUser bool   `json:"is_current_user,omitempty"` // marks the user who initiated this run
+}
+
 type TaskInput struct {
-	Type        InputType     `json:"type"`
-	Messages    []ChatMessage `json:"messages,omitempty"`
-	Attachments []Attachment  `json:"attachments,omitempty"`
+	Type         InputType     `json:"type"`
+	Scene        string        `json:"scene,omitempty"`
+	OutputFormat string        `json:"output_format,omitempty"`
+	Messages     []ChatMessage `json:"messages,omitempty"`
+	Attachments  []Attachment  `json:"attachments,omitempty"`
 }
 
 type ChatMessage struct {
-	ID      string      `json:"id,omitempty"`
-	Role    MessageRole `json:"role"`
-	Content string      `json:"content"`
+	ID           string      `json:"message_id,omitempty"`
+	Role         MessageRole `json:"role"`
+	Content      string      `json:"content"`
+	SenderUserID *uint       `json:"sender_user_id,omitempty"`
+	SenderName   string      `json:"sender_name,omitempty"`
 }
 
 type Attachment struct {
@@ -323,23 +392,39 @@ type Attachment struct {
 	Name     string `json:"name,omitempty"`
 	MimeType string `json:"mime_type,omitempty"`
 	URL      string `json:"url,omitempty"`
+	// AttachmentRole 是工具场景赋予附件的语义角色；空表示普通附件。
+	AttachmentRole string `json:"attachment_role,omitempty"`
 }
 
 type ModelOptions struct {
+	ModelID      uint   `json:"model_id,omitempty"`
 	Provider     string `json:"provider,omitempty"`
 	Model        string `json:"model,omitempty"`
 	BaseURL      string `json:"base_url,omitempty"`
 	BaseURLHasV1 bool   `json:"base_url_has_v1,omitempty"`
 	APIKey       string `json:"api_key,omitempty"`
+	// Vision 表示该模型是否支持图片（多模态）输入。
+	Vision bool `json:"vision,omitempty"`
+
+	// Temperature 默认采样温度；0 表示未配置，走 provider 默认。
+	Temperature float64 `json:"temperature,omitempty"`
+	// MaxTokens 默认最大输出 token 数；0 表示未配置，走 provider 默认。
+	MaxTokens int `json:"max_tokens,omitempty"`
+
+	TopP             *float64 `json:"top_p,omitempty"`
+	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float64 `json:"presence_penalty,omitempty"`
+	ContextLimit     int      `json:"context_limit,omitempty"`
+	OutputLimit      int      `json:"output_limit,omitempty"`
 }
 
 type RuntimeOptions struct {
 	Kind    string `json:"kind,omitempty"`
 	WorkDir string `json:"work_dir,omitempty"`
-	MaxStep int    `json:"max_step,omitempty"`
 }
 
 type TaskPolicy struct {
-	RequireApproval bool   `json:"require_approval,omitempty"`
-	PermissionMode  string `json:"permission_mode,omitempty"`
+	RequireApproval bool                   `json:"require_approval,omitempty"`
+	PermissionMode  string                 `json:"permission_mode,omitempty"`
+	DisabledPlugins []types.DisabledPlugin `json:"disabled_plugins,omitempty"`
 }

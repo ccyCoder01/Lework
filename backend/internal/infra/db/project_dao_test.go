@@ -59,7 +59,8 @@ func TestListProjects_DefaultOrderUsesUpdatedAtDesc(t *testing.T) {
 	}
 
 	items, total, err := ListProjects(ctx, database, &types.PageQuery{
-		Caller: types.Caller{OrgID: 1, Uin: 1},
+		Caller:     types.Caller{OrgID: 1, Uin: 1},
+		ProjectIDs: []uint{projectOld.ID, projectNew.ID},
 		Pagination: types.Pagination{
 			Offset: 0,
 			Limit:  20,

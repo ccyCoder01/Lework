@@ -9,6 +9,7 @@ type Response struct {
 // BaseResponse 基础响应格式
 type BaseResponse struct {
 	Code    int    `json:"code"`
+	ReqID   string `json:"req_id,omitempty"`
 	Message string `json:"message"`
 }
 

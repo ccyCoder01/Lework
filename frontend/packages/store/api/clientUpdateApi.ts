@@ -1,11 +1,11 @@
-import type { BackendDataResponse } from "./types";
 import { apiClient } from "./client";
 import {
-	dispatchClientUpgradeRequired,
-	getClientVersionReport,
 	type ClientUpdatePolicy,
 	type ClientVersionReportParams,
+	dispatchClientUpgradeRequired,
+	getClientVersionReport,
 } from "./clientUpdatePolicy";
+import type { BackendDataResponse } from "./types";
 
 export const CLIENT_UPDATE_ENDPOINTS = {
 	report: "/ClientVersionReport",

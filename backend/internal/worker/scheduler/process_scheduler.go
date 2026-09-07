@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,7 @@ type ProcessInstance struct {
 	Status    string
 	StartedAt time.Time
 	LastSeen  time.Time
+	Endpoint  string
 	mu        sync.RWMutex
 }
 
@@ -62,6 +64,7 @@ func (ps *ProcessScheduler) Start(ctx context.Context, spec *worker.WorkerSpec) 
 		StartedAt: time.Now(),
 		LastSeen:  time.Now(),
 	}
+	instance.Endpoint = processWorkerEndpoint(spec, ps.config)
 
 	if err := ps.startProcess(instance, spec); err != nil {
 		return nil, fmt.Errorf("failed to start process: %w", err)
@@ -75,6 +78,7 @@ func (ps *ProcessScheduler) Start(ctx context.Context, spec *worker.WorkerSpec) 
 		Status:    instance.Status,
 		PID:       instance.Process.Pid,
 		StartedAt: instance.StartedAt,
+		Endpoint:  instance.Endpoint,
 	}, nil
 }
 
@@ -84,7 +88,7 @@ func (ps *ProcessScheduler) Stop(ctx context.Context, workerID string) error {
 
 	instance, ok := ps.instances[workerID]
 	if !ok {
-		return fmt.Errorf("worker %s not found", workerID)
+		return fmt.Errorf("%w: %s", worker.ErrWorkerNotFound, workerID)
 	}
 
 	if err := ps.stopProcess(instance); err != nil {
@@ -102,7 +106,7 @@ func (ps *ProcessScheduler) Health(ctx context.Context, workerID string) error {
 	ps.mu.RUnlock()
 
 	if !ok {
-		return fmt.Errorf("worker %s not found", workerID)
+		return fmt.Errorf("%w: %s", worker.ErrWorkerNotFound, workerID)
 	}
 
 	return ps.healthCheck(instance)
@@ -121,6 +125,7 @@ func (ps *ProcessScheduler) List(ctx context.Context) ([]*worker.WorkerInstance,
 			Status:    instance.Status,
 			PID:       instance.Process.Pid,
 			StartedAt: instance.StartedAt,
+			Endpoint:  instance.Endpoint,
 		})
 		instance.mu.RUnlock()
 	}
@@ -148,6 +153,7 @@ func (ps *ProcessScheduler) startProcess(instance *ProcessInstance, spec *worker
 	if spec.BootstrapToken != "" {
 		env = append(env, "LEROS_WORKER_BOOTSTRAP_TOKEN="+spec.BootstrapToken)
 	}
+	env = append(env, fmt.Sprintf("LEROS_PARENT_PID=%d", os.Getpid()))
 
 	workDir := cfg.WorkingDir
 	if workDir == "" {
@@ -155,6 +161,9 @@ func (ps *ProcessScheduler) startProcess(instance *ProcessInstance, spec *worker
 	}
 
 	args := []string{cmdPath, "worker"}
+	if strings.TrimSpace(cfg.WorkerConfig) != "" {
+		args = append(args, "--config", cfg.WorkerConfig)
+	}
 	if spec.OrgID != 0 {
 		args = append(args, "--org-id", strconv.FormatUint(uint64(spec.OrgID), 10))
 	}
@@ -171,12 +180,16 @@ func (ps *ProcessScheduler) startProcess(instance *ProcessInstance, spec *worker
 	if spec.BootstrapToken != "" {
 		args = append(args, "--bootstrap-token", spec.BootstrapToken)
 	}
+	if instance.Endpoint != "" {
+		args = append(args, "--listen-addr", strings.TrimPrefix(instance.Endpoint, "http://"))
+	}
 
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = workDir
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	configureProcessGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start command: %w", err)
@@ -204,36 +217,78 @@ func (ps *ProcessScheduler) stopProcess(instance *ProcessInstance) error {
 		return nil
 	}
 
-	if err := instance.Process.Signal(os.Interrupt); err != nil {
-		logs.Warnf("Failed to send interrupt signal to %s: %v", instance.WorkerID, err)
-		if err := instance.Process.Kill(); err != nil {
-			return fmt.Errorf("failed to kill process: %w", err)
-		}
+	if err := stopProcessGroup(instance.Cmd); err != nil {
+		return fmt.Errorf("failed to stop process group: %w", err)
 	}
 
-	logs.Infof("Sent interrupt signal to worker %s", instance.WorkerID)
+	logs.Infof("Worker process group for %s stopped", instance.WorkerID)
 	return nil
 }
 
 func (ps *ProcessScheduler) healthCheck(instance *ProcessInstance) error {
 	instance.mu.RLock()
-	defer instance.mu.RUnlock()
+	endpoint := strings.TrimSpace(instance.Endpoint)
+	cmd := instance.Cmd
+	instance.mu.RUnlock()
 
-	if instance.Process == nil {
-		return fmt.Errorf("process not started")
+	if endpoint == "" {
+		return fmt.Errorf("worker endpoint is not configured")
+	}
+	if cmd != nil && cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+		return fmt.Errorf("process exited")
 	}
 
-	process, err := os.FindProcess(instance.Process.Pid)
+	requestCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint+"/health", nil)
 	if err != nil {
-		return fmt.Errorf("process not found: %w", err)
+		return fmt.Errorf("create worker health request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("worker health request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("worker health status %d", resp.StatusCode)
 	}
 
-	if err := process.Signal(os.Interrupt); err != nil {
-		return fmt.Errorf("process is not responding: %w", err)
-	}
-
+	instance.mu.Lock()
 	instance.LastSeen = time.Now()
+	instance.Status = "running"
+	instance.mu.Unlock()
 	return nil
+}
+
+func processWorkerEndpoint(spec *worker.WorkerSpec, cfg *config.SchedulerConfig) string {
+	listenAddr := ""
+	if spec != nil && spec.Env != nil {
+		listenAddr = strings.TrimSpace(spec.Env["LEROS_WORKER_LISTEN_ADDR"])
+	}
+	if listenAddr == "" && cfg != nil && cfg.Env != nil {
+		listenAddr = strings.TrimSpace(cfg.Env["LEROS_WORKER_LISTEN_ADDR"])
+	}
+	if listenAddr == "" {
+		workerID := uint(1)
+		if spec != nil && spec.WorkerID != 0 {
+			workerID = spec.WorkerID
+		}
+		orgID := uint(0)
+		if spec != nil && spec.OrgID != 0 {
+			orgID = spec.OrgID
+		}
+		// Assign a unique port block per org to avoid collisions when multiple
+		// organizations have the same worker_id (e.g. every org's first worker).
+		port := 18080 + uint64(orgID)*100 + uint64(workerID)
+		listenAddr = "127.0.0.1:" + strconv.FormatUint(port, 10)
+	}
+	if strings.HasPrefix(listenAddr, "http://") || strings.HasPrefix(listenAddr, "https://") {
+		return strings.TrimRight(listenAddr, "/")
+	}
+	if strings.HasPrefix(listenAddr, ":") {
+		listenAddr = "127.0.0.1" + listenAddr
+	}
+	return "http://" + strings.TrimRight(listenAddr, "/")
 }
 
 func (ps *ProcessScheduler) monitorProcess(instance *ProcessInstance) {
@@ -265,4 +320,37 @@ func (ps *ProcessScheduler) removeInstance(workerID string) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	delete(ps.instances, workerID)
+}
+
+func (ps *ProcessScheduler) Shutdown(ctx context.Context) error {
+	ps.mu.Lock()
+	instanceIDs := make([]string, 0, len(ps.instances))
+	for id := range ps.instances {
+		instanceIDs = append(instanceIDs, id)
+	}
+	ps.mu.Unlock()
+
+	if len(instanceIDs) == 0 {
+		return nil
+	}
+
+	logs.Infof("Shutting down %d worker process(es)", len(instanceIDs))
+
+	var errs []error
+	for _, id := range instanceIDs {
+		ps.mu.RLock()
+		instance, ok := ps.instances[id]
+		ps.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		if err := ps.stopProcess(instance); err != nil {
+			errs = append(errs, fmt.Errorf("stop %s: %w", id, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("shutdown errors: %v", errs)
+	}
+	return nil
 }

@@ -12,6 +12,7 @@ type Task struct {
 	OrgID       uint                   `json:"org_id"`
 	OwnerID     uint                   `json:"owner_id"`
 	ProjectID   string                 `json:"project_id"`
+	ProjectName string                 `json:"project_name"`
 	SessionID   *uint                  `json:"session_id,omitempty"`
 	TaskType    string                 `json:"task_type"`
 	AssigneeID  *uint                  `json:"assignee_id,omitempty"`
@@ -20,6 +21,7 @@ type Task struct {
 	Status      string                 `json:"status"`
 	Deadline    *time.Time             `json:"deadline,omitempty"`
 	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	Session     *Session               `json:"session,omitempty"`
 	CreatedAt   time.Time              `json:"created_at"`
 	UpdatedAt   time.Time              `json:"updated_at"`
 }

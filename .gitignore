@@ -20,6 +20,11 @@ profile.cov
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+node_modules/
+frontend/node_modules/
+
+# Build cache
+frontend/node_modules/.vite/
 
 # Go workspace file
 go.work
@@ -55,7 +60,7 @@ docs/swagger.yaml
 .worktree
 frontend/.pnpm-store
 .pnpm-store
-leros
+/leros
 !backend/cmd/leros
 logs/
 .omo/
@@ -64,3 +69,9 @@ leros-storage/
 .codex-local/
 .idea
 .codegraph
+deployments/dev/server.config.yaml
+deployments/dev/worker.config.yaml
+deployments/helm/leros/values.yaml
+.opencode
+.cursor
+backend/leros

@@ -17,9 +17,12 @@ import (
 
 // Usage describes model token usage.
 type Usage struct {
-	InputTokens  int
-	OutputTokens int
-	TotalTokens  int
+	InputTokens     int
+	OutputTokens    int
+	TotalTokens     int
+	PromptTokens    int64
+	CacheHitTokens  int64
+	CacheMissTokens int64
 }
 
 // StreamSink receives text deltas emitted during streaming.
@@ -38,6 +41,11 @@ func (noopStreamSink) EmitReasoningDelta(context.Context, string, string) error 
 	return nil
 }
 
+// DefaultMaxIterations 为 ReAct 循环的默认轮数上限。
+// eino ADK ChatModelAgent 迭代上限默认 20，超出即报 "exceeds max iterations"；
+// 此处抬升至 50 以支撑多轮工具调用任务。
+const DefaultMaxIterations = 50
+
 // Flow runs a tool-calling Eino agent loop.
 type Flow struct {
 	agent        adk.Agent
@@ -51,8 +59,9 @@ type FlowConfig struct {
 	Model        einomodel.ToolCallingChatModel
 	Tools        []einotool.BaseTool
 	SystemPrompt string
-	MaxStep      int
 	Messages     []adk.Message
+	// MaxIterations 限制 agent ReAct 循环轮数；0 则使用 DefaultMaxIterations。
+	MaxIterations int
 }
 
 // NewFlow creates a reusable Eino agent flow.
@@ -64,16 +73,17 @@ func NewFlow(ctx context.Context, cfg *FlowConfig) (*Flow, error) {
 		return nil, fmt.Errorf("tool-calling model is required")
 	}
 
-	maxStep := cfg.MaxStep
-	if maxStep <= 0 {
-		maxStep = 90
+	maxIter := cfg.MaxIterations
+	if maxIter <= 0 {
+		maxIter = DefaultMaxIterations
 	}
 
 	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:        "EinoAgent",
-		Description: "Eino runtime agent",
-		Model:       cfg.Model,
-		Instruction: cfg.SystemPrompt,
+		Name:          "EinoAgent",
+		Description:   "Eino runtime agent",
+		Model:         cfg.Model,
+		Instruction:   cfg.SystemPrompt,
+		MaxIterations: maxIter,
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				Tools: cfg.Tools,
@@ -83,7 +93,6 @@ func NewFlow(ctx context.Context, cfg *FlowConfig) (*Flow, error) {
 				},
 			},
 		},
-		MaxIterations: maxStep,
 		ModelRetryConfig: &adk.ModelRetryConfig{
 			MaxRetries: 5,
 			IsRetryAble: func(_ context.Context, err error) bool {
@@ -247,9 +256,12 @@ func (f *Flow) StreamWithUsage(ctx context.Context, userInput string, sink Strea
 }
 
 type usageAccumulator struct {
-	inputTokens  int
-	outputTokens int
-	totalTokens  int
+	inputTokens     int
+	outputTokens    int
+	totalTokens     int
+	promptTokens    int64
+	cacheHitTokens  int64
+	cacheMissTokens int64
 }
 
 func (u *usageAccumulator) AddMessage(message *einoschema.Message) {
@@ -266,6 +278,8 @@ func (u *usageAccumulator) AddResponseMeta(meta *einoschema.ResponseMeta) {
 	u.inputTokens += meta.Usage.PromptTokens
 	u.outputTokens += meta.Usage.CompletionTokens
 	u.totalTokens += meta.Usage.TotalTokens
+	u.promptTokens += int64(meta.Usage.PromptTokens)
+	u.cacheHitTokens += int64(meta.Usage.PromptTokenDetails.CachedTokens)
 }
 
 func (u *usageAccumulator) Payload() *Usage {
@@ -277,8 +291,11 @@ func (u *usageAccumulator) Payload() *Usage {
 		totalTokens = u.inputTokens + u.outputTokens
 	}
 	return &Usage{
-		InputTokens:  u.inputTokens,
-		OutputTokens: u.outputTokens,
-		TotalTokens:  totalTokens,
+		InputTokens:     u.inputTokens,
+		OutputTokens:    u.outputTokens,
+		TotalTokens:     totalTokens,
+		PromptTokens:    u.promptTokens,
+		CacheHitTokens:  u.cacheHitTokens,
+		CacheMissTokens: u.cacheMissTokens,
 	}
 }

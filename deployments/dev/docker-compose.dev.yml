@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgresql:
     image: registry.yygu.cn/library/postgres:17.9
@@ -26,7 +24,7 @@ services:
     container_name: leros-dev-nats
     command: ["--jetstream"]
     ports:
-      - "4223:4222"
+      - "14223:4222"
       - "8223:8222"
     volumes:
       - dev_nats_data:/data

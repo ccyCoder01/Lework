@@ -149,7 +149,7 @@ class HttpClient {
 					headers: response.headers,
 				};
 			} catch (error) {
-				lastError = error as ApiError;
+				lastError = normalizeRequestError(error as ApiError);
 
 				if (lastError?.status && lastError.status < 500) {
 					throw lastError;
@@ -245,4 +245,51 @@ function isErrorResponse(value: unknown): value is { message: string } {
 		"message" in value &&
 		typeof (value as { message?: unknown }).message === "string"
 	);
+}
+
+export function getRequestErrorMessage(error: unknown): string | undefined {
+	if (!error || typeof error !== "object") return undefined;
+
+	const apiError = error as ApiError;
+	const responseData = apiError.response?.data;
+	if (isErrorResponse(responseData)) {
+		return responseData.message;
+	}
+
+	if ("message" in error && typeof (error as { message?: unknown }).message === "string") {
+		const rawMessage = (error as { message: string }).message;
+		return normalizeNetworkErrorMessage(rawMessage, (error as Error).name) ?? rawMessage;
+	}
+
+	return undefined;
+}
+
+function normalizeRequestError(error: ApiError): ApiError {
+	if (error.status) return error;
+
+	const normalizedMessage = normalizeNetworkErrorMessage(error.message, error.name);
+	if (!normalizedMessage) return error;
+
+	const normalizedError = new Error(normalizedMessage) as ApiError;
+	normalizedError.name = error.name;
+	normalizedError.stack = error.stack;
+	return normalizedError;
+}
+
+function normalizeNetworkErrorMessage(message: string, name?: string): string | undefined {
+	if (name === "AbortError") {
+		return "请求超时，请稍后重试";
+	}
+
+	const lowerMessage = message.toLowerCase();
+	if (
+		lowerMessage === "failed to fetch" ||
+		lowerMessage.includes("networkerror") ||
+		lowerMessage === "load failed" ||
+		lowerMessage.includes("network request failed")
+	) {
+		return "网络连接失败，请检查网络后重试";
+	}
+
+	return undefined;
 }

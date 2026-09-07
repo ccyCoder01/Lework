@@ -21,11 +21,13 @@ import (
 // ManifestArtifact 表示 Agent 在一次 turn 中写入 JSON Lines manifest 的一条产物声明。
 type ManifestArtifact struct {
 	Path         string `json:"path"`
+	PreviousPath string `json:"previous_path,omitempty"`
 	Title        string `json:"title,omitempty"`
 	Description  string `json:"description,omitempty"`
 	MimeType     string `json:"mime_type,omitempty"`
 	ArtifactType string `json:"artifact_type,omitempty"`
 	IsFinal      bool   `json:"is_final,omitempty"`
+	Source       string `json:"source,omitempty"`
 }
 
 // ArtifactRecord 是 manifest 产物声明经过校验后可持久化的结构。
@@ -36,6 +38,7 @@ type ArtifactRecord struct {
 	Description  string
 	ArtifactType string
 	RelativePath string
+	PreviousPath string
 	StorageKey   string
 	StorageURI   string
 	MimeType     string
@@ -81,6 +84,11 @@ func CollectFinalArtifacts(ctx context.Context, plan *TaskWorkspace) ([]Artifact
 			return nil, fmt.Errorf("invalid artifact path %q", item.Path)
 		}
 		item.Path = key
+		if existing, ok := declared[key]; ok && strings.TrimSpace(item.PreviousPath) != "" {
+			existing.PreviousPath = item.PreviousPath
+			declared[key] = existing
+			continue
+		}
 		declared[key] = item
 	}
 	if err := scanner.Err(); err != nil {
@@ -137,6 +145,7 @@ func BuildArtifactRecord(plan *TaskWorkspace, item ManifestArtifact) (ArtifactRe
 	if artifactType == "" {
 		artifactType = string(types.ArtifactTypeFile)
 	}
+	source := resolveArtifactSource(item.Source)
 	return ArtifactRecord{
 		Title:        title,
 		Filename:     filepath.Base(item.Path),
@@ -144,13 +153,27 @@ func BuildArtifactRecord(plan *TaskWorkspace, item ManifestArtifact) (ArtifactRe
 		Description:  strings.TrimSpace(item.Description),
 		ArtifactType: artifactType,
 		RelativePath: item.Path,
+		PreviousPath: strings.TrimSpace(item.PreviousPath),
 		StorageKey:   storageKey,
 		MimeType:     detectMimeType(absolute, item.MimeType),
 		FileSize:     info.Size(),
 		Sha256:       sha,
-		Source:       string(types.ArtifactSourceAgentDeclared),
+		Source:       source,
 		Status:       string(types.ArtifactStatusCompleted),
 	}, nil
+}
+
+// resolveArtifactSource returns a valid artifact source from the manifest entry.
+// Empty or unknown values fall back to agent_declared.
+func resolveArtifactSource(source string) string {
+	switch strings.TrimSpace(source) {
+	case string(types.ArtifactSourceAgentDeclared):
+		return string(types.ArtifactSourceAgentDeclared)
+	case string(types.ArtifactSourceDiff):
+		return string(types.ArtifactSourceDiff)
+	default:
+		return string(types.ArtifactSourceAgentDeclared)
+	}
 }
 
 func sha256File(path string) (string, error) {
@@ -186,4 +209,18 @@ func detectMimeType(path string, declared string) string {
 		return ""
 	}
 	return normalizeMimeType(http.DetectContentType(buf[:n]))
+}
+
+func normalizeMimeType(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if mediaType, _, err := mime.ParseMediaType(value); err == nil {
+		return mediaType
+	}
+	if index := strings.Index(value, ";"); index >= 0 {
+		return strings.TrimSpace(value[:index])
+	}
+	return value
 }

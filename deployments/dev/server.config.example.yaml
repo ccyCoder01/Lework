@@ -7,6 +7,11 @@ server:
   jwt:
     secret: "dev-leros-jwt-secret"
 
+# 自动化定时任务调度器（Planner/Dispatcher）。默认开启，显式 false 可关闭。
+automation_scheduler:
+  enabled: true
+  planner_interval: 30
+
 client_update:
   desktop:
     min_supported_version: "0.1.0"
@@ -19,16 +24,56 @@ database:
   debug: true
 
 nats:
-  url: "nats://localhost:4223/"
+  url: "nats://localhost:14223/"
 
 log:
   level: debug
+
+logger:
+  default:
+    - writer: console
+      level: debug
+    - writer: file
+      level: debug
+      filename: ./logs/leros-server.log
+      maxsize: 10
+      maxage: 15
+      maxbackups: 5
+      localtime: true
+      compress: true
+    - writer: cls
+      level: info
+      tencent_cls:
+        topic_id: ${TENCENT_CLS_TOPIC_ID}
+        secret_id: ${TENCENT_CLS_SECRET_ID}
+        secret_key: ${TENCENT_CLS_SECRET_KEY}
+        region: ap-beijing
+        endpoint: ap-beijing.cls.tencentcs.com
+  gorm:
+    - writer: console
+      level: debug
+    - writer: cls
+      level: debug
+      tencent_cls:
+        topic_id: ${TENCENT_CLS_TOPIC_ID}
+        secret_id: ${TENCENT_CLS_SECRET_ID}
+        secret_key: ${TENCENT_CLS_SECRET_KEY}
+        region: ap-beijing
+        endpoint: ap-beijing.cls.tencentcs.com
 
 llm:
   provider: "openai"
   api_key: "${LLM_API_KEY}"
   model: "qwen3.6-plus"
   base_url: "https://api.yygu.cn/v3/llm.chat/"
+  # 以下均为可选参数，缺省即走模型/服务默认值；base_url 填根地址即可（带不带 /v1 均可），启动时 seed 会自动规范化 /v1 前缀。
+  vision: false # 默认模型是否支持图片（多模态）输入，seed 时写入模型配置
+  top_p: 0.95 # 核采样（0-1）
+  frequency_penalty: 0.1 # 频率惩罚（-2 ~ 2）
+  presence_penalty: 0 # 存在惩罚（-2 ~ 2）
+  limit:
+    context: 82144 # 上下文窗口大小（token）
+    output: 42768 # 单次输出上限（token）
   translation:
     provider: "deepseek"
     api_key: "${LLM_API_KEY}"
@@ -48,3 +93,112 @@ storage:
   sign_secret: "leros-local-presign"
   base_url: "http://localhost:8080"
 
+# 系统级 MCP 连接器：启动时仅按此列表幂等创建或更新渠道和系统模板；空列表不执行同步。
+# 未列出的数据库渠道不会被修改或重新发布模板；
+# bindings 支持直接凭据字段名或 {{credential}} 模板，动态 Header、查询参数和环境变量统一在此声明；
+# OAuth 密钥使用环境变量注入，示例中不包含真实凭据。
+mcp_connectors:
+  # 服务端托管授权：Enterprise 版通过 CoreKG handler 为每位用户创建独立 API Key。
+  - channel: corekg
+    name: 知识库
+    description: 知识库服务
+    status: active
+    transport: http
+    url: https://tapi.yygu.cn/v3/keapi/mcp
+    bindings:
+      mcp_headers:
+        Authorization: "Bearer {{api_key}}"
+    auth:
+      type: managed
+      handler: corekg
+
+  # API Key 表单授权：用户连接时填写 CatAPI API Key。
+  - channel: catapi
+    name: CatAPI
+    description: 连接 CatAPI API 市场中的工具与服务
+    status: active
+    transport: http
+    url: https://api.insmtx.com/v6/api/mcp
+    bindings:
+      mcp_headers:
+        Authorization: "Bearer {{api_key}}"
+    auth:
+      type: form
+      description: 输入 CatAPI API Key，连接后即可使用 API 市场中的工具与服务。请先在 CatAPI 控制台创建 API Key。
+      fields:
+        - key: api_key
+          label: API Key
+          type: password
+          required: true
+          placeholder: 请输入 CatAPI API Key
+          description: 在 CatAPI API Key 管理页面创建并获取
+
+  # 表单授权 + 内置 Skill：用户连接时填写邮箱与客户端授权码。
+  - channel: netease-mail
+    name: 邮箱
+    description: 通过标准 IMAP/SMTP 收发、搜索和管理邮件及附件
+    status: active
+    skill_code: connector-netease-mail
+    bindings:
+      skill_env:
+        NETEASE_EMAIL_USER: email
+        NETEASE_EMAIL_PASS: authorization_code
+    auth:
+      type: form
+      description: 输入邮箱地址和 IMAP/SMTP 授权码（非登录密码）。支持 163、126、yeah.net 等网易邮箱，以及其他支持 IMAP/SMTP 的邮箱。
+      fields:
+        - key: email
+          label: 邮箱地址
+          type: text
+          required: true
+          placeholder: yourname@163.com
+          description: 完整邮箱地址
+        - key: authorization_code
+          label: IMAP/SMTP 授权码
+          type: password
+          required: true
+          placeholder: 在邮箱设置中生成授权码
+          description: IMAP/SMTP 客户端授权码，不是网页登录密码
+
+  # OAuth + MCP + 内置 Skill：补齐 OAuth 应用参数后，将 status 改为 active 即可对用户开放。
+  - channel: baidu-netdisk
+    name: 百度网盘
+    description: 通过百度网盘 MCP 浏览、检索、整理和分享云端文件
+    status: inactive
+    skill_code: connector-baidu-netdisk
+    transport: sse
+    url: "https://mcp-pan.baidu.com/sse"
+    bindings:
+      mcp_headers:
+        Authorization: "Bearer {{access_token}}"
+    auth:
+      type: oauth
+      handler: baidu-netdisk
+      oauth:
+        app_key: "${BAIDU_NETDISK_APP_KEY}"
+        secret_key: "${BAIDU_NETDISK_SECRET_KEY}"
+        redirect_uri: "${LEROS_BASE_URL}/v1/plugins/mcp/oauth/baidu-netdisk/callback"
+        scopes:
+          - basic
+          - netdisk
+
+# 本地启动ai队友相关配置 使用这个配置，不需要手动启动worker
+# scheduler:
+#   mode: process
+#   worker_binary: ./bundles/leros
+#   本地项目路径
+#   working_dir: /Users/xxx/lework
+#   server_addr: 127.0.0.1:8080
+
+feishu:
+  enabled: true
+  app_id: "<your_feishu_app_id>"
+  app_secret: "<your_feishu_app_secret>"
+  app_token: "<your_feishu_app_token>"
+  table_id: "<your_feishu_table_id>"
+
+# Enterprise authentication adapter (only required with -tags enterprise)
+# auth:
+#   base_url: "https://iam.example.com"  # IAM 服务地址
+#   domain_name: "example.com"           # 域名，用于登录配置查询
+#   phone_code_login_enabled: true       # 是否开启手机号验证码登录，默认 true

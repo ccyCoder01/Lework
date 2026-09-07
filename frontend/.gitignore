@@ -28,6 +28,9 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# 打包时从 S3 写入的品牌资源
+apps/desktop/src/renderer/public/brand/
+
 # Logs
 *.log
 npm-debug.log*

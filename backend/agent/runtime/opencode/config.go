@@ -5,9 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/insmtx/Leros/backend/agent"
-	"github.com/insmtx/Leros/backend/agent/runtime/provider"
+	runtimeprocess "github.com/insmtx/Leros/backend/agent/runtime/internal/process"
 )
 
 const (
@@ -15,11 +18,17 @@ const (
 	providerID = "leros-provider"
 	// providerNpm 使用 @ai-sdk/openai-compatible 通配大多数兼容 API。
 	providerNpm = "@ai-sdk/openai-compatible"
+	// openCodeBuildAgentPrompt 占位替换 OpenCode build agent 的内置 provider baseline prompt。
+	openCodeBuildAgentPrompt = "Follow the system instructions supplied with each task."
+	// openCodeDataDirName 是 OpenCode 在 worker 工作目录下的持久化目录。
+	openCodeDataDirName = ".opencode"
+	// openCodeDBName 是 OpenCode 会话数据库文件名。
+	openCodeDBName = "opencode.db"
 )
 
-// buildConfigContent 根据 ModelConfig 和 MCPServerConfig 列表
+// buildConfigContent 根据 ModelConfig、MCPServerConfig 列表和任务 Skill 目录
 // 生成 OPENCODE_CONFIG_CONTENT JSON 字符串。
-func buildConfigContent(modelCfg agent.ModelConfig, mcps []provider.MCPServerConfig) (string, error) {
+func buildConfigContent(modelCfg agent.ModelConfig, mcps []agent.MCPServerConfig, skillDir string) (string, error) {
 	modelID := modelCfg.Model
 	if modelID == "" {
 		modelID = "default"
@@ -27,6 +36,54 @@ func buildConfigContent(modelCfg agent.ModelConfig, mcps []provider.MCPServerCon
 	modelName := modelID
 	if modelCfg.Provider != "" {
 		modelName = modelCfg.Provider + "/" + modelID
+	}
+
+	ctxLimit, outLimit := 200000, 16384
+	if modelCfg.ContextLimit > 0 {
+		ctxLimit = modelCfg.ContextLimit
+	}
+	if modelCfg.OutputLimit > 0 {
+		outLimit = modelCfg.OutputLimit
+	}
+
+	modelEntry := modelConfig{
+		ID:          modelID,
+		Name:        modelName,
+		ToolCall:    true,
+		Attachment:  true,
+		Reasoning:   false,
+		Temperature: true,
+		Limit: modelLimit{
+			Context: ctxLimit,
+			Output:  outLimit,
+		},
+	}
+
+	// 采样参数透传：snake_case 键，兼容 vLLM 等 OpenAI 兼容服务（其只识别 top_p 等蛇形字段）。
+	if modelCfg.TopP != nil || modelCfg.FrequencyPenalty != nil || modelCfg.PresencePenalty != nil {
+		options := make(map[string]any)
+		if modelCfg.TopP != nil {
+			options["top_p"] = *modelCfg.TopP
+		}
+		if modelCfg.FrequencyPenalty != nil {
+			options["frequency_penalty"] = *modelCfg.FrequencyPenalty
+		}
+		if modelCfg.PresencePenalty != nil {
+			options["presence_penalty"] = *modelCfg.PresencePenalty
+		}
+		modelEntry.Options = options
+	}
+
+	// 视觉模型声明其真正支持的输入输出模态（图片为主路径，文本输出）。
+	// 仅声明已支持的模态，未声明的（PDF/音视频/多模态输出）由 opencode 降级为文本提示，
+	// 避免声明过宽导致 AI SDK 层对不支持的 file part 返回硬错误（如视频报
+	// "'file part media type video/mp4' functionality not supported"）。
+	// 非多模态模型不声明，opencode 据此对全部附件优雅降级。
+	if modelCfg.Vision {
+		modelEntry.Modalities = &modalityConfig{
+			Input:  []string{"text", "image"},
+			Output: []string{"text"},
+		}
 	}
 
 	cfg := configContent{
@@ -39,28 +96,27 @@ func buildConfigContent(modelCfg agent.ModelConfig, mcps []provider.MCPServerCon
 					BaseURL: modelCfg.BaseURL,
 				},
 				Models: map[string]modelConfig{
-					modelID: {
-						ID:          modelID,
-						Name:        modelName,
-						ToolCall:    true,
-						Attachment:  true,
-						Reasoning:   false,
-						Temperature: true,
-						Limit: modelLimit{
-							Context: 200000,
-							Output:  16384,
-						},
-					},
+					modelID: modelEntry,
 				},
 			},
 		},
-		Model:      providerID + "/" + modelID,
-		Permission: map[string]string{"websearch": "allow"},
+		Model: providerID + "/" + modelID,
+		Agent: map[string]agentConfig{"build": {Prompt: openCodeBuildAgentPrompt}},
+		Permission: map[string]any{
+			"*": "allow",
+			"bash": map[string]string{
+				"*":    "allow",
+				"rm *": "ask",
+			},
+		},
 	}
 
 	// 构建 MCP 配置（遵循 opencode V1 config schema）
 	if mcpCfg := buildMCPConfig(mcps); len(mcpCfg) > 0 {
 		cfg.MCP = mcpCfg
+	}
+	if skillDir = strings.TrimSpace(skillDir); skillDir != "" {
+		cfg.Skills = &skillsConfig{Paths: []string{skillDir}}
 	}
 
 	data, err := json.Marshal(cfg)
@@ -70,13 +126,39 @@ func buildConfigContent(modelCfg agent.ModelConfig, mcps []provider.MCPServerCon
 	return string(data), nil
 }
 
+// sanitizeConfigContent 返回适合写入日志的 config JSON 字符串。
+// 剔除每个 provider options 下的 apiKey 字段以避免密钥落入日志；
+// baseURL 及采样参数等其余字段原样保留。config 无法解析时原样返回，
+// 不阻塞日志输出（调用方不应因脱敏失败而中断启动流程）。
+func sanitizeConfigContent(configContent string) string {
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(configContent), &cfg); err != nil {
+		return configContent
+	}
+	providers, ok := cfg["provider"].(map[string]any)
+	if ok {
+		for _, v := range providers {
+			opts, ok := v.(map[string]any)["options"].(map[string]any)
+			if !ok {
+				continue
+			}
+			delete(opts, "apiKey")
+		}
+	}
+	cleaned, err := json.Marshal(cfg)
+	if err != nil {
+		return configContent
+	}
+	return string(cleaned)
+}
+
 // buildMCPConfig 将 MCPServerConfig 列表转为 opencode V1 MCP schema 格式。
 //
 // opencode V1 MCP schema:
 //
 //	Remote (HTTP):  { "type": "remote", "url": "...", "headers": { "Authorization": "Bearer ..." } }
 //	Local (stdio):  { "type": "local", "command": ["cmd", ...], "environment": { ... } }
-func buildMCPConfig(mcps []provider.MCPServerConfig) map[string]any {
+func buildMCPConfig(mcps []agent.MCPServerConfig) map[string]any {
 	if len(mcps) == 0 {
 		return nil
 	}
@@ -87,15 +169,25 @@ func buildMCPConfig(mcps []provider.MCPServerConfig) map[string]any {
 			name = "leros"
 		}
 		if m.URL != "" {
+			if strings.EqualFold(m.Transport, "sse") {
+				command := []string{"npx", "-y", "mcp-remote", m.URL, "--transport", "sse-only"}
+				mcpServers[name] = map[string]any{"type": "local", "command": command}
+				continue
+			}
 			// HTTP 传输 — remote type
 			entry := map[string]any{
 				"type": "remote",
 				"url":  m.URL,
 			}
-			if m.BearerToken != "" {
-				entry["headers"] = map[string]string{
-					"Authorization": "Bearer " + m.BearerToken,
+			headers := cloneHeaders(m.Headers)
+			if m.BearerToken != "" && !hasHeader(headers, "authorization") {
+				if headers == nil {
+					headers = make(map[string]string)
 				}
+				headers["Authorization"] = "Bearer " + m.BearerToken
+			}
+			if len(headers) > 0 {
+				entry["headers"] = headers
 			}
 			mcpServers[name] = entry
 		} else if m.Command != "" {
@@ -115,10 +207,44 @@ func buildMCPConfig(mcps []provider.MCPServerConfig) map[string]any {
 	return mcpServers
 }
 
+func cloneHeaders(source map[string]string) map[string]string {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func hasHeader(headers map[string]string, name string) bool {
+	for key := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureOpenCodeDBPath ensures the OpenCode data directory exists and returns the session database path.
+// Returns an empty string if dataDir is empty — the caller should skip the OPENCODE_DB env var
+// so that OpenCode falls back to its own default location.
+func ensureOpenCodeDBPath(dataDir string) (string, error) {
+	dir := strings.TrimSpace(dataDir)
+	if dir == "" {
+		return "", nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create opencode data directory %s: %w", dir, err)
+	}
+	return filepath.Join(dir, openCodeDBName), nil
+}
+
 // buildServerEnv 构建 opcode serve 子进程所需的环境变量。
 // 返回格式为 "KEY=VALUE" 的字符串切片，附加到 baseEnv 之后。
-func buildServerEnv(password, configContent string, baseEnv []string) []string {
-	env := make([]string, 0, 12)
+func buildServerEnv(password, configContent, databasePath string, baseEnv []string) []string {
+	env := make([]string, 0, 13)
 
 	// 服务器认证
 	env = append(env, "OPENCODE_SERVER_PASSWORD="+password)
@@ -126,6 +252,10 @@ func buildServerEnv(password, configContent string, baseEnv []string) []string {
 
 	// 注入完整配置（provider、model、API key、base URL）
 	env = append(env, "OPENCODE_CONFIG_CONTENT="+configContent)
+	// 将 session 等 SQLite 数据持久化到 worker 工作目录。
+	if databasePath != "" {
+		env = append(env, "OPENCODE_DB="+databasePath)
+	}
 
 	// 隔离环境变量：确保子进程不读取宿主机的配置文件或插件
 	env = append(env, "OPENCODE_DISABLE_PROJECT_CONFIG=1")
@@ -133,15 +263,14 @@ func buildServerEnv(password, configContent string, baseEnv []string) []string {
 	env = append(env, "OPENCODE_DISABLE_AUTOUPDATE=1")
 	env = append(env, "OPENCODE_DISABLE_MODELS_FETCH=1")
 
-	// 启用 v2 事件系统（session.next.* 事件流）
-	env = append(env, "OPENCODE_EXPERIMENTAL_EVENT_SYSTEM=true")
+	// 启用 plan mode 和 CLI client 模式
 	env = append(env, "OPENCODE_EXPERIMENTAL_PLAN_MODE=true")
 	env = append(env, "OPENCODE_CLIENT=cli")
 
 	// 启用 EXA web search 功能
 	env = append(env, "OPENCODE_ENABLE_EXA=1")
 
-	return provider.BuildRunEnv(baseEnv, env, nil)
+	return runtimeprocess.BuildRunEnv(baseEnv, env, nil)
 }
 
 // generatePassword 生成 32 位随机十六进制密码。

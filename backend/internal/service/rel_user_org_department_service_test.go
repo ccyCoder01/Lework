@@ -1,0 +1,100 @@
+package service
+
+import (
+	"context"
+	"testing"
+
+	"github.com/insmtx/Leros/backend/internal/adapter/account"
+	"github.com/insmtx/Leros/backend/internal/api/contract"
+	"github.com/insmtx/Leros/backend/types"
+)
+
+type memberDepartmentTestRepo struct {
+	department *account.Department
+}
+
+func (r *memberDepartmentTestRepo) CreateDepartment(context.Context, *account.CreateDepartmentInput) (*account.Department, error) {
+	return nil, nil
+}
+
+func (r *memberDepartmentTestRepo) GetDepartment(context.Context, uint) (*account.Department, error) {
+	return r.department, nil
+}
+
+func (r *memberDepartmentTestRepo) UpdateDepartment(context.Context, uint, *account.UpdateDepartmentInput) (*account.Department, error) {
+	return nil, nil
+}
+
+func (r *memberDepartmentTestRepo) DeleteDepartment(context.Context, uint) error { return nil }
+
+func (r *memberDepartmentTestRepo) ListDepartment(context.Context, *account.ListDepartmentInput) (*account.DepartmentList, error) {
+	return nil, nil
+}
+
+func TestMemberDepartmentServiceCRUDAndList(t *testing.T) {
+	database := setupAccountServiceTestDB(t)
+	if err := database.AutoMigrate(&types.UserOrg{}); err != nil {
+		t.Fatalf("failed to migrate user org: %v", err)
+	}
+	ctx := accountServiceTestContext()
+
+	userOrg := &types.UserOrg{UserID: 30, OrgID: 1, IsDefault: true}
+	if err := database.Create(userOrg).Error; err != nil {
+		t.Fatalf("Create user org failed: %v", err)
+	}
+	department := &types.Department{Name: "测试部门", ParentID: 0, Sort: 1000, OrgID: 1}
+	if err := database.Create(department).Error; err != nil {
+		t.Fatalf("Create department failed: %v", err)
+	}
+	service := NewMemberDepartmentService(database, newTestOrgRepoForSender("Test User"), &memberDepartmentTestRepo{
+		department: &account.Department{ID: department.ID, OrgID: department.OrgID, Name: department.Name},
+	})
+
+	created, err := service.CreateMemberDepartment(ctx, &contract.CreateMemberDepartmentRequest{
+		Uin:          userOrg.ID,
+		DepartmentID: department.ID,
+		IsPrimary:    true,
+	})
+	if err != nil {
+		t.Fatalf("CreateMemberDepartment failed: %v", err)
+	}
+	if created.ID == 0 || created.Uin != userOrg.ID {
+		t.Fatalf("unexpected created relation: %#v", created)
+	}
+	if created.OrgID != userOrg.OrgID {
+		t.Fatalf("expected OrgID %d, got %d", userOrg.OrgID, created.OrgID)
+	}
+
+	got, err := service.GetMemberDepartment(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetMemberDepartment failed: %v", err)
+	}
+	if got.Uin != userOrg.ID {
+		t.Fatalf("unexpected relation by id: %#v", got)
+	}
+
+	isPrimary := false
+	updated, err := service.UpdateMemberDepartment(ctx, created.ID, &contract.UpdateMemberDepartmentRequest{IsPrimary: &isPrimary})
+	if err != nil {
+		t.Fatalf("UpdateMemberDepartment failed: %v", err)
+	}
+	if updated.IsPrimary {
+		t.Fatalf("expected updated is_primary, got %#v", updated)
+	}
+
+	uin := userOrg.ID
+	list, err := service.ListMemberDepartments(ctx, &contract.ListMemberDepartmentsRequest{Uin: &uin, Pagination: types.Pagination{Limit: 10}})
+	if err != nil {
+		t.Fatalf("ListMemberDepartments failed: %v", err)
+	}
+	if list.Total != 1 || len(list.Items) != 1 || list.Items[0].ID != created.ID {
+		t.Fatalf("unexpected relation list: %#v", list)
+	}
+
+	if err := service.DeleteMemberDepartment(ctx, created.ID); err != nil {
+		t.Fatalf("DeleteMemberDepartment failed: %v", err)
+	}
+	if _, err := service.GetMemberDepartment(ctx, created.ID); err == nil || err.Error() != "成员部门关联不存在" {
+		t.Fatalf("expected not found after delete, got %v", err)
+	}
+}

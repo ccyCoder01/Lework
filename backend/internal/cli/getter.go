@@ -76,6 +76,16 @@ func GetDigitalAssistantByID(ctx context.Context, serverAddr, authToken string, 
 	return &result, nil
 }
 
+// GetDigitalAssistantByPublicID 通过 PublicID 调用服务端 GetDigitalAssistant API。
+func GetDigitalAssistantByPublicID(ctx context.Context, serverAddr, authToken string, publicID string) (*contract.DigitalAssistantDetail, error) {
+	var result contract.DigitalAssistantDetail
+	if err := doPostRequest(ctx, serverAddr, authToken, "GetDigitalAssistant",
+		map[string]interface{}{"public_id": publicID}, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // ResolveUserName 通过 Uin 解析用户名称。
 func ResolveUserName(ctx context.Context, serverAddr, authToken string, uin uint) string {
 	member, err := getOrgMemberByUin(ctx, serverAddr, authToken, uin)
@@ -97,10 +107,24 @@ func getOrgMemberByUin(ctx context.Context, serverAddr, authToken string, uin ui
 	return &result, nil
 }
 
-// ListTaskArtifacts 调用服务端 ListTaskArtifacts API 并返回解析后的结果。
-func ListTaskArtifacts(ctx context.Context, serverAddr, authToken, taskID string) ([]contract.Artifact, error) {
-	var result []contract.Artifact
-	if err := doGetRequest(ctx, serverAddr, authToken, fmt.Sprintf("tasks/%s/artifacts", taskID), &result); err != nil {
+// ListProjectFiles 调用服务端项目文件树接口，按 project + resource_type + task 过滤。
+func ListProjectFiles(ctx context.Context, serverAddr, authToken, projectID, resourceType, taskID string) ([]contract.FileTreeNode, error) {
+	path := fmt.Sprintf("projects/%s/files", projectID)
+	var params []string
+	if resourceType != "" {
+		params = append(params, fmt.Sprintf("resource_type=%s", resourceType))
+	}
+	if taskID != "" {
+		params = append(params, fmt.Sprintf("task_id=%s", taskID))
+	}
+	if len(params) > 0 {
+		path = path + "?" + params[0]
+		for _, p := range params[1:] {
+			path = path + "&" + p
+		}
+	}
+	var result []contract.FileTreeNode
+	if err := doGetRequest(ctx, serverAddr, authToken, path, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -108,6 +132,10 @@ func ListTaskArtifacts(ctx context.Context, serverAddr, authToken, taskID string
 
 // doPostRequest 发送 POST JSON API 请求的通用封装。
 func doPostRequest(ctx context.Context, serverAddr, authToken, endpoint string, reqBody, target interface{}) error {
+	return doPostRequestWithHeaders(ctx, serverAddr, authToken, endpoint, reqBody, target, nil)
+}
+
+func doPostRequestWithHeaders(ctx context.Context, serverAddr, authToken, endpoint string, reqBody, target interface{}, headers map[string]string) error {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
@@ -123,8 +151,18 @@ func doPostRequest(ctx context.Context, serverAddr, authToken, endpoint string, 
 	if authToken != "" {
 		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
+	setRequestHeaders(req, headers)
 
 	return doRequest(client, req, target)
+}
+
+func setRequestHeaders(req *http.Request, headers map[string]string) {
+	for key, value := range headers {
+		if key == "" || value == "" {
+			continue
+		}
+		req.Header.Set(key, value)
+	}
 }
 
 // doGetRequest 发送 GET API 请求的通用封装（用于 REST 风格端点）。
@@ -167,6 +205,9 @@ func doRequest(client *http.Client, req *http.Request, target interface{}) error
 		return fmt.Errorf("api error [%d]: %s", apiResp.Code, apiResp.Message)
 	}
 
+	if target == nil || len(bytes.TrimSpace(apiResp.Data)) == 0 || string(bytes.TrimSpace(apiResp.Data)) == "null" {
+		return nil
+	}
 	if err := json.Unmarshal(apiResp.Data, target); err != nil {
 		return fmt.Errorf("decode data: %w", err)
 	}

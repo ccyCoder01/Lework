@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 $script:DevRuntimeStateFile = Join-Path $PSScriptRoot '.runtime-state.json'
 
@@ -38,6 +38,83 @@ function Get-GoExe {
     return (Resolve-ToolPath -CommandName 'go.exe' -FallbackPaths @(
         'E:\DevEnv\Go\goroot\bin\go.exe'
     ))
+}
+
+function Get-BackendBinaryPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+
+    return Join-Path $RepoRoot 'bundles\leros.exe'
+}
+
+function Get-LatestBackendSourceWriteTimeUtc {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+
+    $candidatePaths = @(
+        (Join-Path $RepoRoot 'backend'),
+        (Join-Path $RepoRoot 'go.mod'),
+        (Join-Path $RepoRoot 'go.sum')
+    )
+
+    $latestWriteTime = [datetime]::MinValue
+    foreach ($path in $candidatePaths) {
+        if (-not (Test-Path $path)) {
+            continue
+        }
+
+        $item = Get-Item $path
+        if ($item.PSIsContainer) {
+            $latestChild = Get-ChildItem -Path $path -Recurse -File -Include *.go |
+                Sort-Object LastWriteTimeUtc -Descending |
+                Select-Object -First 1
+            if ($latestChild -and $latestChild.LastWriteTimeUtc -gt $latestWriteTime) {
+                $latestWriteTime = $latestChild.LastWriteTimeUtc
+            }
+            continue
+        }
+
+        if ($item.LastWriteTimeUtc -gt $latestWriteTime) {
+            $latestWriteTime = $item.LastWriteTimeUtc
+        }
+    }
+
+    return $latestWriteTime
+}
+
+function Test-BackendBinaryNeedsRebuild {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+
+    $binaryPath = Get-BackendBinaryPath -RepoRoot $RepoRoot
+    if (-not (Test-Path $binaryPath)) {
+        return $true
+    }
+
+    $binaryWriteTime = (Get-Item $binaryPath).LastWriteTimeUtc
+    $sourceWriteTime = Get-LatestBackendSourceWriteTimeUtc -RepoRoot $RepoRoot
+    return $sourceWriteTime -gt $binaryWriteTime
+}
+
+function Ensure-LatestBackendBinary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+
+    if (-not (Test-BackendBinaryNeedsRebuild -RepoRoot $RepoRoot)) {
+        return
+    }
+
+    # 中文注释：开发脚本默认启动最新后端，避免静默复用旧 bundles 导致接口与源码不一致。
+    Write-Host '[Leros] Backend source changed, rebuilding latest binary...' -ForegroundColor Cyan
+    & (Join-Path $PSScriptRoot 'rebuild-backend.ps1')
 }
 
 function Get-PnpmExe {
@@ -105,6 +182,214 @@ function Wait-DockerReady {
     }
 
     throw 'Docker engine did not become ready in time.'
+}
+
+function Test-DevDatabaseHasDuplicateUserOrgUin {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DockerExe
+    )
+
+    $query = "SELECT COUNT(*) FROM (SELECT uin FROM leros_user_org GROUP BY uin HAVING COUNT(*) > 1) duplicates;"
+    $duplicateCount = & $DockerExe exec leros-dev-postgresql psql -U leros_dev_user -d leros_dev_db -tAc $query 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+
+    $duplicateText = ($duplicateCount | Out-String).Trim()
+    return ([int]$duplicateText -gt 0)
+}
+
+function Wait-DevPostgresReady {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DockerExe
+    )
+
+    for ($i = 0; $i -lt 30; $i++) {
+        $health = & $DockerExe inspect --format '{{.State.Health.Status}}' leros-dev-postgresql 2>$null
+        if ($LASTEXITCODE -eq 0 -and ($health | Out-String).Trim() -eq 'healthy') {
+            return
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw 'PostgreSQL did not become healthy in time.'
+}
+
+function Wait-DevNatsReady {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DockerExe
+    )
+
+    for ($i = 0; $i -lt 30; $i++) {
+        $health = & $DockerExe inspect --format '{{.State.Health.Status}}' leros-dev-nats 2>$null
+        if ($LASTEXITCODE -eq 0 -and ($health | Out-String).Trim() -eq 'healthy') {
+            return
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw 'NATS did not become healthy in time.'
+}
+
+function Wait-DevPortReady {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName,
+
+        [int]$MaxAttempts = 60,
+
+        [int]$IntervalSeconds = 2
+    )
+
+    for ($i = 0; $i -lt $MaxAttempts; $i++) {
+        if (Test-PortListening -Port $Port) {
+            return
+        }
+
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+
+    throw "$ServiceName did not start listening on port $Port in time."
+}
+
+function Get-DefaultCLIConfigPath {
+    return Join-Path $env:USERPROFILE '.leros\config.yaml'
+}
+
+function Get-DevNatsUrlFromConfig {
+    $configPath = Join-Path $PSScriptRoot 'worker.config.yaml'
+    if (-not (Test-Path $configPath)) {
+        throw 'worker.config.yaml not found. Copy worker.config.example.yaml first.'
+    }
+
+    $content = Get-Content $configPath -Raw -Encoding UTF8
+    if ($content -match '(?ms)^nats:\s*\r?\n\s*url:\s*["'']?([^"''\s]+)["'']?') {
+        return $Matches[1]
+    }
+
+    throw 'NATS URL not found in worker.config.yaml.'
+}
+
+function Sync-DevCLIConfig {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot,
+
+        [Parameter(Mandatory = $true)]
+        [int]$ServerPort
+    )
+
+    $resolvedWorkerConfig = New-ResolvedWorkerConfig -RepoRoot $RepoRoot -ServerPort $ServerPort
+    $natsUrl = Get-DevNatsUrlFromConfig
+    $cliConfigPath = Get-DefaultCLIConfigPath
+    $cliDir = Split-Path $cliConfigPath -Parent
+    $workspaceRoot = Join-Path $RepoRoot '.leros-workspace'
+
+    if (-not (Test-Path $cliDir)) {
+        New-Item -ItemType Directory -Path $cliDir | Out-Null
+    }
+
+    if (-not (Test-Path $cliConfigPath)) {
+        # 中文注释：首次启动时写入 CLI 默认配置，避免调度子 Worker 回退到陈旧 NATS 地址。
+        $content = Get-Content $resolvedWorkerConfig -Raw -Encoding UTF8
+        if ($content -match '(?m)^workspace_root:\s*$') {
+            $content = $content -replace '(?m)^workspace_root:\s*$', "workspace_root: $workspaceRoot"
+        }
+        Set-Content -Path $cliConfigPath -Value $content -Encoding UTF8
+        Write-Host "[Leros] Created CLI config at $cliConfigPath" -ForegroundColor Cyan
+        return
+    }
+
+    $inNatsBlock = $false
+    $updatedLines = Get-Content $cliConfigPath -Encoding UTF8 | ForEach-Object {
+        if ($_ -match '^\s*nats:\s*$') {
+            $inNatsBlock = $true
+            return $_
+        }
+
+        if ($inNatsBlock -and $_ -match '^(\s*url:\s*)') {
+            $inNatsBlock = $false
+            return $Matches[1] + $natsUrl
+        }
+
+        if ($_ -match '^\S') {
+            $inNatsBlock = $false
+        }
+
+        if ($_ -match '^(\s*server_addr:\s*)') {
+            return $Matches[1] + "127.0.0.1:$ServerPort"
+        }
+
+        return $_
+    }
+
+    Set-Content -Path $cliConfigPath -Value ($updatedLines -join [Environment]::NewLine) -Encoding UTF8
+    Write-Host "[Leros] Synced NATS/server_addr in CLI config ($cliConfigPath)." -ForegroundColor Cyan
+}
+
+function ConvertTo-DevRuntimeHashtable {
+    param(
+        [Parameter(Mandatory = $true)]
+        $State
+    )
+
+    if ($State -is [hashtable]) {
+        return $State
+    }
+
+    return @{
+        serverPort = [int]$State.serverPort
+        workerPort = [int]$State.workerPort
+        apiBaseUrl = [string]$State.apiBaseUrl
+    }
+}
+
+function Prepare-DevRuntimeConfigs {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot,
+
+        [Parameter(Mandatory = $true)]
+        $RuntimeState
+    )
+
+    $state = ConvertTo-DevRuntimeHashtable -State $RuntimeState
+    $null = New-ResolvedServerConfig -RepoRoot $RepoRoot -ServerPort $state.serverPort
+    Sync-DevCLIConfig -RepoRoot $RepoRoot -ServerPort $state.serverPort
+}
+
+function Start-DevBackendWindows {
+    param(
+        [Parameter(Mandatory = $true)]
+        $RuntimeState
+    )
+
+    $state = ConvertTo-DevRuntimeHashtable -State $RuntimeState
+
+    Write-Host '[Leros] Opening server window...' -ForegroundColor Cyan
+    Start-Process powershell.exe -ArgumentList '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "$PSScriptRoot\run-server-dev.ps1" | Out-Null
+    Write-Host "[Leros] Waiting for server on port $($state.serverPort)..." -ForegroundColor Cyan
+    Wait-DevPortReady -Port $state.serverPort -ServiceName 'API server'
+
+    Write-Host '[Leros] Opening worker window...' -ForegroundColor Cyan
+    Start-Process powershell.exe -ArgumentList '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "$PSScriptRoot\run-worker-dev.ps1" | Out-Null
+    Write-Host "[Leros] Waiting for worker on port $($state.workerPort)..." -ForegroundColor Cyan
+    Wait-DevPortReady -Port $state.workerPort -ServiceName 'Worker'
+}
+
+function Start-DevFrontendWindow {
+    Write-Host '[Leros] Opening frontend window...' -ForegroundColor Cyan
+    Start-Process powershell.exe -ArgumentList '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "$PSScriptRoot\run-frontend-dev.ps1" | Out-Null
+    Write-Host '[Leros] Waiting for frontend on port 3005...' -ForegroundColor Cyan
+    Wait-DevPortReady -Port 3005 -ServiceName 'Frontend' -MaxAttempts 90
 }
 
 function Import-DevEnvFile {
@@ -290,13 +575,18 @@ function New-ResolvedServerConfig {
 
     $templatePath = Join-Path $PSScriptRoot 'server.config.yaml'
     $resolvedPath = Join-Path $runtimeDir 'server.config.runtime.yaml'
-    $content = Get-Content $templatePath -Raw
-    # Only override the generated runtime config; keep the checked-in YAML unchanged.
-    $content = [regex]::Replace(
-        $content,
-        '(?m)^(\s*port:\s*)\d+\s*$',
-        [System.Text.RegularExpressions.MatchEvaluator]{ param($match) $match.Groups[1].Value + $ServerPort }
-    )
+    # 中文注释：同步服务端口和调度地址，避免子 Worker 连接旧端口。
+    $content = (
+        Get-Content $templatePath -Encoding UTF8 | ForEach-Object {
+            if ($_ -match '^(\s*port:\s*)\d+\s*$') {
+                return $Matches[1] + $ServerPort
+            }
+            if ($_ -match '^(\s*server_addr:\s*).*$') {
+                return $Matches[1] + "127.0.0.1:$ServerPort"
+            }
+            return $_
+        }
+    ) -join [Environment]::NewLine
     Set-Content -Path $resolvedPath -Value $content -Encoding UTF8
     return $resolvedPath
 }
@@ -317,13 +607,15 @@ function New-ResolvedWorkerConfig {
 
     $templatePath = Join-Path $PSScriptRoot 'worker.config.yaml'
     $resolvedPath = Join-Path $runtimeDir 'worker.config.runtime.yaml'
-    $content = Get-Content $templatePath -Raw
-    # Keep the worker connected to the selected dev server port.
-    $content = [regex]::Replace(
-        $content,
-        '(?m)^(\s*server_addr:\s*)".*"\s*$',
-        [System.Text.RegularExpressions.MatchEvaluator]{ param($match) $match.Groups[1].Value + '"127.0.0.1:' + $ServerPort + '"' }
-    )
+    # 中文注释：兼容本地配置中的单引号、双引号和无引号格式。
+    $content = (
+        Get-Content $templatePath -Encoding UTF8 | ForEach-Object {
+            if ($_ -match '^(\s*server_addr:\s*).*$') {
+                return $Matches[1] + '"127.0.0.1:' + $ServerPort + '"'
+            }
+            return $_
+        }
+    ) -join [Environment]::NewLine
     Set-Content -Path $resolvedPath -Value $content -Encoding UTF8
     return $resolvedPath
 }

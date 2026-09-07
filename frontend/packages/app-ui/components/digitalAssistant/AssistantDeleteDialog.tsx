@@ -11,6 +11,8 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@leros/ui/components/ui/dialog";
+import { useState } from "react";
+import { toast } from "sonner";
 
 export type AssistantDeleteDialogProps = {
 	assistant: DigitalAssistantItem;
@@ -24,14 +26,27 @@ export function AssistantDeleteDialog({
 	onOpenChange,
 }: AssistantDeleteDialogProps) {
 	const { deleteAssistant } = useDAStore((s) => s);
+	const [submitting, setSubmitting] = useState(false);
 
 	const handleDelete = async () => {
-		await deleteAssistant(assistant.id);
+		if (submitting) return;
+		setSubmitting(true);
+		const deleted = await deleteAssistant(assistant.id);
+		setSubmitting(false);
+		if (!deleted) {
+			toast.error("AI 队友删除失败，请稍后重试");
+			return;
+		}
 		onOpenChange(false);
 	};
 
 	return (
-		<Dialog open={open} onOpenChange={onOpenChange}>
+		<Dialog
+			open={open}
+			onOpenChange={(nextOpen) => {
+				if (!nextOpen && !submitting) onOpenChange(false);
+			}}
+		>
 			<DialogContent className="sm:max-w-md" showCloseButton={false}>
 				<DialogHeader>
 					<DialogTitle>删除 AI 队友</DialogTitle>
@@ -40,15 +55,16 @@ export function AssistantDeleteDialog({
 					</DialogDescription>
 				</DialogHeader>
 				<DialogFooter className="mt-4">
-					<Button variant="outline" onClick={() => onOpenChange(false)}>
+					<Button variant="outline" onClick={() => onOpenChange(false)} disabled={submitting}>
 						取消
 					</Button>
 					<button
 						type="button"
 						onClick={handleDelete}
-						className="inline-flex items-center justify-center rounded-lg bg-destructive/10 text-destructive hover:bg-destructive/20 h-8 px-2.5 text-sm font-medium transition-all"
+						disabled={submitting}
+						className="inline-flex h-8 items-center justify-center rounded-lg bg-destructive/10 px-2.5 text-sm font-medium text-destructive transition-all hover:bg-destructive/20 disabled:pointer-events-none disabled:opacity-50"
 					>
-						删除
+						{submitting ? "删除中…" : "删除"}
 					</button>
 				</DialogFooter>
 			</DialogContent>

@@ -1,7 +1,8 @@
 // Package command 提供统一的 Worker Command 分发器。
 //
-// Dispatcher 负责启动各 lane 订阅（cmd.run、cmd.control、cmd.interaction、cmd.skill），
+// Dispatcher 负责启动各 lane 订阅（cmd.run、cmd.control、cmd.interaction、cmd.file），
 // 并将收到的统一 WorkerCommand 分发到对应的 handler。
+// 其中 cmd.run lane 使用手动确认订阅（SubscribeManualDurable），其余 lane 使用自动确认订阅（Subscribe）。
 package command
 
 import (
@@ -10,20 +11,27 @@ import (
 	"errors"
 	"fmt"
 
+	eventbus "github.com/insmtx/Leros/backend/internal/infra/mq"
 	"github.com/insmtx/Leros/backend/pkg/messaging"
 	"github.com/nats-io/nats.go"
 	"github.com/ygpkg/yg-go/logs"
 )
 
 // Subscriber 是 Dispatcher 所需的最小订阅接口。
+// 包含自动确认和手动确认两种订阅方式。
 type Subscriber interface {
 	Subscribe(ctx context.Context, topic string, consumer string, handler func(msg *nats.Msg)) error
+	SubscribeManualDurable(ctx context.Context, topic string, consumer string, handler func(msg *nats.Msg)) error
 }
 
 // RunHandler 处理 cmd.run lane 的 agent run 命令。
-// msg 是原始 NATS 消息，供 handler 获取 stream seq 用于 seq tracking 和背压控制。
+// delivery 提供手动 Ack 控制（Term/Nak/Ack/NakWithDelay/InProgress），
+// handler 根据处理阶段决定确认方式：
+//   - 永久错误 → Term（不再重试）
+//   - 临时错误 → NakWithDelay（延迟重试）
+//   - 成功持久化后 → Ack（异步执行）
 type RunHandler interface {
-	HandleRunCommand(ctx context.Context, cmd messaging.WorkerCommand, msg *nats.Msg) error
+	HandleRunCommand(ctx context.Context, cmd messaging.WorkerCommand, delivery eventbus.ManualDelivery) error
 }
 
 // ControlHandler 处理 cmd.control lane 的 cancel 命令。
@@ -36,9 +44,9 @@ type InteractionHandler interface {
 	HandleInteractionCommand(ctx context.Context, cmd messaging.WorkerCommand) error
 }
 
-// SkillHandler 处理 cmd.skill lane 的 skill 管理命令。
-type SkillHandler interface {
-	HandleSkillCommand(ctx context.Context, cmd messaging.WorkerCommand, msg *nats.Msg) error
+// FileHandler 处理 cmd.file lane 的项目文件命令。
+type FileHandler interface {
+	HandleFileCommand(ctx context.Context, cmd messaging.WorkerCommand) error
 }
 
 // Handlers 显式包含四类 handler，构造时一次性校验。
@@ -46,7 +54,7 @@ type Handlers struct {
 	Run         RunHandler
 	Control     ControlHandler
 	Interaction InteractionHandler
-	Skill       SkillHandler
+	File        FileHandler
 }
 
 // Config 是 Dispatcher 的配置。
@@ -63,7 +71,6 @@ type Dispatcher struct {
 }
 
 // New 创建新的 Dispatcher。
-// 一次性校验 worker 标识、subscriber 和全部 handler。
 func New(cfg Config, sub Subscriber, handlers Handlers) (*Dispatcher, error) {
 	if cfg.OrgID == 0 {
 		return nil, fmt.Errorf("worker org_id is required")
@@ -83,8 +90,8 @@ func New(cfg Config, sub Subscriber, handlers Handlers) (*Dispatcher, error) {
 	if handlers.Interaction == nil {
 		return nil, fmt.Errorf("interaction handler is required")
 	}
-	if handlers.Skill == nil {
-		return nil, fmt.Errorf("skill handler is required")
+	if handlers.File == nil {
+		return nil, fmt.Errorf("file handler is required")
 	}
 
 	return &Dispatcher{
@@ -94,23 +101,32 @@ func New(cfg Config, sub Subscriber, handlers Handlers) (*Dispatcher, error) {
 	}, nil
 }
 
-// Run 并发启动四个 lane 订阅并阻塞，直到 ctx 取消或任一订阅异常退出。
+// Run 并发启动五个 lane 订阅并阻塞，直到 ctx 取消或任一订阅异常退出。
 //
-// 任一订阅异常退出时会取消其他 lane 的 context 并返回带 lane/subject 上下文的错误。
-// ctx 正常取消时返回 nil。
+// run lane 使用手动 Ack 订阅（SubscribeManualDurable），
+// 因为 run handler 需要先将消息持久化到本地 inbox 再 Ack，
+// 以实现 at-least-once 的崩溃恢复语义。
+//
+// 其余 lane（control、interaction、skill、file）使用自动 Ack 订阅
+// （Subscribe），因为它们的 handler 同步完成处理，无需手动控制确认时机。
+//
+// 任一订阅异常退出时会取消其他 lane 的 context。
 func (d *Dispatcher) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	lanes := []struct {
+	type laneCfg struct {
 		lane     messaging.Lane
 		consumer string
 		handler  func(ctx context.Context, msg *nats.Msg)
-	}{
-		{messaging.LaneRun, messaging.WorkerRunConsumer(), d.handleRun},
-		{messaging.LaneControl, messaging.WorkerControlConsumer(), d.handleControl},
-		{messaging.LaneInteraction, messaging.WorkerInteractionConsumer(), d.handleInteraction},
-		{messaging.LaneSkill, messaging.WorkerSkillConsumer(), d.handleSkill},
+		manual   bool // true = SubscribeManualDurable, false = Subscribe (auto-Ack)
+	}
+
+	lanes := []laneCfg{
+		{messaging.LaneRun, messaging.WorkerLaneConsumer(d.cfg.OrgID, d.cfg.WorkerID, messaging.LaneRun), d.handleRun, true},
+		{messaging.LaneControl, messaging.WorkerLaneConsumer(d.cfg.OrgID, d.cfg.WorkerID, messaging.LaneControl), d.handleControl, false},
+		{messaging.LaneInteraction, messaging.WorkerLaneConsumer(d.cfg.OrgID, d.cfg.WorkerID, messaging.LaneInteraction), d.handleInteraction, false},
+		{messaging.LaneFile, messaging.WorkerLaneConsumer(d.cfg.OrgID, d.cfg.WorkerID, messaging.LaneFile), d.handleFile, false},
 	}
 
 	errCh := make(chan error, len(lanes))
@@ -120,18 +136,24 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("build subject for lane %s: %w", l.lane, err)
 		}
-
-		go func(lane messaging.Lane, topic, consumer string, handler func(ctx context.Context, msg *nats.Msg)) {
-			logs.InfoContextf(ctx, "Command dispatcher starting lane %s on topic %s", lane, topic)
-			err := d.sub.Subscribe(ctx, topic, consumer, func(msg *nats.Msg) {
-				handler(ctx, msg)
-			})
-			if err != nil {
-				errCh <- fmt.Errorf("lane %s (topic %s): %w", lane, topic, err)
+		l := l
+		go func() {
+			logs.InfoContextf(ctx, "Command dispatcher starting lane %s on topic %s (manual=%v)", l.lane, topic, l.manual)
+			var subErr error
+			natsHandler := func(msg *nats.Msg) {
+				l.handler(ctx, msg)
+			}
+			if l.manual {
+				subErr = d.sub.SubscribeManualDurable(ctx, topic, l.consumer, natsHandler)
+			} else {
+				subErr = d.sub.Subscribe(ctx, topic, l.consumer, natsHandler)
+			}
+			if subErr != nil {
+				errCh <- fmt.Errorf("lane %s (topic %s): %w", l.lane, topic, subErr)
 			} else {
 				errCh <- nil
 			}
-		}(l.lane, topic, l.consumer, l.handler)
+		}()
 	}
 
 	var firstErr error
@@ -160,13 +182,30 @@ func (d *Dispatcher) parseCommand(data []byte) (messaging.WorkerCommand, error) 
 	return cmd, nil
 }
 
+// handleRun 使用手动确认方式处理 run 命令。
+// 将原始 *nats.Msg 包装为 ManualDelivery 后传递给 handler，
+// 由 handler 根据处理阶段决定确认方式（Ack/Term/Nak/NakWithDelay/InProgress）。
+// 消息解析失败时直接 Term，其余错误由 handler 内部处理。
 func (d *Dispatcher) handleRun(ctx context.Context, msg *nats.Msg) {
-	cmd, err := d.parseCommand(msg.Data)
+	// 标记 worker 是否真的收到 cmd.run 投递，用于与 server 侧 published run command
+	// 配对定位"投递层丢失 vs 处理层失败"（第 5 点不触发的关键分界）。
+	var metaSeq uint64
+	if meta, err := msg.Metadata(); err == nil && meta != nil {
+		metaSeq = meta.Sequence.Stream
+	}
+	logs.InfoContextf(ctx, "worker received run cmd delivery: subject=%s stream_seq=%d", msg.Subject, metaSeq)
+	d.handleRunDelivery(ctx, msg.Data, eventbus.NewManualDelivery(msg))
+}
+
+func (d *Dispatcher) handleRunDelivery(ctx context.Context, data []byte, delivery eventbus.ManualDelivery) {
+	cmd, err := d.parseCommand(data)
 	if err != nil {
 		logs.WarnContextf(ctx, "Failed to parse run command: %v", err)
+		_ = delivery.Term()
 		return
 	}
-	if err := d.handlers.Run.HandleRunCommand(ctx, cmd, msg); err != nil {
+	ctx = withCommandLogFields(ctx, cmd)
+	if err := d.handlers.Run.HandleRunCommand(ctx, cmd, delivery); err != nil {
 		logs.WarnContextf(ctx, "Run command handler error: %v", err)
 	}
 }
@@ -177,6 +216,7 @@ func (d *Dispatcher) handleControl(ctx context.Context, msg *nats.Msg) {
 		logs.WarnContextf(ctx, "Failed to parse control command: %v", err)
 		return
 	}
+	ctx = withCommandLogFields(ctx, cmd)
 	if err := d.handlers.Control.HandleControlCommand(ctx, cmd); err != nil {
 		logs.WarnContextf(ctx, "Control command handler error: %v", err)
 	}
@@ -188,18 +228,40 @@ func (d *Dispatcher) handleInteraction(ctx context.Context, msg *nats.Msg) {
 		logs.WarnContextf(ctx, "Failed to parse interaction command: %v", err)
 		return
 	}
+	ctx = withCommandLogFields(ctx, cmd)
 	if err := d.handlers.Interaction.HandleInteractionCommand(ctx, cmd); err != nil {
 		logs.WarnContextf(ctx, "Interaction command handler error: %v", err)
 	}
 }
 
-func (d *Dispatcher) handleSkill(ctx context.Context, msg *nats.Msg) {
+func (d *Dispatcher) handleFile(ctx context.Context, msg *nats.Msg) {
 	cmd, err := d.parseCommand(msg.Data)
 	if err != nil {
-		logs.WarnContextf(ctx, "Failed to parse skill command: %v", err)
+		logs.WarnContextf(ctx, "Failed to parse file command: %v", err)
 		return
 	}
-	if err := d.handlers.Skill.HandleSkillCommand(ctx, cmd, msg); err != nil {
-		logs.WarnContextf(ctx, "Skill command handler error: %v", err)
+	ctx = withCommandLogFields(ctx, cmd)
+	if err := d.handlers.File.HandleFileCommand(ctx, cmd); err != nil {
+		logs.WarnContextf(ctx, "File command handler error: %v", err)
 	}
+}
+
+func withCommandLogFields(ctx context.Context, cmd messaging.WorkerCommand) context.Context {
+	fields := make([]interface{}, 0, 8)
+	if cmd.Trace.ReqID != "" {
+		fields = append(fields, "req_id", cmd.Trace.ReqID)
+	}
+	if cmd.Route.SessionID != "" {
+		fields = append(fields, "session_id", cmd.Route.SessionID)
+	}
+	if cmd.Route.AssistantID != 0 {
+		fields = append(fields, "assistant_id", cmd.Route.AssistantID)
+	}
+	if cmd.Route.WorkerID != 0 {
+		fields = append(fields, "worker_id", cmd.Route.WorkerID)
+	}
+	if len(fields) == 0 {
+		return ctx
+	}
+	return logs.WithContextFields(ctx, fields...)
 }

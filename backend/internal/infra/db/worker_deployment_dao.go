@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -42,6 +43,18 @@ func GetDefaultWorkerDeployment(ctx context.Context, database *gorm.DB, orgID ui
 	return GetWorkerDeploymentByOrgWorkerID(ctx, database, orgID, 1)
 }
 
+// GetDefaultAssistantIDByOrg 获取组织的默认 AI 队友 ID（worker_id=1 对应的 assistant）。
+func GetDefaultAssistantIDByOrg(ctx context.Context, database *gorm.DB, orgID uint) (uint, error) {
+	deployment, err := GetDefaultWorkerDeployment(ctx, database, orgID)
+	if err != nil {
+		return 0, err
+	}
+	if deployment == nil {
+		return 0, nil
+	}
+	return deployment.DigitalAssistantID, nil
+}
+
 func NextWorkerID(ctx context.Context, database *gorm.DB, orgID uint) (uint, error) {
 	var maxID uint
 	if err := database.WithContext(ctx).
@@ -57,6 +70,18 @@ func NextWorkerID(ctx context.Context, database *gorm.DB, orgID uint) (uint, err
 func ListWorkerDeploymentsByStatuses(ctx context.Context, database *gorm.DB, statuses []string) ([]*types.WorkerDeployment, error) {
 	var deployments []*types.WorkerDeployment
 	query := database.WithContext(ctx).Order("updated_at ASC")
+	if len(statuses) > 0 {
+		query = query.Where("status IN ?", statuses)
+	}
+	if err := query.Find(&deployments).Error; err != nil {
+		return nil, err
+	}
+	return deployments, nil
+}
+
+func ListWorkerDeploymentsByOrgAndStatuses(ctx context.Context, database *gorm.DB, orgID uint, statuses []string) ([]*types.WorkerDeployment, error) {
+	var deployments []*types.WorkerDeployment
+	query := database.WithContext(ctx).Where("org_id = ?", orgID).Order("worker_id ASC")
 	if len(statuses) > 0 {
 		query = query.Where("status IN ?", statuses)
 	}
@@ -85,7 +110,11 @@ func MarkWorkerDeploymentStarted(ctx context.Context, database *gorm.DB, id uint
 		LastStartedAt:      &now,
 		LastReconciledAt:   &now,
 	}
-	return database.WithContext(ctx).Model(&types.WorkerDeployment{}).Where("id = ?", id).Updates(updates).Error
+	// 中文注释：GORM 的结构体 Updates 会忽略零值，显式选择字段才能清空旧 token 和错误信息。
+	return database.WithContext(ctx).Model(&types.WorkerDeployment{}).
+		Where("id = ?", id).
+		Select("Status", "BootstrapTokenHash", "LastError", "LastStartedAt", "LastReconciledAt").
+		Updates(updates).Error
 }
 
 func MarkWorkerDeploymentStatus(ctx context.Context, database *gorm.DB, id uint, status string, lastError string) error {
@@ -99,5 +128,31 @@ func MarkWorkerDeploymentStatus(ctx context.Context, database *gorm.DB, id uint,
 		LastError:        lastError,
 		LastReconciledAt: &now,
 	}
-	return database.WithContext(ctx).Model(&types.WorkerDeployment{}).Where("id = ?", id).Updates(updates).Error
+	// 中文注释：部署恢复后 lastError 需要写回空字符串，不能被 GORM 的零值过滤跳过。
+	return database.WithContext(ctx).Model(&types.WorkerDeployment{}).
+		Where("id = ?", id).
+		Select("Status", "LastError", "LastReconciledAt").
+		Updates(updates).Error
+}
+
+// GetWorkerIDByAssistantPublicID 根据 DigitalAssistant 的 public ID 反查对应的 worker_id。
+func GetWorkerIDByAssistantPublicID(ctx context.Context, database *gorm.DB, publicID string) (uint, error) {
+	if publicID == "" {
+		return 0, errors.New("publicID is empty")
+	}
+	da, err := GetDigitalAssistantByPublicID(ctx, database, publicID)
+	if err != nil {
+		return 0, err
+	}
+	if da == nil {
+		return 0, fmt.Errorf("digital assistant not found: %s", publicID)
+	}
+	deployment, err := GetWorkerDeploymentByAssistantID(ctx, database, da.ID)
+	if err != nil {
+		return 0, err
+	}
+	if deployment == nil {
+		return 0, fmt.Errorf("worker deployment not found for assistant: %s", publicID)
+	}
+	return deployment.WorkerID, nil
 }

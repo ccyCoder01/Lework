@@ -17,7 +17,7 @@ const docTemplate = `{
     "paths": {
         "/AddMessage": {
             "post": {
-                "description": "向指定会话添加一条消息",
+                "description": "向指定会话添加一条消息；工具场景可传 scene/output_format（或 metadata 同名字段）与带 attachment_role 的附件",
                 "consumes": [
                     "application/json"
                 ],
@@ -60,6 +60,142 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "资源不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/AuthSession": {
+            "get": {
+                "description": "获取当前用户、当前组织和可切换组织列表",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "当前登录会话",
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "认证失败",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/BatchCheckPermission": {
+            "post": {
+                "description": "批量检查当前用户对多个资源/动作的权限（用于前端控制按钮可见性）",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Permission"
+                ],
+                "summary": "批量检查权限",
+                "parameters": [
+                    {
+                        "description": "批量权限检查请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.batchCheckPermissionRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/ChooseUin": {
+            "post": {
+                "description": "使用 refresh token 选择组织并获取访问令牌",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "选择组织",
+                "parameters": [
+                    {
+                        "description": "选择组织请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.ChooseUinRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "认证失败",
                         "schema": {
                             "$ref": "#/definitions/dto.ErrorResponse"
                         }
@@ -131,6 +267,58 @@ const docTemplate = `{
                 }
             }
         },
+        "/CreateDepartment": {
+            "post": {
+                "description": "创建一个新部门",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Department"
+                ],
+                "summary": "创建部门",
+                "parameters": [
+                    {
+                        "description": "创建部门请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.CreateDepartmentRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/CreateDigitalAssistant": {
             "post": {
                 "description": "创建一个新的数字助手实例",
@@ -152,6 +340,58 @@ const docTemplate = `{
                         "required": true,
                         "schema": {
                             "$ref": "#/definitions/contract.CreateDigitalAssistantRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.CreateDigitalAssistantResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/CreateDigitalAssistantFromTemplate": {
+            "post": {
+                "description": "使用 AI 队友模板创建一个新的数字助手实例",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "DigitalAssistant"
+                ],
+                "summary": "基于模板创建数字助手",
+                "parameters": [
+                    {
+                        "description": "基于模板创建数字助手请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.CreateDigitalAssistantFromTemplateRequest"
                         }
                     }
                 ],
@@ -235,9 +475,61 @@ const docTemplate = `{
                 }
             }
         },
+        "/CreateMemberDepartment": {
+            "post": {
+                "description": "创建成员与部门的关联",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "MemberDepartment"
+                ],
+                "summary": "创建成员部门关系",
+                "parameters": [
+                    {
+                        "description": "创建成员部门关系请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.CreateMemberDepartmentRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/CreateOrg": {
             "post": {
-                "description": "创建一个新组织",
+                "description": "创建一个新组织。已废弃，请使用 POST /v1/CreateOrganization 替代。",
                 "consumes": [
                     "application/json"
                 ],
@@ -247,7 +539,7 @@ const docTemplate = `{
                 "tags": [
                     "Organization"
                 ],
-                "summary": "创建组织",
+                "summary": "创建组织（已废弃）",
                 "parameters": [
                     {
                         "description": "创建组织请求",
@@ -326,6 +618,58 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/CreateOrganization": {
+            "post": {
+                "description": "创建新组织/企业并切换当前登录组织",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "创建组织并切换",
+                "parameters": [
+                    {
+                        "description": "创建组织请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.CreateOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "认证失败",
                         "schema": {
                             "$ref": "#/definitions/dto.ErrorResponse"
                         }
@@ -547,6 +891,64 @@ const docTemplate = `{
                 }
             }
         },
+        "/DeleteDepartment": {
+            "post": {
+                "description": "根据 ID 删除部门",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Department"
+                ],
+                "summary": "删除部门",
+                "parameters": [
+                    {
+                        "description": "删除部门请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.deleteDepartmentRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "资源不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/DeleteDigitalAssistant": {
             "post": {
                 "description": "根据ID删除数字助手",
@@ -675,6 +1077,64 @@ const docTemplate = `{
                 }
             }
         },
+        "/DeleteMemberDepartment": {
+            "post": {
+                "description": "根据 ID 删除成员部门关联",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "MemberDepartment"
+                ],
+                "summary": "删除成员部门关系",
+                "parameters": [
+                    {
+                        "description": "删除成员部门关系请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.deleteMemberDepartmentRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "资源不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/DeleteMessage": {
             "post": {
                 "description": "根据ID删除会话消息",
@@ -754,64 +1214,6 @@ const docTemplate = `{
                         "required": true,
                         "schema": {
                             "$ref": "#/definitions/handler.DeleteOrgRequest"
-                        }
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "成功响应",
-                        "schema": {
-                            "$ref": "#/definitions/dto.Response"
-                        }
-                    },
-                    "400": {
-                        "description": "请求参数错误",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "401": {
-                        "description": "未认证",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "404": {
-                        "description": "资源不存在",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "500": {
-                        "description": "内部服务器错误",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/DeleteOrgMember": {
-            "post": {
-                "description": "根据ID从组织中移除成员",
-                "consumes": [
-                    "application/json"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "OrgMember"
-                ],
-                "summary": "删除组织成员",
-                "parameters": [
-                    {
-                        "description": "删除组织成员请求",
-                        "name": "body",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "$ref": "#/definitions/handler.DeleteOrgMemberRequest"
                         }
                     }
                 ],
@@ -1180,9 +1582,67 @@ const docTemplate = `{
                 }
             }
         },
+        "/GetDepartment": {
+            "post": {
+                "description": "根据 ID 获取部门详情",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Department"
+                ],
+                "summary": "获取部门",
+                "parameters": [
+                    {
+                        "description": "获取部门请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.getDepartmentRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "资源不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/GetDigitalAssistant": {
             "post": {
-                "description": "根据ID或Code获取数字助手详情",
+                "description": "根据ID或PublicID获取数字助手详情",
                 "consumes": [
                     "application/json"
                 ],
@@ -1244,6 +1704,58 @@ const docTemplate = `{
                 }
             }
         },
+        "/GetDigitalAssistantPermissions": {
+            "post": {
+                "description": "获取 AI 队友的公开范围和协作成员角色",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "DigitalAssistant"
+                ],
+                "summary": "获取数字助手共享权限",
+                "parameters": [
+                    {
+                        "description": "共享权限请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.GetDigitalAssistantPermissionsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "权限不足",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "资源不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/GetLLMModel": {
             "post": {
                 "description": "根据ID或Code获取LLM模型配置详情",
@@ -1289,6 +1801,64 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "权限不足",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "资源不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/GetMemberDepartment": {
+            "post": {
+                "description": "根据 ID 获取成员部门关系详情",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "MemberDepartment"
+                ],
+                "summary": "获取成员部门关系",
+                "parameters": [
+                    {
+                        "description": "获取成员部门关系请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.getMemberDepartmentRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
                         "schema": {
                             "$ref": "#/definitions/dto.ErrorResponse"
                         }
@@ -1658,7 +2228,7 @@ const docTemplate = `{
         },
         "/GetUser": {
             "post": {
-                "description": "根据PublicID或GithubLogin获取用户详情",
+                "description": "根据PublicID或Phone获取用户详情",
                 "consumes": [
                     "application/json"
                 ],
@@ -1701,6 +2271,96 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "资源不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/GlobalConfig": {
+            "get": {
+                "description": "返回服务端通用全局配置信息（edition、deploy_mode、max_orgs_per_user）",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Global"
+                ],
+                "summary": "获取全局配置",
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/dto.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/dto.GlobalConfigData"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/ListDepartment": {
+            "post": {
+                "description": "查询部门列表",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Department"
+                ],
+                "summary": "部门列表",
+                "parameters": [
+                    {
+                        "description": "查询部门列表请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.ListDepartmentRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
                         "schema": {
                             "$ref": "#/definitions/dto.ErrorResponse"
                         }
@@ -1818,6 +2478,58 @@ const docTemplate = `{
                 }
             }
         },
+        "/ListMemberDepartments": {
+            "post": {
+                "description": "分页查询成员部门关系列表",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "MemberDepartment"
+                ],
+                "summary": "查询成员部门关系列表",
+                "parameters": [
+                    {
+                        "description": "查询成员部门关系列表请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.ListMemberDepartmentsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/ListOrgMembers": {
             "post": {
                 "description": "分页查询组织成员列表",
@@ -1891,6 +2603,58 @@ const docTemplate = `{
                         "required": true,
                         "schema": {
                             "$ref": "#/definitions/contract.ListOrgsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/ListProjectActivities": {
+            "post": {
+                "description": "按项目和操作人筛选项目操作动态",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Project"
+                ],
+                "summary": "查询项目操作动态",
+                "parameters": [
+                    {
+                        "description": "查询项目动态请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.ListProjectActivitiesRequest"
                         }
                     }
                 ],
@@ -2078,7 +2842,53 @@ const docTemplate = `{
                 }
             }
         },
-        "/ListUsers": {
+        "/ListUin": {
+            "post": {
+                "description": "获取当前登录用户的所有UIN（用户身份标识）列表，包含个人和企业身份",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "User"
+                ],
+                "summary": "查询用户身份标识列表",
+                "parameters": [
+                    {
+                        "description": "查询请求（可为空）",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.ListUinRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/ListUser": {
             "post": {
                 "description": "分页查询用户列表",
                 "consumes": [
@@ -2098,7 +2908,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/contract.ListUsersRequest"
+                            "$ref": "#/definitions/contract.ListUserRequest"
                         }
                     }
                 ],
@@ -2130,9 +2940,9 @@ const docTemplate = `{
                 }
             }
         },
-        "/LoginByEmail": {
+        "/LoginByPassword": {
             "post": {
-                "description": "使用邮箱和密码登录并获取访问令牌",
+                "description": "使用账号（邮箱或手机号）和密码登录；统一返回 refresh_token，需后续调用 ChooseUin 选择组织获取 JWT",
                 "consumes": [
                     "application/json"
                 ],
@@ -2142,15 +2952,15 @@ const docTemplate = `{
                 "tags": [
                     "Auth"
                 ],
-                "summary": "邮箱登录",
+                "summary": "账号密码登录",
                 "parameters": [
                     {
-                        "description": "邮箱登录请求",
+                        "description": "账号密码登录请求",
                         "name": "body",
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/contract.LoginByEmailRequest"
+                            "$ref": "#/definitions/contract.LoginByPasswordRequest"
                         }
                     }
                 ],
@@ -2233,64 +3043,6 @@ const docTemplate = `{
                     },
                     "429": {
                         "description": "登录失败次数过多",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "500": {
-                        "description": "内部服务器错误",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/NewMessage": {
-            "post": {
-                "description": "原子创建 Project + Task + Session 并分配 AgentWorker",
-                "consumes": [
-                    "application/json"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Work"
-                ],
-                "summary": "首页新建消息",
-                "parameters": [
-                    {
-                        "description": "新建消息请求",
-                        "name": "body",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "$ref": "#/definitions/contract.NewMessageRequest"
-                        }
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "成功响应",
-                        "schema": {
-                            "$ref": "#/definitions/dto.BaseResponse"
-                        }
-                    },
-                    "400": {
-                        "description": "请求参数错误",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "401": {
-                        "description": "未认证",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "404": {
-                        "description": "资源不存在",
                         "schema": {
                             "$ref": "#/definitions/dto.ErrorResponse"
                         }
@@ -2474,7 +3226,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/handler.SessionEventsRequest"
+                            "$ref": "#/definitions/contract.SessionEventsRequest"
                         }
                     }
                 ],
@@ -2493,6 +3245,186 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/SetDefaultLLMModel": {
+            "post": {
+                "description": "将指定ID的LLM模型设为所属用途的默认模型",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "LLMModel"
+                ],
+                "summary": "设为默认LLM模型",
+                "parameters": [
+                    {
+                        "description": "设为默认LLM模型请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.SetDefaultLLMModelRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "权限不足",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "资源不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/SetLLMModelStatus": {
+            "post": {
+                "description": "根据ID启用或禁用LLM模型配置",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "LLMModel"
+                ],
+                "summary": "启用或禁用LLM模型",
+                "parameters": [
+                    {
+                        "description": "启用/禁用LLM模型请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.SetLLMModelStatusRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "权限不足",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "资源不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/SwitchOrganization": {
+            "post": {
+                "description": "切换当前登录组织并获取新的访问令牌",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "切换组织",
+                "parameters": [
+                    {
+                        "description": "切换组织请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.SwitchOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "认证失败",
                         "schema": {
                             "$ref": "#/definitions/dto.ErrorResponse"
                         }
@@ -2545,6 +3477,116 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/UpdateCurrentUser": {
+            "post": {
+                "description": "当前登录用户修改自己的信息",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "User"
+                ],
+                "summary": "更新当前用户信息",
+                "parameters": [
+                    {
+                        "description": "更新当前用户请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.UpdateCurrentUserRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/UpdateDepartment": {
+            "post": {
+                "description": "更新部门信息",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Department"
+                ],
+                "summary": "更新部门",
+                "parameters": [
+                    {
+                        "description": "更新部门请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.updateDepartmentRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "资源不存在",
                         "schema": {
                             "$ref": "#/definitions/dto.ErrorResponse"
                         }
@@ -2615,6 +3657,58 @@ const docTemplate = `{
                     },
                     "500": {
                         "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/UpdateDigitalAssistantPermissions": {
+            "post": {
+                "description": "全量更新 AI 队友的公开范围和协作成员角色",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "DigitalAssistant"
+                ],
+                "summary": "更新数字助手共享权限",
+                "parameters": [
+                    {
+                        "description": "共享权限更新请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/contract.UpdateDigitalAssistantPermissionsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "权限不足",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "资源不存在",
                         "schema": {
                             "$ref": "#/definitions/dto.ErrorResponse"
                         }
@@ -2731,6 +3825,64 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "权限不足",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "资源不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "内部服务器错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/UpdateMemberDepartment": {
+            "post": {
+                "description": "更新成员部门关联信息",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "MemberDepartment"
+                ],
+                "summary": "更新成员部门关系",
+                "parameters": [
+                    {
+                        "description": "更新成员部门关系请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.updateMemberDepartmentRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
                         "schema": {
                             "$ref": "#/definitions/dto.ErrorResponse"
                         }
@@ -3098,59 +4250,9 @@ const docTemplate = `{
                 }
             }
         },
-        "/files/upload": {
-            "post": {
-                "description": "上传文件到系统",
-                "consumes": [
-                    "multipart/form-data"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "File"
-                ],
-                "summary": "上传文件",
-                "parameters": [
-                    {
-                        "type": "file",
-                        "description": "上传文件",
-                        "name": "file",
-                        "in": "formData",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "文件用途（默认 attachment）",
-                        "name": "purpose",
-                        "in": "formData"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "上传成功",
-                        "schema": {
-                            "$ref": "#/definitions/dto.Response"
-                        }
-                    },
-                    "400": {
-                        "description": "请求参数错误",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "401": {
-                        "description": "未认证",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/files/{id}/download": {
+        "/files/download": {
             "get": {
-                "description": "流式返回文件内容",
+                "description": "通过 publicID 或 storageURI 流式返回文件内容",
                 "produces": [
                     "application/octet-stream"
                 ],
@@ -3161,10 +4263,15 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "文件ID",
-                        "name": "id",
-                        "in": "path",
-                        "required": true
+                        "description": "文件公共ID",
+                        "name": "public_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "文件存储URI（格式 {schema}://{bucket}/{key}）",
+                        "name": "storage_uri",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -3195,9 +4302,9 @@ const docTemplate = `{
                 }
             }
         },
-        "/files/{id}/preview": {
+        "/files/preview": {
             "get": {
-                "description": "生成预签名下载 URL 并 302 重定向",
+                "description": "通过 publicID 或 storageURI 生成预签名下载 URL 并 302 重定向",
                 "produces": [
                     "application/json"
                 ],
@@ -3208,10 +4315,15 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "文件ID",
-                        "name": "id",
-                        "in": "path",
-                        "required": true
+                        "description": "文件公共ID",
+                        "name": "public_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "文件存储URI（格式 {schema}://{bucket}/{key}）",
+                        "name": "storage_uri",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -3235,6 +4347,134 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "文件不存在",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/files/upload": {
+            "post": {
+                "description": "上传文件到系统",
+                "consumes": [
+                    "multipart/form-data"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "File"
+                ],
+                "summary": "上传文件",
+                "parameters": [
+                    {
+                        "type": "file",
+                        "description": "上传文件",
+                        "name": "file",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "文件用途（默认 attachment）",
+                        "name": "purpose",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "来源ID（可选）",
+                        "name": "source_id",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "上传成功",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/ops/workers/status": {
+            "get": {
+                "description": "根据 orgid 和 workerid 查询指定 Worker 的本地运行状态快照。",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Ops"
+                ],
+                "summary": "查询 Worker 状态",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "组织 ID",
+                        "name": "orgid",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Worker ID",
+                        "name": "workerid",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Worker 状态快照",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "请求参数错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "未认证",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "组织不匹配",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "502": {
+                        "description": "Worker 响应格式错误",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "NATS 不可用",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "504": {
+                        "description": "Worker 响应超时",
                         "schema": {
                             "$ref": "#/definitions/dto.ErrorResponse"
                         }
@@ -3383,74 +4623,9 @@ const docTemplate = `{
                 }
             }
         },
-        "/projects/{project_id}/AddFile": {
-            "post": {
-                "description": "将已通过 /v1/files/upload 上传的文件关联到指定项目",
-                "consumes": [
-                    "application/json"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Project"
-                ],
-                "summary": "关联文件到项目",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "项目 public_id",
-                        "name": "project_id",
-                        "in": "path",
-                        "required": true
-                    },
-                    {
-                        "description": "文件信息",
-                        "name": "request",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "$ref": "#/definitions/contract.AddFileRequest"
-                        }
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "成功响应",
-                        "schema": {
-                            "$ref": "#/definitions/dto.Response"
-                        }
-                    },
-                    "400": {
-                        "description": "请求参数错误",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "401": {
-                        "description": "未认证",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "404": {
-                        "description": "资源不存在",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "500": {
-                        "description": "内部服务器错误",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
         "/projects/{project_id}/files": {
             "get": {
-                "description": "获取项目 artifacts/ 和 uploads/ 目录的文件树，可通过 path 参数指定子目录。\n文件节点包含 created_at 字段（Unix 秒级时间戳），表示该文件在 Gitea 仓库中的首次 commit 时间，未找到时为 0。",
+                "description": "获取项目 artifacts/ 和 uploads/ 目录的文件树，可通过 resource_type 参数筛选。\n文件节点包含 created_at 字段（Unix 秒级时间戳），表示该文件关联记录创建的时间，未找到时为 0。",
                 "produces": [
                     "application/json"
                 ],
@@ -3468,72 +4643,27 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "起始目录相对路径，如 artifacts，默认返回全量",
-                        "name": "path",
+                        "description": "资源类型：user_upload | artifact | plan；默认排除 plan",
+                        "name": "resource_type",
                         "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "成功响应",
-                        "schema": {
-                            "$ref": "#/definitions/dto.Response"
-                        }
                     },
-                    "400": {
-                        "description": "请求参数错误",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "401": {
-                        "description": "未认证",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "404": {
-                        "description": "资源不存在",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    },
-                    "500": {
-                        "description": "内部服务器错误",
-                        "schema": {
-                            "$ref": "#/definitions/dto.ErrorResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/projects/{project_id}/files/upload": {
-            "post": {
-                "description": "上传文件到项目 Upload 目录，同名文件自动追加序列号",
-                "consumes": [
-                    "multipart/form-data"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "Project"
-                ],
-                "summary": "上传项目文件",
-                "parameters": [
                     {
                         "type": "string",
-                        "description": "项目 public_id",
-                        "name": "project_id",
-                        "in": "path",
-                        "required": true
+                        "description": "Task public ID，传入时仅返回该任务的产物文件",
+                        "name": "task_id",
+                        "in": "query"
                     },
                     {
-                        "type": "file",
-                        "description": "上传的文件",
-                        "name": "file",
-                        "in": "formData",
-                        "required": true
+                        "type": "string",
+                        "description": "节点类型：folder | file；默认返回文件与文件夹",
+                        "name": "node_type",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "文件类型分组：pdf | docx | xlsx | pptx | md | html | image | video | text",
+                        "name": "file_ext",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -3679,19 +4809,19 @@ const docTemplate = `{
         },
         "/static/{bucket}/{key}": {
             "get": {
-                "description": "为指定 bucket/key 生成一个带过期时间的预签名下载 URL",
+                "description": "根据 operation=upload|download 生成预签名上传或下载 URL",
                 "produces": [
                     "text/plain"
                 ],
                 "tags": [
                     "Storage"
                 ],
-                "summary": "生成预签名下载 URL",
+                "summary": "生成预签名 URL",
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "触发预签名标识(任意值)",
-                        "name": "presign",
+                        "description": "操作类型: upload 或 download",
+                        "name": "operation",
                         "in": "query",
                         "required": true
                     },
@@ -3712,7 +4842,7 @@ const docTemplate = `{
                 ],
                 "responses": {
                     "200": {
-                        "description": "预签名下载 URL",
+                        "description": "预签名 URL",
                         "schema": {
                             "type": "string"
                         }
@@ -3730,56 +4860,88 @@ const docTemplate = `{
                         }
                     }
                 }
-            },
-            "put": {
-                "description": "为指定 bucket/key 生成一个带过期时间的预签名上传 URL",
+            }
+        },
+        "/v1/GlobalEvents": {
+            "post": {
+                "description": "建立 project 级全局 SSE 长连接，实时推送新消息等通知",
+                "consumes": [
+                    "application/json"
+                ],
                 "produces": [
-                    "text/plain"
+                    "text/event-stream"
                 ],
                 "tags": [
-                    "Storage"
+                    "GlobalEvents"
                 ],
-                "summary": "生成预签名上传 URL",
+                "summary": "全局事件流",
                 "parameters": [
                     {
-                        "type": "string",
-                        "description": "触发预签名标识(任意值)",
-                        "name": "presign",
-                        "in": "query",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "存储桶名称",
-                        "name": "bucket",
-                        "in": "path",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "对象 key",
-                        "name": "key",
-                        "in": "path",
-                        "required": true
+                        "description": "replay 控制参数",
+                        "name": "request",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/handler.GlobalEventsRequest"
+                        }
                     }
                 ],
                 "responses": {
                     "200": {
-                        "description": "预签名上传 URL",
+                        "description": "text/event-stream",
                         "schema": {
                             "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/workers/token": {
+            "post": {
+                "description": "使用 Worker 启动令牌（bootstrap token）换取短期访问令牌",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "WorkerAuth"
+                ],
+                "summary": "获取 Worker 访问令牌",
+                "parameters": [
+                    {
+                        "description": "Worker 令牌请求",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.issueWorkerTokenRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "成功响应",
+                        "schema": {
+                            "$ref": "#/definitions/dto.Response"
                         }
                     },
                     "400": {
-                        "description": "参数错误",
+                        "description": "请求参数错误",
                         "schema": {
-                            "type": "string"
+                            "$ref": "#/definitions/dto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "认证失败",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErrorResponse"
                         }
                     },
                     "500": {
-                        "description": "生成预签名 URL 失败",
+                        "description": "内部服务器错误",
                         "schema": {
-                            "type": "string"
+                            "$ref": "#/definitions/dto.ErrorResponse"
                         }
                     }
                 }
@@ -3787,38 +4949,167 @@ const docTemplate = `{
         }
     },
     "definitions": {
-        "contract.AddFileRequest": {
+        "contract.AutomationIntervalInput": {
+            "type": "object",
+            "properties": {
+                "interval_minutes": {
+                    "type": "integer"
+                },
+                "interval_seconds": {
+                    "type": "integer"
+                },
+                "interval_unit": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.AutomationScheduleInput": {
+            "type": "object",
+            "properties": {
+                "calendar": {
+                    "$ref": "#/definitions/types.AutomationCalendarConfig"
+                },
+                "interval": {
+                    "$ref": "#/definitions/contract.AutomationIntervalInput"
+                },
+                "mode": {
+                    "type": "string"
+                },
+                "timezone": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.ChooseUinRequest": {
+            "type": "object",
+            "properties": {
+                "login_way": {
+                    "type": "integer"
+                },
+                "refresh_token": {
+                    "type": "string"
+                },
+                "uin": {
+                    "type": "integer"
+                },
+                "user_id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "contract.CreateAutomationRequest": {
             "type": "object",
             "required": [
-                "public_id"
+                "name",
+                "schedule",
+                "schedule_mode"
             ],
             "properties": {
-                "public_id": {
+                "enabled": {
+                    "type": "boolean"
+                },
+                "instruction": {
                     "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "project_public_id": {
+                    "description": "ProjectPublicID 关联的既有项目对外 ID（可选）。空/省略：使用默认新项目（首次执行懒创建）。",
+                    "type": "string"
+                },
+                "schedule": {
+                    "$ref": "#/definitions/contract.AutomationScheduleInput"
+                },
+                "schedule_mode": {
+                    "type": "string"
+                },
+                "timezone": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.CreateDepartmentRequest": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string"
+                },
+                "org_id": {
+                    "type": "integer"
+                },
+                "parent_id": {
+                    "type": "integer"
+                },
+                "sort": {
+                    "type": "integer"
+                }
+            }
+        },
+        "contract.CreateDigitalAssistantFromTemplateRequest": {
+            "type": "object",
+            "required": [
+                "template_id"
+            ],
+            "properties": {
+                "avatar": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "expertise": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "name": {
+                    "type": "string"
+                },
+                "role_name": {
+                    "type": "string"
+                },
+                "system_prompt": {
+                    "type": "string"
+                },
+                "template_id": {
+                    "type": "integer"
                 }
             }
         },
         "contract.CreateDigitalAssistantRequest": {
             "type": "object",
             "required": [
-                "code",
                 "name"
             ],
             "properties": {
                 "avatar": {
                     "type": "string"
                 },
-                "code": {
-                    "type": "string"
-                },
                 "description": {
                     "type": "string"
+                },
+                "expertise": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "name": {
                     "type": "string"
                 },
+                "role_name": {
+                    "type": "string"
+                },
+                "source": {
+                    "type": "string"
+                },
                 "system_prompt": {
                     "type": "string"
+                },
+                "template_id": {
+                    "type": "integer"
                 }
             }
         },
@@ -3827,7 +5118,9 @@ const docTemplate = `{
             "required": [
                 "api_key",
                 "base_url",
-                "model"
+                "model",
+                "name",
+                "purpose"
             ],
             "properties": {
                 "api_key": {
@@ -3846,6 +5139,9 @@ const docTemplate = `{
                 "is_default": {
                     "type": "boolean"
                 },
+                "max_tokens": {
+                    "type": "integer"
+                },
                 "model": {
                     "type": "string"
                 },
@@ -3855,22 +5151,54 @@ const docTemplate = `{
                 "provider": {
                     "type": "string"
                 },
+                "purpose": {
+                    "type": "string"
+                },
                 "status": {
                     "type": "string"
+                },
+                "temperature": {
+                    "type": "number"
+                }
+            }
+        },
+        "contract.CreateMemberDepartmentRequest": {
+            "type": "object",
+            "required": [
+                "department_id",
+                "uin"
+            ],
+            "properties": {
+                "department_id": {
+                    "type": "integer"
+                },
+                "is_primary": {
+                    "type": "boolean"
+                },
+                "uin": {
+                    "type": "integer"
                 }
             }
         },
         "contract.CreateOrgMemberRequest": {
             "type": "object",
-            "required": [
-                "org_id",
-                "user_id"
-            ],
             "properties": {
+                "department_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
                 "is_default": {
                     "type": "boolean"
                 },
+                "name": {
+                    "type": "string"
+                },
                 "org_id": {
+                    "type": "string"
+                },
+                "phone": {
                     "type": "string"
                 },
                 "user_id": {
@@ -3880,12 +5208,17 @@ const docTemplate = `{
         },
         "contract.CreateOrgRequest": {
             "type": "object",
-            "required": [
-                "code",
-                "name"
-            ],
             "properties": {
+                "address": {
+                    "type": "string"
+                },
                 "code": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "logo": {
                     "type": "string"
                 },
                 "name": {
@@ -3896,6 +5229,29 @@ const docTemplate = `{
                 },
                 "type": {
                     "type": "string"
+                },
+                "user_display_name": {
+                    "type": "string"
+                },
+                "website": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.CreateOrganizationRequest": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string"
+                },
+                "refresh_token": {
+                    "type": "string"
+                },
+                "user_display_name": {
+                    "type": "string"
+                },
+                "user_id": {
+                    "type": "integer"
                 }
             }
         },
@@ -3907,6 +5263,12 @@ const docTemplate = `{
             "properties": {
                 "description": {
                     "type": "string"
+                },
+                "members": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/contract.MemberInput"
+                    }
                 },
                 "metadata": {
                     "type": "object",
@@ -3927,7 +5289,7 @@ const docTemplate = `{
             ],
             "properties": {
                 "assistant_id": {
-                    "type": "integer"
+                    "type": "string"
                 },
                 "expired_at": {
                     "type": "string"
@@ -3979,33 +5341,31 @@ const docTemplate = `{
         },
         "contract.CreateUserRequest": {
             "type": "object",
-            "required": [
-                "github_login",
-                "name"
-            ],
             "properties": {
-                "avatar_url": {
-                    "type": "string"
-                },
-                "bio": {
-                    "type": "string"
-                },
-                "company": {
-                    "type": "string"
+                "department_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
                 },
                 "email": {
-                    "type": "string"
-                },
-                "github_login": {
-                    "type": "string"
-                },
-                "location": {
                     "type": "string"
                 },
                 "name": {
                     "type": "string"
                 },
-                "password": {
+                "phone": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.DeleteAutomationRequest": {
+            "type": "object",
+            "required": [
+                "public_id"
+            ],
+            "properties": {
+                "public_id": {
                     "type": "string"
                 }
             }
@@ -4016,14 +5376,20 @@ const docTemplate = `{
                 "avatar": {
                     "type": "string"
                 },
-                "code": {
-                    "type": "string"
-                },
                 "created_at": {
                     "type": "string"
                 },
+                "deployment": {
+                    "$ref": "#/definitions/contract.WorkerDeploymentStatus"
+                },
                 "description": {
                     "type": "string"
+                },
+                "expertise": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "id": {
                     "type": "integer"
@@ -4037,16 +5403,163 @@ const docTemplate = `{
                 "owner_id": {
                     "type": "integer"
                 },
+                "permission": {
+                    "$ref": "#/definitions/contract.DigitalAssistantPermission"
+                },
+                "public_id": {
+                    "type": "string"
+                },
+                "role_name": {
+                    "type": "string"
+                },
+                "source": {
+                    "type": "string"
+                },
                 "status": {
                     "type": "string"
                 },
                 "system_prompt": {
                     "type": "string"
                 },
+                "template_id": {
+                    "type": "integer"
+                },
                 "updated_at": {
                     "type": "string"
                 },
                 "version": {
+                    "type": "integer"
+                },
+                "visibility": {
+                    "$ref": "#/definitions/types.DigitalAssistantVisibility"
+                }
+            }
+        },
+        "contract.DigitalAssistantPermission": {
+            "type": "object",
+            "properties": {
+                "role": {
+                    "$ref": "#/definitions/types.ResourceRole"
+                }
+            }
+        },
+        "contract.DigitalAssistantPermissionMemberInput": {
+            "type": "object",
+            "properties": {
+                "role": {
+                    "$ref": "#/definitions/types.ResourceRole"
+                },
+                "user": {
+                    "type": "object",
+                    "properties": {
+                        "public_id": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "contract.GetAutomationExecutionRequest": {
+            "type": "object",
+            "required": [
+                "public_id"
+            ],
+            "properties": {
+                "public_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.GetAutomationRequest": {
+            "type": "object",
+            "required": [
+                "public_id"
+            ],
+            "properties": {
+                "public_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.GetDigitalAssistantPermissionsRequest": {
+            "type": "object",
+            "required": [
+                "public_id"
+            ],
+            "properties": {
+                "public_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.ListAutomationExecutionsRequest": {
+            "type": "object",
+            "required": [
+                "public_id"
+            ],
+            "properties": {
+                "limit": {
+                    "type": "integer"
+                },
+                "list_all": {
+                    "type": "boolean"
+                },
+                "offset": {
+                    "type": "integer"
+                },
+                "public_id": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.ListAutomationsRequest": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean"
+                },
+                "keyword": {
+                    "type": "string"
+                },
+                "limit": {
+                    "type": "integer"
+                },
+                "list_all": {
+                    "type": "boolean"
+                },
+                "offset": {
+                    "type": "integer"
+                },
+                "schedule_mode": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.ListDepartmentRequest": {
+            "type": "object",
+            "properties": {
+                "keyword": {
+                    "type": "string"
+                },
+                "limit": {
+                    "type": "integer"
+                },
+                "list_all": {
+                    "type": "boolean"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "offset": {
+                    "type": "integer"
+                },
+                "org_id": {
+                    "type": "integer"
+                },
+                "parent_id": {
                     "type": "integer"
                 }
             }
@@ -4065,6 +5578,9 @@ const docTemplate = `{
                 },
                 "offset": {
                     "type": "integer"
+                },
+                "source": {
+                    "type": "string"
                 },
                 "status": {
                     "type": "string"
@@ -4089,14 +5605,23 @@ const docTemplate = `{
                 "provider": {
                     "type": "string"
                 },
+                "purpose": {
+                    "type": "string"
+                },
                 "status": {
                     "type": "string"
                 }
             }
         },
-        "contract.ListOrgMembersRequest": {
+        "contract.ListMemberDepartmentsRequest": {
             "type": "object",
             "properties": {
+                "department_id": {
+                    "type": "integer"
+                },
+                "is_primary": {
+                    "type": "boolean"
+                },
                 "limit": {
                     "type": "integer"
                 },
@@ -4107,7 +5632,30 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "org_id": {
-                    "type": "string"
+                    "type": "integer"
+                },
+                "uin": {
+                    "type": "integer"
+                }
+            }
+        },
+        "contract.ListOrgMembersRequest": {
+            "type": "object",
+            "properties": {
+                "department_id": {
+                    "type": "integer"
+                },
+                "limit": {
+                    "type": "integer"
+                },
+                "list_all": {
+                    "type": "boolean"
+                },
+                "offset": {
+                    "type": "integer"
+                },
+                "org_id": {
+                    "type": "integer"
                 },
                 "user_id": {
                     "type": "string"
@@ -4130,6 +5678,29 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.ListProjectActivitiesRequest": {
+            "type": "object",
+            "properties": {
+                "cursor": {
+                    "type": "string"
+                },
+                "limit": {
+                    "type": "integer"
+                },
+                "operator_id": {
+                    "type": "string"
+                },
+                "operator_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "project_id": {
                     "type": "string"
                 }
             }
@@ -4157,11 +5728,8 @@ const docTemplate = `{
         "contract.ListSessionsRequest": {
             "type": "object",
             "properties": {
-                "assistant_code": {
-                    "type": "string"
-                },
                 "assistant_id": {
-                    "type": "integer"
+                    "type": "string"
                 },
                 "keyword": {
                     "type": "string"
@@ -4212,11 +5780,14 @@ const docTemplate = `{
                 }
             }
         },
-        "contract.ListUsersRequest": {
+        "contract.ListUinRequest": {
+            "type": "object"
+        },
+        "contract.ListUserRequest": {
             "type": "object",
             "properties": {
-                "github_login": {
-                    "type": "string"
+                "department_id": {
+                    "type": "integer"
                 },
                 "keyword": {
                     "type": "string"
@@ -4232,14 +5803,10 @@ const docTemplate = `{
                 }
             }
         },
-        "contract.LoginByEmailRequest": {
+        "contract.LoginByPasswordRequest": {
             "type": "object",
-            "required": [
-                "email",
-                "password"
-            ],
             "properties": {
-                "email": {
+                "account": {
                     "type": "string"
                 },
                 "password": {
@@ -4249,10 +5816,6 @@ const docTemplate = `{
         },
         "contract.LoginByPhoneCodeRequest": {
             "type": "object",
-            "required": [
-                "code",
-                "phone"
-            ],
             "properties": {
                 "code": {
                     "type": "string"
@@ -4262,56 +5825,46 @@ const docTemplate = `{
                 }
             }
         },
-        "contract.NewMessageRequest": {
+        "contract.MemberInput": {
             "type": "object",
             "required": [
-                "content"
+                "id",
+                "type"
             ],
             "properties": {
-                "assistant_id": {
-                    "type": "integer"
-                },
-                "attachments": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/types.MessageAttachment"
-                    }
-                },
-                "content": {
+                "id": {
+                    "description": "user 传 public_id, assistant 传 public_id",
                     "type": "string"
                 },
-                "message_type": {
+                "role": {
+                    "description": "仅 type=user 生效，可选 owner|admin|member，空值默认 member",
                     "type": "string"
                 },
-                "objective": {
-                    "type": "string"
-                },
-                "project_id": {
-                    "type": "string"
-                },
-                "task_id": {
+                "type": {
+                    "description": "\"user\" | \"assistant\"",
                     "type": "string"
                 }
             }
         },
         "contract.RefreshTokenRequest": {
             "type": "object",
-            "required": [
-                "refresh_token"
-            ],
             "properties": {
+                "login_way": {
+                    "type": "integer"
+                },
                 "refresh_token": {
                     "type": "string"
+                },
+                "uin_id": {
+                    "type": "integer"
+                },
+                "user_id": {
+                    "type": "integer"
                 }
             }
         },
         "contract.RegisterByEmailRequest": {
             "type": "object",
-            "required": [
-                "confirm_password",
-                "email",
-                "password"
-            ],
             "properties": {
                 "confirm_password": {
                     "type": "string"
@@ -4327,14 +5880,76 @@ const docTemplate = `{
                 }
             }
         },
-        "contract.SendPhoneLoginCodeRequest": {
+        "contract.RunAutomationNowRequest": {
             "type": "object",
             "required": [
-                "phone"
+                "public_id"
             ],
+            "properties": {
+                "public_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.SendPhoneLoginCodeRequest": {
+            "type": "object",
             "properties": {
                 "phone": {
                     "type": "string"
+                }
+            }
+        },
+        "contract.SessionEventsRequest": {
+            "type": "object",
+            "required": [
+                "session_id"
+            ],
+            "properties": {
+                "assistant_id": {
+                    "type": "string"
+                },
+                "replay": {
+                    "type": "boolean"
+                },
+                "session_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.SetDefaultLLMModelRequest": {
+            "type": "object",
+            "required": [
+                "id"
+            ],
+            "properties": {
+                "id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "contract.SetLLMModelStatusRequest": {
+            "type": "object",
+            "required": [
+                "id",
+                "status"
+            ],
+            "properties": {
+                "id": {
+                    "type": "integer"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.SwitchOrganizationRequest": {
+            "type": "object",
+            "properties": {
+                "login_way": {
+                    "type": "integer"
+                },
+                "uin": {
+                    "type": "integer"
                 }
             }
         },
@@ -4361,6 +5976,54 @@ const docTemplate = `{
                 }
             }
         },
+        "contract.UpdateCurrentUserRequest": {
+            "type": "object",
+            "properties": {
+                "avatar_url": {
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "contract.UpdateDigitalAssistantPermissionsRequest": {
+            "type": "object",
+            "required": [
+                "public_id"
+            ],
+            "properties": {
+                "members": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/contract.DigitalAssistantPermissionMemberInput"
+                    }
+                },
+                "public_id": {
+                    "type": "string"
+                },
+                "visibility": {
+                    "$ref": "#/definitions/types.DigitalAssistantVisibility"
+                }
+            }
+        },
+        "contract.WorkerDeploymentStatus": {
+            "type": "object",
+            "properties": {
+                "last_error": {
+                    "type": "string"
+                },
+                "public_id": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
         "dto.BaseResponse": {
             "type": "object",
             "properties": {
@@ -4368,6 +6031,9 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "message": {
+                    "type": "string"
+                },
+                "req_id": {
                     "type": "string"
                 }
             }
@@ -4397,6 +6063,26 @@ const docTemplate = `{
                 },
                 "message": {
                     "type": "string"
+                },
+                "req_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.GlobalConfigData": {
+            "type": "object",
+            "properties": {
+                "deploy_mode": {
+                    "type": "string"
+                },
+                "edition": {
+                    "type": "string"
+                },
+                "max_orgs_per_user": {
+                    "type": "integer"
+                },
+                "phone_code_login_enabled": {
+                    "type": "boolean"
                 }
             }
         },
@@ -4409,6 +6095,9 @@ const docTemplate = `{
                 "data": {},
                 "message": {
                     "type": "string"
+                },
+                "req_id": {
+                    "type": "string"
                 }
             }
         },
@@ -4420,6 +6109,12 @@ const docTemplate = `{
                 "session_id"
             ],
             "properties": {
+                "assistant_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "attachments": {
                     "type": "array",
                     "items": {
@@ -4432,8 +6127,25 @@ const docTemplate = `{
                         "$ref": "#/definitions/types.MessageChunk"
                     }
                 },
+                "connector_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "content": {
                     "type": "string"
+                },
+                "execution_mode": {
+                    "enum": [
+                        "default",
+                        "plan"
+                    ],
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/types.ExecutionMode"
+                        }
+                    ]
                 },
                 "message_type": {
                     "type": "string"
@@ -4441,7 +6153,15 @@ const docTemplate = `{
                 "metadata": {
                     "$ref": "#/definitions/types.ObjectMetadata"
                 },
+                "output_format": {
+                    "description": "OutputFormat 是工具场景要求生成的最终交付格式，如 docx、pdf、pptx、md。",
+                    "type": "string"
+                },
                 "role": {
+                    "type": "string"
+                },
+                "scene": {
+                    "description": "Scene 区分普通问答与工具场景；空或 normal 为普通问答，bid_comparison 为标书对比。",
                     "type": "string"
                 },
                 "session_id": {
@@ -4495,17 +6215,6 @@ const docTemplate = `{
             ],
             "properties": {
                 "message_id": {
-                    "type": "integer"
-                }
-            }
-        },
-        "handler.DeleteOrgMemberRequest": {
-            "type": "object",
-            "required": [
-                "id"
-            ],
-            "properties": {
-                "id": {
                     "type": "integer"
                 }
             }
@@ -4568,11 +6277,11 @@ const docTemplate = `{
         "handler.GetDigitalAssistantRequest": {
             "type": "object",
             "properties": {
-                "code": {
-                    "type": "string"
-                },
                 "id": {
                     "type": "integer"
+                },
+                "public_id": {
+                    "type": "string"
                 }
             }
         },
@@ -4656,7 +6365,7 @@ const docTemplate = `{
         "handler.GetUserRequest": {
             "type": "object",
             "properties": {
-                "github_login": {
+                "phone": {
                     "type": "string"
                 },
                 "public_id": {
@@ -4664,17 +6373,11 @@ const docTemplate = `{
                 }
             }
         },
-        "handler.SessionEventsRequest": {
+        "handler.GlobalEventsRequest": {
             "type": "object",
-            "required": [
-                "session_id"
-            ],
             "properties": {
-                "replay": {
-                    "type": "boolean"
-                },
-                "session_id": {
-                    "type": "string"
+                "replay_since_seq": {
+                    "type": "integer"
                 }
             }
         },
@@ -4690,10 +6393,19 @@ const docTemplate = `{
                 "description": {
                     "type": "string"
                 },
+                "expertise": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "id": {
                     "type": "integer"
                 },
                 "name": {
+                    "type": "string"
+                },
+                "role_name": {
                     "type": "string"
                 },
                 "system_prompt": {
@@ -4719,7 +6431,9 @@ const docTemplate = `{
         "handler.UpdateLLMModelRequest": {
             "type": "object",
             "required": [
-                "id"
+                "id",
+                "name",
+                "purpose"
             ],
             "properties": {
                 "api_key": {
@@ -4741,6 +6455,9 @@ const docTemplate = `{
                 "is_default": {
                     "type": "boolean"
                 },
+                "max_tokens": {
+                    "type": "integer"
+                },
                 "model": {
                     "type": "string"
                 },
@@ -4750,8 +6467,11 @@ const docTemplate = `{
                 "provider": {
                     "type": "string"
                 },
-                "status": {
+                "purpose": {
                     "type": "string"
+                },
+                "temperature": {
+                    "type": "number"
                 }
             }
         },
@@ -4761,11 +6481,20 @@ const docTemplate = `{
                 "id"
             ],
             "properties": {
+                "department_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
                 "id": {
                     "type": "integer"
                 },
                 "is_default": {
                     "type": "boolean"
+                },
+                "name": {
+                    "type": "string"
                 },
                 "org_id": {
                     "type": "string"
@@ -4778,6 +6507,15 @@ const docTemplate = `{
                 "public_id"
             ],
             "properties": {
+                "address": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "logo": {
+                    "type": "string"
+                },
                 "name": {
                     "type": "string"
                 },
@@ -4788,6 +6526,9 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "type": {
+                    "type": "string"
+                },
+                "website": {
                     "type": "string"
                 }
             }
@@ -4800,6 +6541,12 @@ const docTemplate = `{
             "properties": {
                 "description": {
                     "type": "string"
+                },
+                "members": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/contract.MemberInput"
+                    }
                 },
                 "metadata": {
                     "type": "object",
@@ -4884,28 +6631,10 @@ const docTemplate = `{
                 "public_id"
             ],
             "properties": {
-                "avatar_url": {
-                    "type": "string"
-                },
-                "bio": {
-                    "type": "string"
-                },
-                "company": {
-                    "type": "string"
-                },
                 "email": {
                     "type": "string"
                 },
-                "github_login": {
-                    "type": "string"
-                },
-                "location": {
-                    "type": "string"
-                },
                 "name": {
-                    "type": "string"
-                },
-                "password": {
                     "type": "string"
                 },
                 "public_id": {
@@ -4913,11 +6642,247 @@ const docTemplate = `{
                 }
             }
         },
+        "handler.automationUpdateRequestBody": {
+            "type": "object",
+            "required": [
+                "public_id"
+            ],
+            "properties": {
+                "enabled": {
+                    "type": "boolean"
+                },
+                "instruction": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "project_public_id": {
+                    "description": "ProjectPublicID 关联项目三态：\n  nil：保持原关联；\"\"：切回默认新项目；非空：关联指定项目。",
+                    "type": "string"
+                },
+                "public_id": {
+                    "type": "string"
+                },
+                "schedule": {
+                    "$ref": "#/definitions/contract.AutomationScheduleInput"
+                },
+                "schedule_mode": {
+                    "description": "修改周期时必须提交完整 schedule",
+                    "type": "string"
+                },
+                "timezone": {
+                    "type": "string"
+                }
+            }
+        },
+        "handler.batchCheckPermissionItem": {
+            "type": "object",
+            "required": [
+                "action",
+                "resource"
+            ],
+            "properties": {
+                "action": {
+                    "type": "string"
+                },
+                "resource": {
+                    "type": "object",
+                    "required": [
+                        "public_id",
+                        "type"
+                    ],
+                    "properties": {
+                        "public_id": {
+                            "type": "string"
+                        },
+                        "type": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "handler.batchCheckPermissionRequest": {
+            "type": "object",
+            "required": [
+                "items"
+            ],
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/handler.batchCheckPermissionItem"
+                    }
+                }
+            }
+        },
+        "handler.deleteDepartmentRequest": {
+            "type": "object",
+            "required": [
+                "id"
+            ],
+            "properties": {
+                "id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "handler.deleteMemberDepartmentRequest": {
+            "type": "object",
+            "required": [
+                "id"
+            ],
+            "properties": {
+                "id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "handler.getDepartmentRequest": {
+            "type": "object",
+            "required": [
+                "id"
+            ],
+            "properties": {
+                "id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "handler.getMemberDepartmentRequest": {
+            "type": "object",
+            "required": [
+                "id"
+            ],
+            "properties": {
+                "id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "handler.issueWorkerTokenRequest": {
+            "type": "object",
+            "required": [
+                "org_id",
+                "worker_id"
+            ],
+            "properties": {
+                "bootstrap_token": {
+                    "type": "string"
+                },
+                "org_id": {
+                    "type": "integer"
+                },
+                "worker_id": {
+                    "type": "integer"
+                }
+            }
+        },
+        "handler.updateDepartmentRequest": {
+            "type": "object",
+            "required": [
+                "id"
+            ],
+            "properties": {
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "org_id": {
+                    "type": "integer"
+                },
+                "parent_id": {
+                    "type": "integer"
+                },
+                "sort": {
+                    "type": "integer"
+                }
+            }
+        },
+        "handler.updateMemberDepartmentRequest": {
+            "type": "object",
+            "required": [
+                "id"
+            ],
+            "properties": {
+                "department_id": {
+                    "type": "integer"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "is_primary": {
+                    "type": "boolean"
+                },
+                "uin": {
+                    "type": "integer"
+                }
+            }
+        },
+        "types.AutomationCalendarConfig": {
+            "type": "object",
+            "properties": {
+                "days_of_month": {
+                    "description": "DaysOfMonth 每月预设的日期集合（1-31）",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "days_of_week": {
+                    "description": "DaysOfWeek 每周预设的星期集合（0=周日，6=周六），0-6",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "hour": {
+                    "description": "Hour 小时（0-23）",
+                    "type": "integer"
+                },
+                "minute": {
+                    "description": "Minute 分钟（0-59）",
+                    "type": "integer"
+                },
+                "preset": {
+                    "description": "Preset 预设类型：daily/weekly/monthly/hourly",
+                    "type": "string"
+                }
+            }
+        },
+        "types.DigitalAssistantVisibility": {
+            "type": "string",
+            "enum": [
+                "public",
+                "private"
+            ],
+            "x-enum-varnames": [
+                "DigitalAssistantVisibilityPublic",
+                "DigitalAssistantVisibilityPrivate"
+            ]
+        },
+        "types.ExecutionMode": {
+            "type": "string",
+            "enum": [
+                "default",
+                "plan"
+            ],
+            "x-enum-varnames": [
+                "ExecutionModeDefault",
+                "ExecutionModePlan"
+            ]
+        },
         "types.MessageAttachment": {
             "type": "object",
             "properties": {
                 "PublicURL": {
-                    "description": "resolved at runtime, not exposed to front end",
+                    "type": "string"
+                },
+                "attachment_role": {
+                    "description": "AttachmentRole 是工具场景赋予附件的语义角色；空表示普通附件。",
                     "type": "string"
                 },
                 "file_upload_id": {
@@ -4929,7 +6894,7 @@ const docTemplate = `{
                 "name": {
                     "type": "string"
                 },
-                "purpose": {
+                "relative_path": {
                     "type": "string"
                 },
                 "size": {
@@ -4940,6 +6905,9 @@ const docTemplate = `{
         "types.MessageChunk": {
             "type": "object",
             "properties": {
+                "assistant_id": {
+                    "type": "string"
+                },
                 "last_seq": {
                     "type": "integer"
                 },
@@ -4960,6 +6928,12 @@ const docTemplate = `{
         "types.MessageUsage": {
             "type": "object",
             "properties": {
+                "cache_input_tokens": {
+                    "type": "integer"
+                },
+                "cache_output_tokens": {
+                    "type": "integer"
+                },
                 "input_tokens": {
                     "type": "integer"
                 },
@@ -4987,6 +6961,14 @@ const docTemplate = `{
                     "description": "元数据 - 对象存储键",
                     "type": "string"
                 },
+                "output_format": {
+                    "description": "OutputFormat 工具场景要求的最终交付格式（如 docx、pdf）。",
+                    "type": "string"
+                },
+                "scene": {
+                    "description": "Scene 新建任务场景（如 bid_comparison）；空表示普通问答。",
+                    "type": "string"
+                },
                 "tags": {
                     "description": "元数据 - 项目标签",
                     "type": "array",
@@ -4999,6 +6981,21 @@ const docTemplate = `{
                     "type": "string"
                 }
             }
+        },
+        "types.ResourceRole": {
+            "type": "string",
+            "enum": [
+                "owner",
+                "admin",
+                "member",
+                "viewer"
+            ],
+            "x-enum-varnames": [
+                "ResourceRoleOwner",
+                "ResourceRoleAdmin",
+                "ResourceRoleMember",
+                "ResourceRoleViewer"
+            ]
         }
     }
 }`

@@ -1,11 +1,11 @@
+import { app, BrowserWindow, ipcMain, net } from "electron";
 import {
 	type AppUpdater,
-	type UpdateDownloadedEvent,
-	type UpdateInfo,
 	MacUpdater,
 	NsisUpdater,
+	type UpdateDownloadedEvent,
+	type UpdateInfo,
 } from "electron-updater";
-import { app, BrowserWindow, ipcMain } from "electron";
 import {
 	type DesktopUpdateState,
 	desktopUpdateCheckChannel,
@@ -13,12 +13,19 @@ import {
 	desktopUpdateGetStateChannel,
 	desktopUpdateRestartChannel,
 } from "../shared/auto-update";
-import { markAppQuitting } from "./app-lifecycle";
+import { markAppQuitting, prepareForAppQuit } from "./app-lifecycle";
+import { isVersionNewer, parseLinuxUpdateMetadata } from "./linux-update";
 
 const autoUpdateIntervalMs = 30 * 60 * 1000;
 const initialAutoUpdateDelayMs = 1 * 1000;
-const desktopUpdateBaseURL = "https://leros-1395325824.cos.ap-beijing.myqcloud.com/application/stable";
+const desktopUpdateBaseURL =
+	"https://leros-1395325824.cos.ap-beijing.myqcloud.com/application/stable";
 const enableDevAutoUpdate = !app.isPackaged;
+const privateDeploymentUnsupportedMessage = "私有化版本请通过离线安装包更新";
+
+function isPrivateDeploymentBuild(): boolean {
+	return process.env.LEROS_DEPLOYMENT_MODE === "private";
+}
 
 let updateState: DesktopUpdateState = createState({
 	phase: "idle",
@@ -30,10 +37,6 @@ let updateState: DesktopUpdateState = createState({
 let updateHandlersRegistered = false;
 let autoUpdateTimer: NodeJS.Timeout | null = null;
 let updaterInstance: AppUpdater | null = null;
-
-type CheckForUpdatesOptions = {
-	manual?: boolean;
-};
 
 function createState(overrides: Partial<DesktopUpdateState>): DesktopUpdateState {
 	return {
@@ -94,12 +97,68 @@ function markUnsupported(message: string) {
 	});
 }
 
-function canUseAutoUpdate(): boolean {
-	return (app.isPackaged || enableDevAutoUpdate) && (process.platform === "darwin" || process.platform === "win32");
+function canUseNativeAutoUpdate(): boolean {
+	return (
+		(app.isPackaged || enableDevAutoUpdate) &&
+		(process.platform === "darwin" || process.platform === "win32")
+	);
 }
 
 function getUpdateFeedURL(): string {
 	return `${desktopUpdateBaseURL}/${process.platform}/${process.arch}`;
+}
+
+function canCheckLinuxUpdates(): boolean {
+	return (app.isPackaged || enableDevAutoUpdate) && process.platform === "linux";
+}
+
+async function checkLinuxUpdates(): Promise<DesktopUpdateState> {
+	setState({
+		phase: "checking",
+		message: "正在检查 Linux 更新",
+		canCheck: false,
+		canRestart: false,
+		progressPercent: undefined,
+	});
+
+	const metadataURL = new URL("latest-linux.yml", `${getUpdateFeedURL()}/`);
+	metadataURL.searchParams.set("t", Date.now().toString());
+	const response = await net.fetch(metadataURL.toString(), { cache: "no-store" });
+	if (!response.ok) {
+		throw new Error(`检查 Linux 更新失败（HTTP ${response.status}）`);
+	}
+
+	const metadata = parseLinuxUpdateMetadata(await response.text());
+	const lastCheckedAt = new Date().toISOString();
+	if (isVersionNewer(metadata.version, app.getVersion())) {
+		setState({
+			phase: "available",
+			message: `发现新版本 v${metadata.version}，请下载 .deb 安装包后手动安装`,
+			availableVersion: metadata.version,
+			downloadedVersion: undefined,
+			releaseDate: metadata.releaseDate,
+			releaseNotes: undefined,
+			progressPercent: undefined,
+			canCheck: true,
+			canRestart: false,
+			lastCheckedAt,
+		});
+		return updateState;
+	}
+
+	setState({
+		phase: "up-to-date",
+		message: "当前已经是最新版本",
+		availableVersion: undefined,
+		downloadedVersion: undefined,
+		releaseDate: undefined,
+		releaseNotes: undefined,
+		progressPercent: undefined,
+		canCheck: true,
+		canRestart: false,
+		lastCheckedAt,
+	});
+	return updateState;
 }
 
 function getUpdater(): AppUpdater | null {
@@ -151,6 +210,22 @@ function registerAutoUpdaterEvents() {
 	});
 
 	updater.on("update-available", (info) => {
+		const downloadedVersion = updateState.downloadedVersion;
+		if (downloadedVersion && downloadedVersion === info.version) {
+			setState({
+				phase: "downloaded",
+				message: "更新已下载完成，重启后安装",
+				availableVersion: info.version,
+				releaseDate: info.releaseDate,
+				releaseNotes: getReleaseNotes(info),
+				progressPercent: 100,
+				canCheck: true,
+				canRestart: true,
+				lastCheckedAt: new Date().toISOString(),
+			});
+			return;
+		}
+
 		setState({
 			phase: "available",
 			message: "发现新版本，开始后台下载",
@@ -215,13 +290,29 @@ function registerAutoUpdaterEvents() {
 	});
 }
 
-async function checkForUpdates(options: CheckForUpdatesOptions = {}): Promise<DesktopUpdateState> {
-	if (!options.manual && updateState.phase === "downloaded" && updateState.downloadedVersion) {
+export async function checkDesktopUpdates(): Promise<DesktopUpdateState> {
+	if (isPrivateDeploymentBuild()) {
 		return updateState;
 	}
 
-	if (!canUseAutoUpdate()) {
-		markUnsupported("自动更新仅在已安装的 macOS / Windows 版本中可用");
+	if (canCheckLinuxUpdates()) {
+		try {
+			return await checkLinuxUpdates();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "检查 Linux 更新失败";
+			setState({
+				phase: "error",
+				message,
+				canCheck: true,
+				canRestart: false,
+				lastCheckedAt: new Date().toISOString(),
+			});
+			return updateState;
+		}
+	}
+
+	if (!canUseNativeAutoUpdate()) {
+		markUnsupported("当前平台不支持自动更新");
 		return updateState;
 	}
 
@@ -253,16 +344,18 @@ function scheduleAutoUpdateChecks() {
 	}
 
 	setTimeout(() => {
-		void checkForUpdates();
+		void checkDesktopUpdates();
 	}, initialAutoUpdateDelayMs);
 
 	autoUpdateTimer = setInterval(() => {
-		void checkForUpdates();
+		void checkDesktopUpdates();
 	}, autoUpdateIntervalMs);
 }
 
 export function registerDesktopAutoUpdate() {
-	if (canUseAutoUpdate()) {
+	if (isPrivateDeploymentBuild()) {
+		markUnsupported(privateDeploymentUnsupportedMessage);
+	} else if (canUseNativeAutoUpdate()) {
 		registerAutoUpdaterEvents();
 		setState({
 			phase: "idle",
@@ -273,15 +366,23 @@ export function registerDesktopAutoUpdate() {
 			canRestart: false,
 		});
 		scheduleAutoUpdateChecks();
+	} else if (canCheckLinuxUpdates()) {
+		setState({
+			phase: "idle",
+			message: "Linux 可检查新版本，.deb 安装包需要手动安装",
+			canCheck: true,
+			canRestart: false,
+		});
+		scheduleAutoUpdateChecks();
 	} else {
-		markUnsupported("开发环境不执行自动更新，请使用安装包验证");
+		markUnsupported("当前平台不支持自动更新");
 	}
 
 	ipcMain.handle(desktopUpdateGetStateChannel, () => updateState);
 	ipcMain.handle(desktopUpdateCheckChannel, async () => {
-		return checkForUpdates({ manual: true });
+		return checkDesktopUpdates();
 	});
-	ipcMain.handle(desktopUpdateRestartChannel, () => {
+	ipcMain.handle(desktopUpdateRestartChannel, async () => {
 		if (!updateState.canRestart) {
 			return false;
 		}
@@ -292,6 +393,7 @@ export function registerDesktopAutoUpdate() {
 		}
 
 		markAppQuitting();
+		await prepareForAppQuit();
 		updater.quitAndInstall();
 		return true;
 	});

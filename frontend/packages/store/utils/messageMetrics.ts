@@ -1,11 +1,13 @@
 import type { ComposerToken, Message, MessageMetadata, MessageUsage } from "../types/chat";
-import { formatLatency, formatTokenCount } from "./format";
 
 type MetadataSource = {
 	model?: string;
 	tokens?: number;
 	latency?: number;
 	composerTokens?: ComposerToken[];
+	displayContent?: string;
+	displayComposerTokens?: ComposerToken[];
+	invokedAssistant?: MessageMetadata["invokedAssistant"];
 	extra?: Record<string, unknown>;
 };
 
@@ -34,13 +36,30 @@ function pickComposerTokens(...values: unknown[]): ComposerToken[] | undefined {
 			if (typeof item !== "object" || item === null) return false;
 			const token = item as Partial<ComposerToken>;
 			return (
-				(token.kind === "assistant" || token.kind === "skill") &&
+				(token.kind === "assistant" || token.kind === "skill" || token.kind === "reference") &&
 				typeof token.label === "string" &&
 				typeof token.start === "number" &&
 				typeof token.end === "number"
 			);
 		});
 		if (tokens.length > 0) return tokens;
+	}
+	return undefined;
+}
+
+function pickInvokedAssistant(...values: unknown[]): MessageMetadata["invokedAssistant"] {
+	for (const value of values) {
+		if (typeof value !== "object" || value === null) continue;
+		const assistant = value as Partial<NonNullable<MessageMetadata["invokedAssistant"]>>;
+		if (typeof assistant.name !== "string" || !assistant.name.trim()) continue;
+		const result: NonNullable<MessageMetadata["invokedAssistant"]> = {
+			name: assistant.name.trim(),
+		};
+		if (typeof assistant.id === "string" && assistant.id.trim()) result.id = assistant.id.trim();
+		if (typeof assistant.avatarUrl === "string" && assistant.avatarUrl.trim()) {
+			result.avatarUrl = assistant.avatarUrl.trim();
+		}
+		return result;
 	}
 	return undefined;
 }
@@ -69,32 +88,36 @@ export function buildMessageMetadata(
 	const tokens = pickNumber(metadata?.tokens, extra?.tokens, usage?.totalTokens);
 	const latency = pickNumber(metadata?.latency, extra?.latency, extra?.latency_ms);
 	const composerTokens = pickComposerTokens(metadata?.composerTokens, extra?.composerTokens);
+	const displayContent = pickString(metadata?.displayContent, extra?.displayContent);
+	const displayComposerTokens = pickComposerTokens(
+		metadata?.displayComposerTokens,
+		extra?.displayComposerTokens,
+	);
+	const invokedAssistant = pickInvokedAssistant(
+		metadata?.invokedAssistant,
+		extra?.invokedAssistant,
+	);
 
-	if (!model && tokens === undefined && latency === undefined && !composerTokens) {
+	if (
+		!model &&
+		tokens === undefined &&
+		latency === undefined &&
+		!composerTokens &&
+		!displayContent &&
+		!displayComposerTokens &&
+		!invokedAssistant
+	) {
 		return undefined;
 	}
-	return { model, tokens, latency, composerTokens };
-}
-
-/** 读取单条 assistant 消息的 tokens / latency 原始指标。 */
-function getAssistantMessageMetrics(message: Message): MessageMetadata | undefined {
-	if (message.role !== "assistant") return undefined;
-	return buildMessageMetadata(message.metadata, message.usage);
-}
-
-/** 生成消息 footer 展示片段：仅耗时与 token 用量。 */
-export function getAssistantMessageFooterSegments(message: Message): string[] {
-	const metrics = getAssistantMessageMetrics(message);
-	if (!metrics) return [];
-
-	const segments: string[] = [];
-	if (metrics.latency !== undefined) {
-		segments.push(formatLatency(metrics.latency));
-	}
-	if (metrics.tokens !== undefined) {
-		segments.push(`${formatTokenCount(metrics.tokens)} Tokens`);
-	}
-	return segments;
+	return {
+		model,
+		tokens,
+		latency,
+		composerTokens,
+		displayContent,
+		displayComposerTokens,
+		invokedAssistant,
+	};
 }
 
 /** 将 usage 中的 token 总数回填到 metadata，便于统一展示逻辑。 */

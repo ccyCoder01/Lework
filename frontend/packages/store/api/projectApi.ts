@@ -6,10 +6,17 @@ import type {
 	BackendProjectDetail,
 } from "./types";
 
+export type ProjectMemberInput = {
+	type: "assistant" | "user";
+	id: string;
+	role?: string;
+};
+
 export type CreateProjectParams = {
 	name: string;
 	description?: string;
 	objective?: string;
+	members?: ProjectMemberInput[];
 	metadata?: Record<string, unknown>;
 };
 
@@ -32,10 +39,15 @@ export type UpdateProjectParams = {
 	objective?: string;
 	status?: string;
 	owner_id?: number;
+	members?: ProjectMemberInput[];
 	metadata?: Record<string, unknown>;
 };
 
 export type DeleteProjectParams = {
+	public_id: string;
+};
+
+export type LeaveProjectParams = {
 	public_id: string;
 };
 
@@ -45,6 +57,7 @@ const PROJECT_ENDPOINTS = {
 	get: "/GetProject",
 	detail: "/DetailProject",
 	update: "/UpdateProject",
+	leave: "/LeaveProject",
 	delete: "/DeleteProject",
 };
 
@@ -66,4 +79,7 @@ export const projectApi = {
 
 	delete: (params: DeleteProjectParams) =>
 		apiClient.post<BackendDataResponse<null>>(PROJECT_ENDPOINTS.delete, params),
+
+	leave: (params: LeaveProjectParams) =>
+		apiClient.post<BackendDataResponse<null>>(PROJECT_ENDPOINTS.leave, params),
 };

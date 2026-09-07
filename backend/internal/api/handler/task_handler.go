@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -8,14 +10,16 @@ import (
 
 	"github.com/insmtx/Leros/backend/internal/api/contract"
 	"github.com/insmtx/Leros/backend/internal/api/dto"
+	"github.com/insmtx/Leros/backend/types"
 )
 
 type TaskHandler struct {
 	service contract.TaskService
+	permSvc PermGuarder
 }
 
-func NewTaskHandler(service contract.TaskService) *TaskHandler {
-	return &TaskHandler{service: service}
+func NewTaskHandler(service contract.TaskService, permSvc PermGuarder) *TaskHandler {
+	return &TaskHandler{service: service, permSvc: permSvc}
 }
 
 // ================================================================
@@ -23,15 +27,71 @@ func NewTaskHandler(service contract.TaskService) *TaskHandler {
 // ================================================================
 
 func (h *TaskHandler) RegisterRoutes(r gin.IRouter) {
-	r.POST("/CreateTask", h.CreateTask)
-	r.POST("/GetTask", h.GetTask)
-	r.POST("/UpdateTask", h.UpdateTask)
-	r.POST("/DeleteTask", h.DeleteTask)
+	r.POST("/CreateTask",
+		PermGuardProjectTaskAction(h.permSvc, extractCreateTaskProjectID, types.ActionTaskCreate),
+		h.CreateTask,
+	)
+	r.POST("/GetTask",
+		PermGuard(h.permSvc, types.ResourceTypeTask, types.ActionTaskView, extractTaskPublicID),
+		h.GetTask,
+	)
+	r.POST("/UpdateTask",
+		PermGuard(h.permSvc, types.ResourceTypeTask, types.ActionTaskUpdate, extractUpdateTaskPublicID),
+		h.UpdateTask,
+	)
+	r.POST("/DeleteTask",
+		PermGuard(h.permSvc, types.ResourceTypeTask, types.ActionTaskDelete, extractDeleteTaskPublicID),
+		h.DeleteTask,
+	)
 	r.POST("/ListTasks", h.ListTasks)
 }
 
-func RegisterTaskRoutes(r gin.IRouter, service contract.TaskService) {
-	h := NewTaskHandler(service)
+// extractTaskPublicID 从请求 body 提取任务 public_id，供 PermGuard 使用。
+func extractTaskPublicID(body []byte) (string, error) {
+	var req struct {
+		PublicID *string `json:"public_id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return "", err
+	}
+	if req.PublicID == nil || *req.PublicID == "" {
+		return "", errors.New("public_id is required")
+	}
+	return *req.PublicID, nil
+}
+
+func extractCreateTaskProjectID(body []byte) (string, error) {
+	var req struct {
+		ProjectID string `json:"project_id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return "", err
+	}
+	if req.ProjectID == "" {
+		return "", errors.New("project_id is required")
+	}
+	return req.ProjectID, nil
+}
+
+func extractUpdateTaskPublicID(body []byte) (string, error) {
+	var req struct {
+		PublicID string `json:"public_id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return "", err
+	}
+	if req.PublicID == "" {
+		return "", errors.New("public_id is required")
+	}
+	return req.PublicID, nil
+}
+
+func extractDeleteTaskPublicID(body []byte) (string, error) {
+	return extractUpdateTaskPublicID(body)
+}
+
+func RegisterTaskRoutes(r gin.IRouter, service contract.TaskService, permSvc PermGuarder) {
+	h := NewTaskHandler(service, permSvc)
 	h.RegisterRoutes(r)
 }
 
@@ -96,6 +156,7 @@ func (h *TaskHandler) GetTask(ctx *gin.Context) {
 		return
 	}
 
+	// 权限已由路由链上的 PermGuard 在 handler 执行前完成检查，此处直接调用服务
 	result, err := h.service.GetTask(ctx, *req.PublicID)
 	if err != nil {
 		handleTaskServiceError(ctx, err)
@@ -203,7 +264,7 @@ func handleTaskServiceError(ctx *gin.Context, err error) {
 
 	switch errMsg {
 	case "user not authenticated or org not set":
-		ctx.JSON(http.StatusUnauthorized, dto.Error(dto.CodeInternalError, errMsg))
+		ctx.JSON(http.StatusUnauthorized, dto.Error(dto.CodeUnauthorized, errMsg))
 		return
 	}
 
@@ -217,6 +278,10 @@ func handleTaskServiceError(ctx *gin.Context, err error) {
 		"project_id is required":
 		ctx.JSON(http.StatusBadRequest, dto.Error(dto.CodeInvalidParams, errMsg))
 	default:
+		if isPermissionDenied(err) {
+			ctx.JSON(http.StatusForbidden, dto.Error(dto.CodeForbidden, errMsg))
+			return
+		}
 		ctx.JSON(http.StatusInternalServerError, dto.Error(dto.CodeInternalError, errMsg))
 	}
 }

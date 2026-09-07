@@ -8,10 +8,10 @@ import "gorm.io/gorm"
 // 每个用户可以关联多个组织，其中一个可以标记为默认组织。
 type UserOrg struct {
 	gorm.Model
-	Uin       uint `gorm:"column:uin;type:bigint;unique_index;not null"` // 关联ID，JWT中的Uin
-	UserID    uint `gorm:"column:user_id;type:bigint;index;not null"`    // 用户ID
-	OrgID     uint `gorm:"column:org_id;type:bigint;index;not null"`     // 组织ID
-	IsDefault bool `gorm:"column:is_default;type:boolean;default:false"` // 是否为默认组织
+	ExternalUin uint `gorm:"column:external_uin;index"`                                                 // identity-platform UIN.ID
+	UserID      uint `gorm:"column:user_id;type:bigint;index;not null;uniqueIndex:uni_user_org_member"` // 用户ID
+	OrgID       uint `gorm:"column:org_id;type:bigint;index;not null;uniqueIndex:uni_user_org_member"`  // 组织ID
+	IsDefault   bool `gorm:"column:is_default;type:boolean;default:false"`                              // 是否为默认组织
 }
 
 // TableName 重写表名

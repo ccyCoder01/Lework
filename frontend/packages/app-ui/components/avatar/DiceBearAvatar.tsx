@@ -8,6 +8,25 @@ import { useMemo } from "react";
 const notionistsStyle = new Style(notionists);
 const DEFAULT_BACKGROUND_COLOR = "#4f46e5";
 
+/** 为 React 组件和原生 DOM mention 统一生成 AI 队友兜底头像。 */
+export function createDiceBearAvatarDataUri(
+	seed: string,
+	size = 128,
+	backgroundColor = DEFAULT_BACKGROUND_COLOR,
+): string | null {
+	try {
+		return new Avatar(notionistsStyle, {
+			seed,
+			size,
+			borderRadius: 50,
+			backgroundColor: [backgroundColor],
+		}).toDataUri();
+	} catch (err) {
+		console.error("generate DiceBear avatar error:", err);
+		return null;
+	}
+}
+
 export function DiceBearAvatar({
 	seed,
 	alt,
@@ -21,25 +40,16 @@ export function DiceBearAvatar({
 	size?: number;
 	backgroundColor?: string;
 }) {
-	const src = useMemo(() => {
-		try {
-			return new Avatar(notionistsStyle, {
-				seed,
-				size,
-				borderRadius: 50,
-				backgroundColor: [backgroundColor],
-			}).toDataUri();
-		} catch (err) {
-			console.error("generate DiceBear avatar error:", err);
-			return null;
-		}
-	}, [backgroundColor, seed, size]);
+	const src = useMemo(
+		() => createDiceBearAvatarDataUri(seed, size, backgroundColor),
+		[backgroundColor, seed, size],
+	);
 
 	if (!src) {
 		return (
 			<span
 				className={cn(
-					"flex aspect-square items-center justify-center rounded-full bg-[var(--leros-primary)] font-bold text-white",
+					"flex aspect-square items-center justify-center rounded-full bg-[var(--leros-primary)] font-semibold text-white",
 					className,
 				)}
 			>

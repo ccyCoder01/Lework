@@ -51,42 +51,6 @@ const (
 	MemberRoleViewer MemberRole = "viewer"
 )
 
-// SkillCategory 表示技能的类别（如 integration, tool, workflow, ai 等）
-type SkillCategory string
-
-const (
-	// SkillCategoryIntegration 表示集成类技能
-	SkillCategoryIntegration SkillCategory = "integration"
-	// SkillCategoryTool 表示工具类技能
-	SkillCategoryTool SkillCategory = "tool"
-	// SkillCategoryWorkflow 表示工作流技能
-	SkillCategoryWorkflow SkillCategory = "workflow"
-	// SkillCategoryAI 表示AI类技能
-	SkillCategoryAI SkillCategory = "ai"
-)
-
-// SkillType 表示技能类型（本地技能或远程技能）
-type SkillType string
-
-const (
-	// SkillTypeLocal 表示本地技能
-	SkillTypeLocal SkillType = "local"
-	// SkillTypeRemote 表示远程技能
-	SkillTypeRemote SkillType = "remote"
-)
-
-// SkillRegistryStatus 表示技能注册状态
-type SkillRegistryStatus string
-
-const (
-	// SkillRegistryStatusRegistered 表示已注册
-	SkillRegistryStatusRegistered SkillRegistryStatus = "registered"
-	// SkillRegistryStatusUnregistered 表示未注册
-	SkillRegistryStatusUnregistered SkillRegistryStatus = "unregistered"
-	// SkillRegistryStatusUnhealthy 表示不健康
-	SkillRegistryStatusUnhealthy SkillRegistryStatus = "unhealthy"
-)
-
 // ChannelType 表示渠道类型标识
 type ChannelType string
 
@@ -204,30 +168,71 @@ const (
 	TaskTypeCron    TaskType = "cron"
 )
 
+// AutomationScheduleMode 表示自动化的底层调度计算模式
+type AutomationScheduleMode string
+
+const (
+	// AutomationScheduleVersion 当前规范化调度规则版本。
+	AutomationScheduleVersion = 2
+	// AutomationScheduleModeCalendar 按本地日历边界执行
+	AutomationScheduleModeCalendar AutomationScheduleMode = "calendar"
+	// AutomationScheduleModeInterval 从起算时间开始按固定时长执行
+	AutomationScheduleModeInterval AutomationScheduleMode = "interval"
+)
+
+// AutomationCalendarPreset 表示日历类预设类型。
+//
+// 预设只用于前端表单生成/回显配置，不参与后端执行算法选择；执行算法只依赖
+// calendar/interval 两种规范化规则。
+type AutomationCalendarPreset string
+
+const (
+	AutomationPresetDaily   AutomationCalendarPreset = "daily"
+	AutomationPresetWeekly  AutomationCalendarPreset = "weekly"
+	AutomationPresetMonthly AutomationCalendarPreset = "monthly"
+	AutomationPresetHourly  AutomationCalendarPreset = "hourly"
+)
+
+// AutomationExecutionStatus 表示一次自动化执行的生命周期状态
+type AutomationExecutionStatus string
+
+const (
+	// AutomationExecutionQueued 已生成，等待派发
+	AutomationExecutionQueued AutomationExecutionStatus = "queued"
+	// AutomationExecutionRunning 已派发并开始执行
+	AutomationExecutionRunning AutomationExecutionStatus = "running"
+	// AutomationExecutionSucceeded 执行成功
+	AutomationExecutionSucceeded AutomationExecutionStatus = "succeeded"
+	// AutomationExecutionFailed 执行失败
+	AutomationExecutionFailed AutomationExecutionStatus = "failed"
+	// AutomationExecutionSkipped 因上一轮仍活跃等原因被跳过
+	AutomationExecutionSkipped AutomationExecutionStatus = "skipped"
+)
+
+// AutomationExecutionTriggerType 表示一次执行的触发来源
+type AutomationExecutionTriggerType string
+
+const (
+	// AutomationTriggerScheduled 周期触发
+	AutomationTriggerScheduled AutomationExecutionTriggerType = "scheduled"
+	// AutomationTriggerManual 手动触发（立即运行）
+	AutomationTriggerManual AutomationExecutionTriggerType = "manual"
+)
+
 // ArtifactType 表示产出物的类型
 type ArtifactType string
 
 const (
-	// ArtifactTypeText 文本内容（文档、代码、报告等）
-	ArtifactTypeText ArtifactType = "text"
-	// ArtifactTypeStructuredData 结构化数据（JSON、表格、CSV）
-	ArtifactTypeStructuredData ArtifactType = "structured_data"
 	// ArtifactTypeFile 文件附件（图片、压缩包、二进制）
 	ArtifactTypeFile ArtifactType = "file"
-	// ArtifactTypeComposite 复合产物（多种类型混合）
-	ArtifactTypeComposite ArtifactType = "composite"
 )
 
 // ArtifactStatus 表示产出物的状态
 type ArtifactStatus string
 
 const (
-	// ArtifactStatusGenerating 产出物生成中
-	ArtifactStatusGenerating ArtifactStatus = "generating"
 	// ArtifactStatusCompleted 产出物已完成
 	ArtifactStatusCompleted ArtifactStatus = "completed"
-	// ArtifactStatusFailed 产出物生成失败
-	ArtifactStatusFailed ArtifactStatus = "failed"
 )
 
 // ArtifactSource 表示产出物记录来源。

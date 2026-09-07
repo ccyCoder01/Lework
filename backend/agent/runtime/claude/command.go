@@ -7,13 +7,12 @@ import (
 	"strings"
 
 	"github.com/insmtx/Leros/backend/agent"
-	"github.com/insmtx/Leros/backend/agent/runtime/externalcli"
-	"github.com/insmtx/Leros/backend/agent/runtime/provider"
+	"github.com/insmtx/Leros/backend/agent/runtime/internal/cli"
 )
 
 // ——— 参数构建 ———
 
-func buildArgs(req externalcli.InvocationRequest) []string {
+func buildArgs(req cli.InvocationRequest) []string {
 	args := []string{
 		"--verbose",
 		"--output-format", "stream-json",
@@ -25,9 +24,9 @@ func buildArgs(req externalcli.InvocationRequest) []string {
 
 	// 权限模式决定是否绕过审批
 	switch req.PermissionMode {
-	case provider.PermissionModeBypass, "":
+	case agent.PermissionModeBypass, "":
 		args = append(args, "--dangerously-skip-permissions", "--permission-mode", "bypassPermissions")
-	case provider.PermissionModeOnRequest, provider.PermissionModeAuto:
+	case agent.PermissionModeOnRequest, agent.PermissionModeAuto:
 		// on-request 和 auto 均使用 default 模式；auto 由 ApprovalHandler 处理
 		args = append(args, "--permission-mode", "default")
 	}
@@ -57,7 +56,7 @@ type lerosSettings struct {
 }
 
 // buildLerosSettings 根据本次请求构建 leros settings 配置。
-func buildLerosSettings(req externalcli.InvocationRequest) *lerosSettings {
+func buildLerosSettings(req cli.InvocationRequest) *lerosSettings {
 	model := strings.TrimSpace(req.Model.Model)
 	baseURL := withoutV1Suffix(req.Model.BaseURL)
 	apiKey := strings.TrimSpace(req.Model.APIKey)
@@ -112,7 +111,7 @@ func claudeModelEnv(_ agent.ModelConfig) map[string]string {
 
 // writeMCPConfig 将 MCPServerConfig 列表转为 Claude mcpServers JSON，写入 dir/mcp_config.json。
 // 返回文件路径，调用方负责在不再需要时删除。
-func writeMCPConfig(dir string, servers []provider.MCPServerConfig) (string, error) {
+func writeMCPConfig(dir string, servers []agent.MCPServerConfig) (string, error) {
 	mcpServers := make(map[string]any, len(servers))
 	for _, s := range servers {
 		name := strings.TrimSpace(s.Name)
@@ -130,11 +129,19 @@ func writeMCPConfig(dir string, servers []provider.MCPServerConfig) (string, err
 			}
 		} else if s.URL != "" {
 			entry["type"] = "http"
+			if strings.EqualFold(s.Transport, "sse") {
+				entry["type"] = "sse"
+			}
 			entry["url"] = s.URL
-			if s.BearerToken != "" {
-				entry["headers"] = map[string]string{
-					"Authorization": "Bearer " + s.BearerToken,
+			headers := cloneMCPHeaders(s.Headers)
+			if s.BearerToken != "" && !containsMCPHeader(headers, "authorization") {
+				if headers == nil {
+					headers = make(map[string]string)
 				}
+				headers["Authorization"] = "Bearer " + s.BearerToken
+			}
+			if len(headers) > 0 {
+				entry["headers"] = headers
 			}
 		}
 		mcpServers[name] = entry
@@ -152,6 +159,26 @@ func writeMCPConfig(dir string, servers []provider.MCPServerConfig) (string, err
 		return "", err
 	}
 	return path, nil
+}
+
+func cloneMCPHeaders(source map[string]string) map[string]string {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func containsMCPHeader(headers map[string]string, target string) bool {
+	for key := range headers {
+		if strings.EqualFold(key, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // ——— 通用工具 ———

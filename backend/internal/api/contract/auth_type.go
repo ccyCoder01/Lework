@@ -1,59 +1,55 @@
 package contract
 
+import "github.com/insmtx/Leros/backend/internal/adapter/account"
+
 type RegisterByEmailRequest struct {
-	Email           string `json:"email" binding:"required"`
-	Password        string `json:"password" binding:"required"`
-	ConfirmPassword string `json:"confirm_password" binding:"required"`
-	Name            string `json:"name,omitempty"`
+	account.RegisterByEmailInput
 }
 
-type LoginByEmailRequest struct {
-	Email    string `json:"email" binding:"required"`
-	Password string `json:"password" binding:"required"`
+type LoginByPasswordRequest struct {
+	account.LoginByPasswordInput
 }
 
 type SendPhoneLoginCodeRequest struct {
-	Phone string `json:"phone" binding:"required"`
+	account.SendPhoneLoginCodeInput
 }
 
 type SendPhoneLoginCodeResponse struct {
-	Phone       string `json:"phone"`
-	ExpiresIn   int64  `json:"expires_in"`
-	ResendAfter int64  `json:"resend_after"`
+	account.SendPhoneLoginCodeOutput
 }
 
 type LoginByPhoneCodeRequest struct {
-	Phone string `json:"phone" binding:"required"`
-	Code  string `json:"code" binding:"required"`
+	account.LoginByPhoneCodeInput
 }
 
 type RefreshTokenRequest struct {
-	RefreshToken string `json:"refresh_token" binding:"required"`
+	account.RefreshTokenInput
 }
 
-type AuthTokenResponse struct {
-	LoginStatus  string       `json:"login_status"`
-	JwtToken     string       `json:"jwt_token"`
-	RefreshToken string       `json:"refresh_token"`
-	ExpiredAt    int64        `json:"expired_at"`
-	Uin          uint         `json:"uin"`
-	UserInfo     AuthUserInfo `json:"user_info"`
-	Org          AuthOrgInfo  `json:"org"`
+type ChooseUinRequest struct {
+	account.ChooseUinInput
+}
+
+type SwitchOrganizationRequest struct {
+	account.SwitchOrganizationInput
+}
+
+type CreateOrganizationRequest struct {
+	account.CreateOrganizationInput
+}
+
+type SwitchOrganizationResponse struct {
+	JwtToken string `json:"jwt_token"`
+}
+
+type AuthSessionResponse struct {
+	account.AuthSessionOutput
 }
 
 type AuthUserInfo struct {
-	ID          uint   `json:"id"`
-	PublicID    string `json:"public_id"`
-	Name        string `json:"name"`
-	Email       string `json:"email"`
-	Phone       string `json:"phone,omitempty"`
-	GithubLogin string `json:"github_login,omitempty"`
-	AvatarURL   string `json:"avatar_url,omitempty"`
+	account.AuthUserInfo
 }
 
 type AuthOrgInfo struct {
-	ID       uint   `json:"id"`
-	PublicID string `json:"public_id"`
-	Code     string `json:"code"`
-	Name     string `json:"name"`
+	account.AuthOrgInfo
 }

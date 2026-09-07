@@ -1,51 +1,15 @@
+import type { OutgoingMessageAttachment } from "../utils/messageAttachments";
 import { apiClient } from "./client";
 import { API_BASE_URL } from "./config";
 import type {
 	BackendDataResponse,
 	BackendMessage,
 	BackendMessageChunk,
+	BackendMessageMetadata,
+	BackendNewMessageData,
 	BackendPaginatedResponse,
 	BackendSession,
 } from "./types";
-
-export type CreateSessionParams = {
-	type: string;
-	title?: string;
-	assistant_id?: number;
-	assistant_code?: string;
-	session_id?: string;
-	user_id?: number;
-	expired_at?: string;
-	metadata?: {
-		user_agent?: string;
-		ip_address?: string;
-		tags?: string[];
-		extra?: Record<string, unknown>;
-	};
-};
-
-export type UpdateSessionParams = {
-	session_id: string;
-	title?: string;
-	expired_at?: string;
-	metadata?: {
-		user_agent?: string;
-		ip_address?: string;
-		tags?: string[];
-		extra?: Record<string, unknown>;
-	};
-};
-
-export type ListSessionsParams = {
-	page?: number;
-	per_page?: number;
-	type?: string;
-	status?: string;
-	keyword?: string;
-	assistant_id?: number;
-	assistant_code?: string;
-	user_id?: number;
-};
 
 export type GetSessionParams = {
 	id?: number;
@@ -57,13 +21,14 @@ export type AddMessageParams = {
 	role: string;
 	content: string;
 	execution_mode?: "default" | "plan";
+	assistant_ids?: string[];
+	connector_ids?: string[];
 	message_type?: string;
-	attachments?: {
-		file_upload_id: string;
-		name: string;
-		mime_type: string;
-		size?: number;
-	}[];
+	/** 工具场景：空/normal=普通问答，bid_comparison=标书对比 */
+	scene?: string;
+	/** 工具场景要求的最终交付格式，例如 docx、pdf、pptx、md */
+	output_format?: string;
+	attachments?: OutgoingMessageAttachment[];
 	thinking?: string;
 	metadata?: {
 		source?: string;
@@ -100,42 +65,45 @@ export type SubmitApprovalDecisionParams = {
 	request_id: string;
 	action: ApprovalDecisionAction;
 	reason?: string;
+	assistant_id: string;
 };
 
 export type SubmitQuestionAnswerParams = {
 	session_id: string;
 	request_id: string;
 	answers: string[][];
+	assistant_id: string;
+};
+
+export type CreateInitialMessageParams = {
+	content: string;
+	execution_mode?: "default" | "plan";
+	project_id?: string;
+	task_id?: string;
+	message_type?: string;
+	assistant_ids?: string[];
+	connector_ids?: string[];
+	/** 新建任务场景：空/normal=普通问答，bid_comparison=标书对比 */
+	scene?: string;
+	/** 工具场景要求生成的最终交付格式，例如 docx、pdf、pptx、md */
+	output_format?: string;
+	metadata?: BackendMessageMetadata;
+	attachments?: OutgoingMessageAttachment[];
 };
 
 const SESSION_ENDPOINTS = {
-	create: "/CreateSession",
-	list: "/ListSessions",
 	get: "/GetSession",
-	update: "/UpdateSession",
-	delete: "/DeleteSession",
 	addMessage: "/AddMessage",
 	getMessages: "/GetSessionMessages",
 	deleteMessage: "/DeleteMessage",
 	clearMessages: "/ClearSessionMessages",
 	sessionEvents: "/SessionEvents",
+	createInitialMessage: "/CreateInitialMessage",
 };
 
 export const sessionApi = {
-	create: (params: CreateSessionParams) =>
-		apiClient.post<BackendDataResponse<BackendSession>>(SESSION_ENDPOINTS.create, params),
-
-	list: (params: ListSessionsParams) =>
-		apiClient.post<BackendPaginatedResponse<BackendSession>>(SESSION_ENDPOINTS.list, params),
-
 	get: (params: GetSessionParams) =>
 		apiClient.post<BackendDataResponse<BackendSession>>(SESSION_ENDPOINTS.get, params),
-
-	update: (params: UpdateSessionParams) =>
-		apiClient.post<BackendDataResponse<BackendSession>>(SESSION_ENDPOINTS.update, params),
-
-	delete: (sessionId: string) =>
-		apiClient.post<BackendDataResponse<null>>(SESSION_ENDPOINTS.delete, { session_id: sessionId }),
 
 	addMessage: (params: AddMessageParams) =>
 		apiClient.post<BackendDataResponse<BackendMessage>>(SESSION_ENDPOINTS.addMessage, params),
@@ -165,8 +133,9 @@ export const sessionApi = {
 				payload: {
 					request_id: params.request_id,
 					action: params.action,
-					...(params.reason ? { reason: params.reason } : {}),
+					assistant_id: params.assistant_id,
 				},
+				...(params.reason ? { reason: params.reason } : {}),
 			},
 		),
 
@@ -178,6 +147,7 @@ export const sessionApi = {
 				payload: {
 					request_id: params.request_id,
 					answers: params.answers,
+					assistant_id: params.assistant_id,
 				},
 			},
 		),
@@ -185,12 +155,19 @@ export const sessionApi = {
 	getSessionEventsURL: (_sessionId?: string, _lastSequence?: number) =>
 		`${API_BASE_URL}/SessionEvents`,
 
-	cancelSessionRun: (params: { session_id: string; reason?: string }) =>
+	cancelSessionRun: (params: { session_id: string; run_id?: string; reason?: string }) =>
 		apiClient.post<BackendDataResponse<{ session_id: string; status: string }>>(
 			`/CancelSessionRun`,
 			{
 				session_id: params.session_id,
+				...(params.run_id ? { run_id: params.run_id } : {}),
 				reason: params.reason,
 			},
+		),
+
+	createInitialMessage: (params: CreateInitialMessageParams) =>
+		apiClient.post<BackendDataResponse<BackendNewMessageData>>(
+			SESSION_ENDPOINTS.createInitialMessage,
+			params,
 		),
 };

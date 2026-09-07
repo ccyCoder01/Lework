@@ -33,6 +33,9 @@ const (
 	// RunEventWorkTitleUpdated 表示项目/任务标题已由 LLM 自动生成。
 	RunEventWorkTitleUpdated RunEventType = "work.title.updated"
 
+	// RunEventPlanPublished 表示计划文件已上传到对象存储。
+	RunEventPlanPublished RunEventType = "plan.published"
+
 	// ---- stream lane 事件（高频增量，SSE 实时流） ----
 
 	// RunEventMessageDelta 表示助手文本增量输出。
@@ -73,6 +76,7 @@ func ClassifyRunEvent(eventType RunEventType) RunEventLane {
 		RunEventArtifactDeclared,
 		RunEventApprovalRequested, RunEventApprovalResolved,
 		RunEventQuestionAsked, RunEventQuestionAnswered,
+		RunEventPlanPublished,
 		RunEventWorkTitleUpdated:
 		return RunEventLaneState
 
@@ -97,11 +101,18 @@ type RunEventBody struct {
 	Event             RunEventType    `json:"event"`
 	Payload           RunEventPayload `json:"payload"`
 	ReplyToMessageIDs []string        `json:"reply_to_message_ids,omitempty"`
+	// MemberCommandIDs / MemberRunIDs 标识同一 Session 合并批次中的所有源命令。
+	MemberCommandIDs []string `json:"member_command_ids,omitempty"`
+	MemberRunIDs     []string `json:"member_run_ids,omitempty"`
 
 	// RunCompleted 仅在终端事件（run.completed/failed/cancelled）时填充。
 	RunCompleted *RunCompletedPayload `json:"run_completed,omitempty"`
 	// Error 仅在 run.failed 时填充。
 	Error *RunEventError `json:"error,omitempty"`
+	// AssistantPKID 是 leros_digital_assistant.id（主键），用于 worker 侧持久化关联（如 llm_history）。
+	AssistantPKID uint `json:"assistant_pk_id,omitempty"`
+	// AssistantID 是 leros_digital_assistant.public_id，用于 server/UI 侧展示和 SSE 过滤。
+	AssistantID string `json:"assistant_id,omitempty"`
 }
 
 // RunEventPayload 携带流事件的特定内容。
@@ -118,6 +129,7 @@ type RunEventPayload struct {
 	ApprovalDecision *ApprovalDecisionPayload `json:"approval_decision,omitempty"`
 	QuestionRequest  *QuestionRequestPayload  `json:"question_request,omitempty"`
 	QuestionAnswer   *QuestionAnswerPayload   `json:"question_answer,omitempty"`
+	PlanPublished    *PlanPublishedPayload    `json:"plan_published,omitempty"`
 	WorkTitle        *WorkTitleUpdatedPayload `json:"work_title,omitempty"`
 }
 
@@ -141,9 +153,11 @@ type RunEventError struct {
 
 // UsagePayload 描述模型 token 使用情况。
 type UsagePayload struct {
-	InputTokens  int `json:"input_tokens,omitempty"`
-	OutputTokens int `json:"output_tokens,omitempty"`
-	TotalTokens  int `json:"total_tokens,omitempty"`
+	TotalTokens       int `json:"total_tokens"`
+	InputTokens       int `json:"input_tokens"`
+	OutputTokens      int `json:"output_tokens"`
+	CacheInputTokens  int `json:"cache_input_tokens"`
+	CacheOutputTokens int `json:"cache_output_tokens"`
 }
 
 // ToolCallPayload 是工具调用开始和参数事件的标准负载。
@@ -173,20 +187,23 @@ type RuntimeTodoItem struct {
 
 // ArtifactPayload 引用单次运行产生的产物。
 type ArtifactPayload struct {
-	ArtifactID   string `json:"artifact_id,omitempty"`
-	Title        string `json:"title,omitempty"`
-	Filename     string `json:"filename,omitempty"`
-	OriginalName string `json:"original_name,omitempty"`
-	Description  string `json:"description,omitempty"`
-	MimeType     string `json:"mime_type,omitempty"`
-	ArtifactType string `json:"artifact_type,omitempty"`
-	FileSize     int64  `json:"file_size,omitempty"`
-	RelativePath string `json:"relative_path,omitempty"`
-	StorageKey   string `json:"storage_key,omitempty"`
-	StorageURI   string `json:"storage_uri,omitempty"`
-	Sha256       string `json:"sha256,omitempty"`
-	Source       string `json:"source,omitempty"`
-	Status       string `json:"status,omitempty"`
+	ArtifactID           string `json:"artifact_id,omitempty"`
+	Title                string `json:"title,omitempty"`
+	Filename             string `json:"filename,omitempty"`
+	OriginalName         string `json:"original_name,omitempty"`
+	Description          string `json:"description,omitempty"`
+	MimeType             string `json:"mime_type,omitempty"`
+	ArtifactType         string `json:"artifact_type,omitempty"`
+	FileSize             int64  `json:"file_size,omitempty"`
+	CreatedAt            string `json:"created_at,omitempty"`
+	RelativePath         string `json:"relative_path,omitempty"`
+	PreviousRelativePath string `json:"previous_relative_path,omitempty"`
+	StorageKey           string `json:"storage_key,omitempty"`
+	StorageURI           string `json:"storage_uri,omitempty"`
+	Sha256               string `json:"sha256,omitempty"`
+	Source               string `json:"source,omitempty"`
+	Status               string `json:"status,omitempty"`
+	VersionNo            int    `json:"version_no,omitempty"`
 }
 
 // ApprovalRequestPayload 描述需要用户审批的工具调用。
@@ -208,21 +225,28 @@ type ApprovalDecisionPayload struct {
 
 // QuestionRequestPayload 描述引擎向用户提出的澄清问题。
 type QuestionRequestPayload struct {
-	RequestID       string              `json:"request_id"`
-	SessionID       string              `json:"session_id,omitempty"`
-	Questions       []QuestionItem      `json:"questions"`
-	ToolCallID      string              `json:"tool_call_id,omitempty"`
-	MessageID       string              `json:"message_id,omitempty"`
-	InteractionType string              `json:"interaction_type,omitempty"`
-	Plan            *PlanHandoffPayload `json:"plan,omitempty"`
-	Metadata        map[string]string   `json:"metadata,omitempty"`
+	RequestID       string            `json:"request_id"`
+	SessionID       string            `json:"session_id,omitempty"`
+	Questions       []QuestionItem    `json:"questions"`
+	ToolCallID      string            `json:"tool_call_id,omitempty"`
+	MessageID       string            `json:"message_id,omitempty"`
+	InteractionType string            `json:"interaction_type,omitempty"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
 }
 
-// PlanHandoffPayload carries the plan content displayed during a plan confirmation.
-type PlanHandoffPayload struct {
-	Content  string `json:"content,omitempty"`
-	FilePath string `json:"file_path,omitempty"`
-	Error    string `json:"error,omitempty"`
+// PlanPublishedPayload carries the uploaded plan file info and :::plan directive.
+type PlanPublishedPayload struct {
+	FileID       string `json:"file_id"`
+	Directive    string `json:"directive"`
+	SummaryLines int    `json:"summary_lines"`
+	TotalLines   int    `json:"total_lines"`
+	StorageKey   string `json:"storage_key,omitempty"`
+	StorageURI   string `json:"storage_uri,omitempty"`
+	Filename     string `json:"filename,omitempty"`
+	OriginalName string `json:"original_name,omitempty"`
+	MimeType     string `json:"mime_type,omitempty"`
+	FileSize     int64  `json:"file_size,omitempty"`
+	Sha256       string `json:"sha256,omitempty"`
 }
 
 // QuestionItem 是问题请求中的单个问题。
@@ -277,9 +301,10 @@ type RunResultPayload struct {
 
 // RunEventRecord 是归一化、已归档的运行时事件。
 type RunEventRecord struct {
-	Seq       int64           `json:"seq,omitempty"`
-	LastSeq   int64           `json:"last_seq,omitempty"`
-	Type      string          `json:"type"`
-	Timestamp int64           `json:"timestamp,omitempty"`
-	Payload   json.RawMessage `json:"payload,omitempty"`
+	Seq         int64           `json:"seq,omitempty"`
+	LastSeq     int64           `json:"last_seq,omitempty"`
+	Type        string          `json:"type"`
+	Timestamp   int64           `json:"timestamp,omitempty"`
+	Payload     json.RawMessage `json:"payload,omitempty"`
+	AssistantID string          `json:"assistant_id,omitempty"`
 }

@@ -39,7 +39,7 @@ describe("getVisibleLeftRailItems", () => {
 });
 
 describe("getRecentProjectsForLeftRail", () => {
-	it("会保留已展开项目，避免被最近项目数量限制挤出列表", () => {
+	it("会按更新时间倒序排列当前已加载的项目", () => {
 		const projects = [
 			{ id: "project-1", updatedAt: 100 },
 			{ id: "project-2", updatedAt: 90 },
@@ -49,40 +49,29 @@ describe("getRecentProjectsForLeftRail", () => {
 			{ id: "project-6", updatedAt: 50 },
 		];
 
-		const visibleProjects = getRecentProjectsForLeftRail(projects, new Set(["project-6"]), 5);
+		const visibleProjects = getRecentProjectsForLeftRail(projects);
 
 		expect(visibleProjects.map((project) => project.id)).toEqual([
 			"project-1",
 			"project-2",
 			"project-3",
 			"project-4",
+			"project-5",
 			"project-6",
 		]);
 	});
 
-	it("会按更新时间优先补足非展开项目", () => {
+	it("会把后插入但更新时间最新的项目排到最前", () => {
 		const projects = [
-			{ id: "project-1", updatedAt: 100 },
-			{ id: "project-2", updatedAt: 90 },
-			{ id: "project-3", updatedAt: 80 },
-			{ id: "project-4", updatedAt: 70 },
-			{ id: "project-5", updatedAt: 60 },
-			{ id: "project-6", updatedAt: 50 },
-			{ id: "project-7", updatedAt: 40 },
+			{ id: "project-old", updatedAt: 100 },
+			{ id: "project-from-qa", updatedAt: 200 },
 		];
 
-		const visibleProjects = getRecentProjectsForLeftRail(
-			projects,
-			new Set(["project-6", "project-7"]),
-			5,
-		);
+		const visibleProjects = getRecentProjectsForLeftRail(projects);
 
 		expect(visibleProjects.map((project) => project.id)).toEqual([
-			"project-1",
-			"project-2",
-			"project-3",
-			"project-6",
-			"project-7",
+			"project-from-qa",
+			"project-old",
 		]);
 	});
 });

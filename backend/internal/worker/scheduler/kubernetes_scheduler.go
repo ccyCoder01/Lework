@@ -12,6 +12,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -27,10 +28,10 @@ const (
 	defaultWorkerContainerName         = "leros-worker"
 	defaultWorkspaceInitContainerName  = "init-workspace"
 	defaultWorkerListenAddr            = ":8081"
-	defaultWorkspaceContainerMountRoot = "/leros-workspaces"
+	defaultWorkspaceContainerMountRoot = "/workspace"
 	defaultWorkerConfigMountPath       = "/app/config"
 	defaultWorkerConfigFile            = "/app/config/config.yaml"
-	defaultWorkspaceHostPathRoot       = "/data/leros-workspaces"
+	defaultWorkspaceHostPathRoot       = "/data/workspace"
 	defaultStorageHostPath             = "/data/leros-storage"
 	defaultStorageMountPath            = "/leros-storage"
 	defaultWorkerImage                 = "leros-worker:local"
@@ -43,6 +44,7 @@ type KubernetesScheduler struct {
 }
 
 var _ worker.WorkerScheduler = (*KubernetesScheduler)(nil)
+var _ worker.WorkerSpecReconciler = (*KubernetesScheduler)(nil)
 
 func NewKubernetesScheduler(cfg *config.SchedulerConfig) (worker.WorkerScheduler, error) {
 	if cfg == nil {
@@ -133,6 +135,9 @@ func (s *KubernetesScheduler) Stop(ctx context.Context, workerID string) error {
 
 func (s *KubernetesScheduler) Health(ctx context.Context, workerID string) error {
 	deployment, err := s.client.AppsV1().Deployments(s.namespace()).Get(ctx, workerID, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return fmt.Errorf("%w: %s", worker.ErrWorkerNotFound, workerID)
+	}
 	if err != nil {
 		return err
 	}
@@ -159,6 +164,40 @@ func (s *KubernetesScheduler) List(ctx context.Context) ([]*worker.WorkerInstanc
 		result = append(result, s.instanceFromDeployment(&deployment, status))
 	}
 	return result, nil
+}
+
+func (s *KubernetesScheduler) Shutdown(ctx context.Context) error {
+	return nil
+}
+
+func (s *KubernetesScheduler) NeedsReconcile(ctx context.Context, spec *worker.WorkerSpec) (bool, error) {
+	if spec == nil {
+		return false, fmt.Errorf("worker spec is required")
+	}
+	if spec.OrgID == 0 {
+		return false, fmt.Errorf("org_id is required")
+	}
+	if spec.WorkerID == 0 {
+		return false, fmt.Errorf("worker_id is required")
+	}
+	deployment, err := s.client.AppsV1().Deployments(s.namespace()).Get(ctx, deploymentName(spec.OrgID, spec.WorkerID), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get worker deployment: %w", err)
+	}
+	currentImage := workerContainerImage(deployment)
+	if currentImage == "" {
+		return true, nil
+	}
+	if currentImage != s.workerImage(spec) {
+		return true, nil
+	}
+	if s.resourcesDrifted(deployment, spec) {
+		return true, nil
+	}
+	return s.workspaceSpecDrifted(deployment, spec), nil
 }
 
 func (s *KubernetesScheduler) buildDeployment(spec *worker.WorkerSpec) *appsv1.Deployment {
@@ -220,7 +259,7 @@ func (s *KubernetesScheduler) buildDeployment(spec *worker.WorkerSpec) *appsv1.D
 			},
 		},
 		{
-			Name: "leros-workspaces",
+			Name: "workspace",
 			VolumeSource: corev1.VolumeSource{
 				HostPath: &corev1.HostPathVolumeSource{
 					Path: s.workspacePath(spec.OrgID, spec.WorkerID),
@@ -242,7 +281,7 @@ func (s *KubernetesScheduler) buildDeployment(spec *worker.WorkerSpec) *appsv1.D
 	}
 	volumeMounts := []corev1.VolumeMount{
 		{Name: "config", MountPath: defaultWorkerConfigMountPath, ReadOnly: true},
-		{Name: "leros-workspaces", MountPath: workspaceMountPath},
+		{Name: "workspace", MountPath: workspaceMountPath},
 	}
 	if storageMountPath := s.storageMountPath(); storageMountPath != "" {
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "leros-storage", MountPath: storageMountPath})
@@ -254,22 +293,23 @@ func (s *KubernetesScheduler) buildDeployment(spec *worker.WorkerSpec) *appsv1.D
 				Name:    defaultWorkspaceInitContainerName,
 				Image:   s.workspaceInitImage(),
 				Command: []string{"sh", "-c"},
-				Args:    []string{"chmod -R 0777 /leros-workspaces"},
+				Args:    []string{"chmod -R 0777 " + workspaceMountPath},
 				SecurityContext: &corev1.SecurityContext{
 					RunAsUser: int64Ptr(0),
 				},
-				VolumeMounts: []corev1.VolumeMount{{Name: "leros-workspaces", MountPath: workspaceMountPath}},
+				VolumeMounts: []corev1.VolumeMount{{Name: "workspace", MountPath: workspaceMountPath}},
 			},
 		},
 		Containers: []corev1.Container{
 			{
-				Name:            defaultWorkerContainerName,
+				Name:            name,
 				Image:           s.workerImage(spec),
-				ImagePullPolicy: corev1.PullAlways,
+				ImagePullPolicy: s.workerImagePullPolicy(),
 				Command:         []string{"/leros"},
 				Args:            args,
 				Env:             env,
 				VolumeMounts:    volumeMounts,
+				Resources:       s.workerResources(),
 			},
 		},
 		Volumes: volumes,
@@ -289,6 +329,106 @@ func (s *KubernetesScheduler) buildDeployment(spec *worker.WorkerSpec) *appsv1.D
 			},
 		},
 	}
+}
+
+func workerContainerImage(deployment *appsv1.Deployment) string {
+	if deployment == nil {
+		return ""
+	}
+	for _, container := range deployment.Spec.Template.Spec.Containers {
+		if container.Name == deployment.Name {
+			return strings.TrimSpace(container.Image)
+		}
+	}
+	// Keep recognizing deployments created before worker container names were
+	// aligned with their deployment names.
+	for _, container := range deployment.Spec.Template.Spec.Containers {
+		if container.Name == defaultWorkerContainerName {
+			return strings.TrimSpace(container.Image)
+		}
+	}
+	if len(deployment.Spec.Template.Spec.Containers) == 1 {
+		return strings.TrimSpace(deployment.Spec.Template.Spec.Containers[0].Image)
+	}
+	return ""
+}
+
+func (s *KubernetesScheduler) workspaceSpecDrifted(deployment *appsv1.Deployment, spec *worker.WorkerSpec) bool {
+	if deployment == nil || spec == nil {
+		return true
+	}
+	desiredHostPath := s.workspacePath(spec.OrgID, spec.WorkerID)
+	desiredMountPath := s.workspaceMountPath(spec.OrgID, spec.WorkerID)
+	podSpec := deployment.Spec.Template.Spec
+	if hostPathForVolume(podSpec.Volumes, "workspace") != desiredHostPath {
+		return true
+	}
+	workerContainer := containerByName(podSpec.Containers, deploymentName(spec.OrgID, spec.WorkerID))
+	if workerContainer == nil {
+		return true
+	}
+	if mountPathForVolume(workerContainer.VolumeMounts, "workspace") != desiredMountPath {
+		return true
+	}
+	if envValue(workerContainer.Env, "LEROS_WORKSPACE_ROOT") != desiredMountPath {
+		return true
+	}
+	if argValue(workerContainer.Args, "--workspace-root") != desiredMountPath {
+		return true
+	}
+	initContainer := containerByName(podSpec.InitContainers, defaultWorkspaceInitContainerName)
+	if initContainer == nil {
+		return true
+	}
+	if mountPathForVolume(initContainer.VolumeMounts, "workspace") != desiredMountPath {
+		return true
+	}
+	return len(initContainer.Args) == 0 || initContainer.Args[0] != "chmod -R 0777 "+desiredMountPath
+}
+
+func containerByName(containers []corev1.Container, name string) *corev1.Container {
+	for i := range containers {
+		if containers[i].Name == name {
+			return &containers[i]
+		}
+	}
+	return nil
+}
+
+func hostPathForVolume(volumes []corev1.Volume, name string) string {
+	for _, volume := range volumes {
+		if volume.Name == name && volume.HostPath != nil {
+			return strings.TrimSpace(volume.HostPath.Path)
+		}
+	}
+	return ""
+}
+
+func mountPathForVolume(mounts []corev1.VolumeMount, name string) string {
+	for _, mount := range mounts {
+		if mount.Name == name {
+			return strings.TrimSpace(mount.MountPath)
+		}
+	}
+	return ""
+}
+
+func envValue(env []corev1.EnvVar, name string) string {
+	for _, item := range env {
+		if item.Name == name {
+			return strings.TrimSpace(item.Value)
+		}
+	}
+	return ""
+}
+
+func argValue(args []string, name string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == name {
+			return strings.TrimSpace(args[i+1])
+		}
+	}
+	return ""
 }
 
 func (s *KubernetesScheduler) instanceFromDeployment(deployment *appsv1.Deployment, status string) *worker.WorkerInstance {
@@ -325,6 +465,17 @@ func (s *KubernetesScheduler) workerImage(spec *worker.WorkerSpec) string {
 	return defaultWorkerImage
 }
 
+func (s *KubernetesScheduler) workerImagePullPolicy() corev1.PullPolicy {
+	switch strings.ToLower(strings.TrimSpace(s.config.WorkerImagePullPolicy)) {
+	case "always", "pullalways":
+		return corev1.PullAlways
+	case "never", "pullnever":
+		return corev1.PullNever
+	default:
+		return corev1.PullIfNotPresent
+	}
+}
+
 func (s *KubernetesScheduler) workspaceInitImage() string {
 	if value := strings.TrimSpace(s.config.WorkspaceInitImage); value != "" {
 		return value
@@ -344,15 +495,15 @@ func (s *KubernetesScheduler) workspacePath(orgID, workerID uint) string {
 	if root == "" {
 		root = defaultWorkspaceHostPathRoot
 	}
-	return filepath.Join(root, strconv.FormatUint(uint64(orgID), 10), strconv.FormatUint(uint64(workerID), 10), "workspace")
+	return joinHostPath(root, orgID, workerID)
 }
 
-func (s *KubernetesScheduler) workspaceMountPath(orgID, workerID uint) string {
+func (s *KubernetesScheduler) workspaceMountPath(_, _ uint) string {
 	root := strings.TrimSpace(s.config.WorkspaceMountRoot)
 	if root == "" {
 		root = defaultWorkspaceContainerMountRoot
 	}
-	return filepath.Join(root, strconv.FormatUint(uint64(orgID), 10), strconv.FormatUint(uint64(workerID), 10), "workspace")
+	return root
 }
 
 func (s *KubernetesScheduler) storageHostPath() string {
@@ -373,6 +524,70 @@ func deploymentName(orgID, workerID uint) string {
 	return fmt.Sprintf("leros-worker-o%d-w%d", orgID, workerID)
 }
 
+// joinHostPath 在宿主根路径下追加 Deployment 名称二级目录，使每个 worker
+// 使用独立的 workspace 宿主目录（如 /data/workspace/leros-worker-o1001-w3），
+// 目录名与 Deployment 名称一一对应，实现物理隔离。
+// workerID 为 0 时返回根路径本身，避免拼出无意义的目录。
+func joinHostPath(root string, orgID, workerID uint) string {
+	if workerID == 0 {
+		return root
+	}
+	return filepath.Join(root, deploymentName(orgID, workerID))
+}
+
 func boolPtr(value bool) *bool                                       { return &value }
 func int64Ptr(value int64) *int64                                    { return &value }
 func hostPathTypePtr(value corev1.HostPathType) *corev1.HostPathType { return &value }
+
+// workerResources 将配置层 ResourceRequirements 转为 corev1.ResourceRequirements，
+// 忽略无法解析的 quantity 字符串。
+func (s *KubernetesScheduler) workerResources() corev1.ResourceRequirements {
+	return toCoreV1Resources(s.config.WorkerResources)
+}
+
+func toCoreV1Resources(r config.ResourceRequirements) corev1.ResourceRequirements {
+	req := corev1.ResourceRequirements{}
+	for k, v := range r.Limits {
+		if q, err := resource.ParseQuantity(strings.TrimSpace(v)); err == nil {
+			if req.Limits == nil {
+				req.Limits = corev1.ResourceList{}
+			}
+			req.Limits[corev1.ResourceName(k)] = q
+		}
+	}
+	for k, v := range r.Requests {
+		if q, err := resource.ParseQuantity(strings.TrimSpace(v)); err == nil {
+			if req.Requests == nil {
+				req.Requests = corev1.ResourceList{}
+			}
+			req.Requests[corev1.ResourceName(k)] = q
+		}
+	}
+	return req
+}
+
+// resourcesDrifted 判断现有 worker 容器的资源限制是否与期望配置不一致。
+func (s *KubernetesScheduler) resourcesDrifted(deployment *appsv1.Deployment, spec *worker.WorkerSpec) bool {
+	container := containerByName(deployment.Spec.Template.Spec.Containers, deploymentName(spec.OrgID, spec.WorkerID))
+	if container == nil {
+		return true
+	}
+	return !resourceRequirementsEqual(s.workerResources(), container.Resources)
+}
+
+func resourceRequirementsEqual(a, b corev1.ResourceRequirements) bool {
+	return resourceListEqual(a.Limits, b.Limits) && resourceListEqual(a.Requests, b.Requests)
+}
+
+func resourceListEqual(a, b corev1.ResourceList) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		bv, ok := b[k]
+		if !ok || v.Cmp(bv) != 0 {
+			return false
+		}
+	}
+	return true
+}

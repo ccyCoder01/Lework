@@ -4,17 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
 	"gorm.io/gorm"
 
-	"github.com/insmtx/Leros/backend/agent/runtime/events"
 	"github.com/insmtx/Leros/backend/internal/api/contract"
 	infradb "github.com/insmtx/Leros/backend/internal/infra/db"
 	"github.com/insmtx/Leros/backend/internal/infra/filestore"
 	eventbus "github.com/insmtx/Leros/backend/internal/infra/mq"
+	"github.com/insmtx/Leros/backend/internal/llm"
+	"github.com/insmtx/Leros/backend/internal/workspace"
 	"github.com/insmtx/Leros/backend/pkg/messaging"
 	"github.com/insmtx/Leros/backend/types"
 	"github.com/ygpkg/yg-go/logs"
@@ -44,12 +46,40 @@ func StartSessionRunStateProjector(
 	persister := &declaredArtifactPersister{db: db}
 
 	Run(ctx, "session_run_state_projector", func(ctx context.Context) {
-		if err := eb.Subscribe(ctx, topic, messaging.SessionRunStateConsumer(), func(msg *nats.Msg) {
-			handleRunStateMessage(ctx, service, persister, db, msg)
+		if err := eb.SubscribeManualDurable(ctx, topic, messaging.SessionRunStateConsumer(), func(msg *nats.Msg) {
+			handleRunStateDelivery(ctx, service, persister, db, msg)
 		}); err != nil {
 			logs.ErrorContextf(ctx, "subscribe to %s failed: %v", topic, err)
 		}
 	})
+}
+
+// handleRunStateDelivery confirms only after a durable receipt is written. A database outage is retried by
+// JetStream; malformed events are terminal because retrying cannot make them valid.
+func handleRunStateDelivery(ctx context.Context, service contract.SessionService, persister *declaredArtifactPersister, db *gorm.DB, msg *nats.Msg) {
+	delivery := eventbus.NewManualDelivery(msg)
+	var event messaging.RunEvent
+	if err := json.Unmarshal(msg.Data, &event); err != nil || event.Type != messaging.MessageTypeRunEvent || event.Route.SessionID == "" || event.ID == "" {
+		logs.WarnContextf(ctx, "discard malformed run state event: %v", err)
+		_ = delivery.Term()
+		return
+	}
+	inserted, err := infradb.CreateProjectionReceipt(ctx, db, &types.ProjectionReceipt{
+		Consumer: messaging.SessionRunStateConsumer(), EventID: event.ID, RunID: event.Trace.RunID, SessionID: event.Route.SessionID, EventType: string(event.Body.Event),
+	})
+	if err != nil {
+		logs.WarnContextf(ctx, "persist run event receipt id=%s: %v", event.ID, err)
+		_ = delivery.NakWithDelay(5 * time.Second)
+		return
+	}
+	if !inserted {
+		_ = delivery.Ack()
+		return
+	}
+	handleRunStateMessage(ctx, service, persister, db, msg)
+	if err := delivery.Ack(); err != nil {
+		logs.WarnContextf(ctx, "ack run state event id=%s: %v", event.ID, err)
+	}
 }
 
 func handleRunStateMessage(ctx context.Context, service contract.SessionService, persister *declaredArtifactPersister, db *gorm.DB, msg *nats.Msg) {
@@ -67,28 +97,55 @@ func handleRunStateMessage(ctx context.Context, service contract.SessionService,
 		return
 	}
 
+	fields := make([]interface{}, 0, 8)
+	if runEvent.Trace.ReqID != "" {
+		fields = append(fields, "req_id", runEvent.Trace.ReqID)
+	}
+	if runEvent.Route.SessionID != "" {
+		fields = append(fields, "session_id", runEvent.Route.SessionID)
+	}
+	if runEvent.Route.AssistantID != 0 {
+		fields = append(fields, "assistant_id", runEvent.Route.AssistantID)
+	}
+	if runEvent.Route.WorkerID != 0 {
+		fields = append(fields, "worker_id", runEvent.Route.WorkerID)
+	}
+	if len(fields) > 0 {
+		ctx = logs.WithContextFields(ctx, fields...)
+	}
+
+	logs.InfoContextf(ctx, "received run state event: type=%s session_id=%s run_id=%s seq=%d",
+		runEvent.Body.Event, runEvent.Route.SessionID, runEvent.Trace.RunID, runEvent.Body.Seq)
+
+	if runEvent.Route.ClientIP != "" {
+		ctx = llm.WithCtxString(ctx, llm.CtxClientIP, runEvent.Route.ClientIP)
+	}
+
 	switch runEvent.Body.Event {
 	case messaging.RunEventRunStarted:
-		handleRunStartedEvent(ctx, service, msg, runEvent)
+		handleRunStartedEvent(ctx, service, db, msg, runEvent)
 
 	case messaging.RunEventArtifactDeclared:
 		handleArtifactDeclaredEvent(ctx, persister, runEvent)
+
+	case messaging.RunEventPlanPublished:
+		handlePlanPublishedEvent(ctx, persister, runEvent)
 
 	case messaging.RunEventRunCompleted:
 		handleRunCompletedEvent(ctx, service, db, runEvent)
 
 	case messaging.RunEventRunFailed:
-		handleRunFailedEvent(ctx, service, runEvent)
+		handleRunFailedEvent(ctx, service, db, runEvent)
 
 	case messaging.RunEventRunCancelled:
-		handleRunCancelledEvent(ctx, service, runEvent)
+		handleRunCancelledEvent(ctx, service, db, runEvent)
 
 	default:
 		logs.DebugContextf(ctx, "ignoring run state event: %s", runEvent.Body.Event)
 	}
 }
 
-func handleRunStartedEvent(ctx context.Context, service contract.SessionService, msg *nats.Msg, runEvent messaging.RunEvent) {
+func handleRunStartedEvent(ctx context.Context, service contract.SessionService, db *gorm.DB, msg *nats.Msg, runEvent messaging.RunEvent) {
 	meta, err := msg.Metadata()
 	if err != nil {
 		logs.WarnContextf(ctx, "run started missing nats metadata: session_id=%s error=%v", runEvent.Route.SessionID, err)
@@ -100,9 +157,14 @@ func handleRunStartedEvent(ctx context.Context, service contract.SessionService,
 		RequestID:         runEvent.Trace.RequestID,
 		StreamStartSeq:    0, // set asynchronously by session_run_stream_projector
 		StateStartSeq:     meta.Sequence.Stream,
+		RunID:             runEvent.Trace.RunID,
+		AssistantID:       runEvent.Body.AssistantID,
 	}); err != nil {
 		logs.WarnContextf(ctx, "handle session run started failed: session_id=%s error=%v", runEvent.Route.SessionID, err)
 	}
+	handleAutomationRunEvent(ctx, db, runEvent)
+	logs.InfoContextf(ctx, "handled run started: session_id=%s run_id=%s state_start_seq=%d reply_ids=%v",
+		runEvent.Route.SessionID, runEvent.Trace.RunID, meta.Sequence.Stream, runEvent.Body.ReplyToMessageIDs)
 }
 
 func handleArtifactDeclaredEvent(ctx context.Context, persister *declaredArtifactPersister, runEvent messaging.RunEvent) {
@@ -114,28 +176,29 @@ func handleArtifactDeclaredEvent(ctx context.Context, persister *declaredArtifac
 	logs.InfoContextf(ctx, "persisting declared artifact: session_id=%s artifact_id=%s storage_key=%s",
 		runEvent.Route.SessionID, art.ArtifactID, art.StorageKey)
 
-	legacyArtifact := events.ArtifactPayload{
-		ArtifactID:   art.ArtifactID,
-		Title:        art.Title,
-		Filename:     art.Filename,
-		OriginalName: art.OriginalName,
-		Description:  art.Description,
-		MimeType:     art.MimeType,
-		ArtifactType: art.ArtifactType,
-		FileSize:     art.FileSize,
-		RelativePath: art.RelativePath,
-		StorageKey:   art.StorageKey,
-		StorageURI:   art.StorageURI,
-		Sha256:       art.Sha256,
-		Source:       art.Source,
-		Status:       art.Status,
+	artifact := messaging.ArtifactPayload{
+		ArtifactID:           art.ArtifactID,
+		Title:                art.Title,
+		Filename:             art.Filename,
+		OriginalName:         art.OriginalName,
+		Description:          art.Description,
+		MimeType:             art.MimeType,
+		ArtifactType:         art.ArtifactType,
+		FileSize:             art.FileSize,
+		RelativePath:         art.RelativePath,
+		PreviousRelativePath: art.PreviousRelativePath,
+		StorageKey:           art.StorageKey,
+		StorageURI:           art.StorageURI,
+		Sha256:               art.Sha256,
+		Source:               art.Source,
+		Status:               art.Status,
 	}
 
-	if err := persister.PersistDeclaredArtifact(ctx, messaging.RouteContext{
+	if _, err := persister.PersistDeclaredArtifact(ctx, messaging.RouteContext{
 		OrgID:     runEvent.Route.OrgID,
 		SessionID: runEvent.Route.SessionID,
 		WorkerID:  runEvent.Route.WorkerID,
-	}, legacyArtifact); err != nil {
+	}, artifact); err != nil {
 		logs.WarnContextf(ctx, "persist declared artifact failed: session_id=%s artifact_id=%s err=%v",
 			runEvent.Route.SessionID, art.ArtifactID, err)
 	}
@@ -157,14 +220,18 @@ func handleRunCompletedEvent(ctx context.Context, service contract.SessionServic
 		Usage:             messagingUsageToMessageUsage(completed.Usage),
 		Seq:               runEvent.Body.Seq,
 		CreatedAt:         runEvent.CreatedAt,
+		RunID:             runEvent.Trace.RunID,
+		AssistantID:       runEvent.Body.AssistantID,
 	}
 	if err := service.CompleteSessionMessage(ctx, req); err != nil {
 		logs.WarnContextf(ctx, "complete session message: %v", err)
 	}
 	recordSkillInvocationsFromMessaging(ctx, db, runEvent.Route.OrgID, runEvent.Route.SessionID, completed.Events)
+	// 回写自动化执行状态：queued/running → succeeded
+	handleAutomationRunEvent(ctx, db, runEvent)
 }
 
-func handleRunFailedEvent(ctx context.Context, service contract.SessionService, runEvent messaging.RunEvent) {
+func handleRunFailedEvent(ctx context.Context, service contract.SessionService, db *gorm.DB, runEvent messaging.RunEvent) {
 	content := runEvent.Body.Payload.Content
 	errMsg := runEvent.Body.Payload.Content
 	status := string(types.MessageStatusFailed)
@@ -192,6 +259,8 @@ func handleRunFailedEvent(ctx context.Context, service contract.SessionService, 
 		Usage:             messagingUsageToMessageUsage(messagingCompletedUsage(completed)),
 		Seq:               runEvent.Body.Seq,
 		CreatedAt:         runEvent.CreatedAt,
+		RunID:             runEvent.Trace.RunID,
+		AssistantID:       runEvent.Body.AssistantID,
 	}
 	if runEvent.Body.Error != nil {
 		req.ErrorCode = runEvent.Body.Error.Code
@@ -199,9 +268,10 @@ func handleRunFailedEvent(ctx context.Context, service contract.SessionService, 
 	if err := service.FailedSessionMessage(ctx, req); err != nil {
 		logs.WarnContextf(ctx, "failed session message: %v", err)
 	}
+	handleAutomationRunEvent(ctx, db, runEvent)
 }
 
-func handleRunCancelledEvent(ctx context.Context, service contract.SessionService, runEvent messaging.RunEvent) {
+func handleRunCancelledEvent(ctx context.Context, service contract.SessionService, db *gorm.DB, runEvent messaging.RunEvent) {
 	completed := runEvent.Body.RunCompleted
 	content := "已取消"
 	if completed != nil && completed.Result.Message != "" {
@@ -219,10 +289,13 @@ func handleRunCancelledEvent(ctx context.Context, service contract.SessionServic
 		Usage:             messagingUsageToMessageUsage(messagingCompletedUsage(completed)),
 		Seq:               runEvent.Body.Seq,
 		CreatedAt:         runEvent.CreatedAt,
+		RunID:             runEvent.Trace.RunID,
+		AssistantID:       runEvent.Body.AssistantID,
 	}
 	if err := service.FailedSessionMessage(ctx, req); err != nil {
 		logs.WarnContextf(ctx, "cancelled session message: %v", err)
 	}
+	handleAutomationRunEvent(ctx, db, runEvent)
 }
 
 func cancellationError(runEvent messaging.RunEvent) string {
@@ -230,6 +303,24 @@ func cancellationError(runEvent messaging.RunEvent) string {
 		return runEvent.Body.Error.Message
 	}
 	return "run cancelled"
+}
+
+func handlePlanPublishedEvent(ctx context.Context, persister *declaredArtifactPersister, runEvent messaging.RunEvent) {
+	if runEvent.Body.Payload.PlanPublished == nil {
+		logs.WarnContextf(ctx, "plan published missing payload: session_id=%s seq=%d", runEvent.Route.SessionID, runEvent.Body.Seq)
+		return
+	}
+	pp := runEvent.Body.Payload.PlanPublished
+	logs.InfoContextf(ctx, "persisting published plan: session_id=%s file_id=%s", runEvent.Route.SessionID, pp.FileID)
+
+	if err := persister.PersistPublishedPlan(ctx, messaging.RouteContext{
+		OrgID:     runEvent.Route.OrgID,
+		SessionID: runEvent.Route.SessionID,
+		WorkerID:  runEvent.Route.WorkerID,
+	}, pp); err != nil {
+		logs.WarnContextf(ctx, "persist published plan failed: session_id=%s file_id=%s err=%v",
+			runEvent.Route.SessionID, pp.FileID, err)
+	}
 }
 
 // ---- type conversion helpers ----
@@ -241,11 +332,12 @@ func messagingEventsToChunks(records []messaging.RunEventRecord) []types.Message
 	chunks := make([]types.MessageChunk, 0, len(records))
 	for _, record := range records {
 		chunks = append(chunks, types.MessageChunk{
-			Seq:       record.Seq,
-			LastSeq:   record.LastSeq,
-			Type:      record.Type,
-			Timestamp: record.Timestamp,
-			Payload:   json.RawMessage(record.Payload),
+			Seq:         record.Seq,
+			LastSeq:     record.LastSeq,
+			Type:        record.Type,
+			Timestamp:   record.Timestamp,
+			Payload:     json.RawMessage(record.Payload),
+			AssistantID: record.AssistantID,
 		})
 	}
 	return chunks
@@ -275,12 +367,14 @@ func messagingArtifactsToMessageArtifacts(artifacts []messaging.ArtifactPayload)
 
 func messagingUsageToMessageUsage(usage *messaging.UsagePayload) *types.MessageUsage {
 	if usage == nil {
-		return nil
+		usage = &messaging.UsagePayload{}
 	}
 	return &types.MessageUsage{
-		InputTokens:  usage.InputTokens,
-		OutputTokens: usage.OutputTokens,
-		TotalTokens:  usage.TotalTokens,
+		TotalTokens:       usage.InputTokens + usage.OutputTokens,
+		InputTokens:       usage.InputTokens,
+		OutputTokens:      usage.OutputTokens,
+		CacheInputTokens:  usage.CacheInputTokens,
+		CacheOutputTokens: usage.CacheOutputTokens,
 	}
 }
 
@@ -307,8 +401,11 @@ func completedMetadataToObject(completed *messaging.RunCompletedPayload) *types.
 	if completed.Metadata.Resume {
 		extra["resume"] = true
 	}
-	if completed.Usage != nil && completed.Usage.TotalTokens > 0 {
-		extra["tokens"] = completed.Usage.TotalTokens
+	if completed.Usage != nil {
+		totalTokens := completed.Usage.InputTokens + completed.Usage.OutputTokens
+		if totalTokens > 0 {
+			extra["tokens"] = totalTokens
+		}
 	}
 	if len(extra) == 0 {
 		return nil
@@ -350,11 +447,11 @@ func recordSkillInvocationsFromMessaging(ctx context.Context, db *gorm.DB, orgID
 	seen := make(map[string]bool)
 	var records []*types.MessageResource
 	for _, evt := range runEvents {
-		if evt.Type != string(events.EventToolCallStarted) {
+		if evt.Type != string(messaging.RunEventToolCallStarted) {
 			continue
 		}
 		payloadBytes, _ := json.Marshal(evt.Payload)
-		var payload events.ToolCallPayload
+		var payload messaging.ToolCallPayload
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 			continue
 		}
@@ -366,10 +463,19 @@ func recordSkillInvocationsFromMessaging(ctx context.Context, db *gorm.DB, orgID
 
 		source, skillID := "Leros", skillName
 		resourceID := ""
-		if item, err := infradb.GetBuiltinSkillByID(ctx, db, skillName); err == nil && item != nil {
-			source = "Leros"
-			skillID = item.SkillID
-			resourceID = fmt.Sprintf("%d", item.ID)
+		var plugin types.Plugin
+		if err := db.WithContext(ctx).
+			Where(
+				"owner_scope = ? AND org_id = ? AND code = ? AND kind = ? AND deleted_at IS NULL",
+				types.OwnerScopeOrganization,
+				orgID,
+				skillName,
+				"skill",
+			).
+			First(&plugin).Error; err == nil && plugin.ID != 0 {
+			source = "organization"
+			skillID = plugin.Code
+			resourceID = plugin.PublicID
 		}
 		records = append(records, &types.MessageResource{
 			ResourceID:   resourceID,
@@ -394,14 +500,169 @@ type declaredArtifactPersister struct {
 	db *gorm.DB
 }
 
-// PersistDeclaredArtifact persists a declared artifact to the database.
-func (p *declaredArtifactPersister) PersistDeclaredArtifact(ctx context.Context, route messaging.RouteContext, item events.ArtifactPayload) error {
+// PersistDeclaredArtifact persists a declared artifact as FileUpload + ProjectFile in a transaction.
+// Uses ProjectFile.FilePublicID unique index for event replay idempotency.
+// Skips persistence when storage_uri is missing (ProjectFile cannot point to an inaccessible file).
+func (p *declaredArtifactPersister) PersistDeclaredArtifact(
+	ctx context.Context,
+	route messaging.RouteContext,
+	item messaging.ArtifactPayload,
+) (*types.ProjectFile, error) {
 	if p == nil || p.db == nil {
-		return nil
+		return nil, nil
 	}
 	artifactID := strings.TrimSpace(item.ArtifactID)
 	if artifactID == "" {
-		return fmt.Errorf("artifact_id is required")
+		return nil, fmt.Errorf("artifact_id is required")
+	}
+	if route.OrgID == 0 {
+		return nil, fmt.Errorf("org_id is required")
+	}
+	if route.WorkerID == 0 {
+		return nil, fmt.Errorf("worker_id is required")
+	}
+	sessionID := strings.TrimSpace(route.SessionID)
+	if sessionID == "" {
+		return nil, fmt.Errorf("session_id is required")
+	}
+	storageURI := strings.TrimSpace(item.StorageURI)
+	if storageURI == "" {
+		logs.InfoContextf(ctx, "persist declared artifact: storage_uri is empty, skipping persistence artifact_id=%s session_id=%s", artifactID, sessionID)
+		return nil, nil
+	}
+
+	// Check idempotency via ProjectFile.FilePublicID unique index.
+	existingPF, err := infradb.GetProjectFileByFilePublicID(ctx, p.db, route.OrgID, artifactID)
+	if err != nil {
+		return nil, err
+	}
+	if existingPF != nil {
+		logs.InfoContextf(ctx, "persist declared artifact: already exists (project_file), artifact_id=%s session_id=%s", artifactID, sessionID)
+		return existingPF, nil
+	}
+
+	session, err := infradb.GetSessionByPublicID(ctx, p.db, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("find session %s: %w", sessionID, err)
+	}
+	if session == nil {
+		logs.WarnContextf(ctx, "persist declared artifact: session not found, artifact_id=%s session_id=%s", artifactID, sessionID)
+		return nil, fmt.Errorf("session %s not found", sessionID)
+	}
+	if session.OrgID != route.OrgID {
+		logs.WarnContextf(ctx, "persist declared artifact: org mismatch, artifact_id=%s session_org=%d route_org=%d",
+			artifactID, session.OrgID, route.OrgID)
+		return nil, fmt.Errorf("session %s does not belong to org %d", sessionID, route.OrgID)
+	}
+	if session.ProjectID == nil || *session.ProjectID == 0 {
+		logs.WarnContextf(ctx, "persist declared artifact: session has no project_id, artifact_id=%s session_id=%s",
+			artifactID, sessionID)
+		return nil, fmt.Errorf("session project_id is required for artifact persistence")
+	}
+	if session.TaskID == nil || *session.TaskID == 0 {
+		logs.WarnContextf(ctx, "persist declared artifact: session has no task_id, artifact_id=%s session_id=%s",
+			artifactID, sessionID)
+		return nil, fmt.Errorf("session task_id is required for artifact persistence")
+	}
+
+	filename := strings.TrimSpace(item.Filename)
+	if filename == "" {
+		filename = item.Title
+	}
+	originalName := strings.TrimSpace(item.OriginalName)
+	if originalName == "" {
+		originalName = filename
+	}
+	relativePath := strings.TrimSpace(item.RelativePath)
+	if relativePath == "" {
+		relativePath = filepath.Base(originalName)
+	}
+	relativePath, err = workspace.NormalizeRelativePath(relativePath)
+	if err != nil {
+		return nil, fmt.Errorf("normalize artifact relative path: %w", err)
+	}
+	previousRelativePath := strings.TrimSpace(item.PreviousRelativePath)
+	if previousRelativePath != "" {
+		previousRelativePath, err = workspace.NormalizeRelativePath(previousRelativePath)
+		if err != nil {
+			return nil, fmt.Errorf("normalize artifact previous relative path: %w", err)
+		}
+	}
+
+	// Use transaction to ensure FileUpload and ProjectFile are created atomically.
+	var persisted *types.ProjectFile
+	err = p.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		fileUpload, err := filestore.RecordUpload(ctx, tx, filestore.RecordUploadParams{
+			StorageURI:   storageURI,
+			Filename:     filename,
+			OriginalName: originalName,
+			MimeType:     strings.TrimSpace(item.MimeType),
+			OrgID:        session.OrgID,
+			OwnerID:      session.Uin,
+			FileSize:     item.FileSize,
+			Sha256:       item.Sha256,
+			Purpose:      filestore.PurposeArtifact,
+			PublicID:     artifactID,
+		})
+		if err != nil {
+			return fmt.Errorf("record artifact upload: %w", err)
+		}
+
+		projectFile := &types.ProjectFile{
+			FilePublicID: fileUpload.PublicID,
+			OrgID:        session.OrgID,
+			ProjectID:    *session.ProjectID,
+			TaskID:       *session.TaskID,
+			ResourceID:   fileUpload.ID,
+			ResourceType: types.ProjectFileResourceTypeArtifact,
+			Uin:          session.Uin,
+			RelativePath: relativePath,
+		}
+		if err := infradb.CreateProjectFileVersionFromPreviousPath(ctx, tx, projectFile, previousRelativePath); err != nil {
+			return fmt.Errorf("create artifact project file: %w", err)
+		}
+		persisted = projectFile
+		projResource, err := infradb.GetResourceByBizID(ctx, tx, session.OrgID, types.ResourceTypeProject, *session.ProjectID)
+		if err != nil {
+			return fmt.Errorf("get project resource for artifact: %w", err)
+		}
+		if projResource != nil {
+			ar := &types.Resource{
+				OrgID:                 session.OrgID,
+				Uin:                   session.Uin,
+				Type:                  types.ResourceTypeArtifact,
+				BizID:                 projectFile.ID,
+				ParentResourceID:      &projResource.ID,
+				ParentResourcePathIDs: types.ResourcePathIDs{projResource.ID},
+			}
+			if err := infradb.CreateResource(ctx, tx, ar); err != nil {
+				return fmt.Errorf("sync artifact resource: %w", err)
+			}
+		} else {
+			logs.WarnContextf(ctx, "project resource not found, skip artifact resource sync, project_id=%d", *session.ProjectID)
+		}
+		return nil
+	})
+	if err != nil {
+		logs.WarnContextf(ctx, "persist declared artifact: transaction failed, artifact_id=%s err=%v", artifactID, err)
+		return nil, err
+	}
+
+	logs.InfoContextf(ctx, "persist declared artifact: success, artifact_id=%s session_id=%s", artifactID, sessionID)
+	return persisted, nil
+}
+
+// PersistPublishedPlan persists a published plan as FileUpload + ProjectFile in a transaction.
+func (p *declaredArtifactPersister) PersistPublishedPlan(ctx context.Context, route messaging.RouteContext, pp *messaging.PlanPublishedPayload) error {
+	if p == nil || p.db == nil {
+		return nil
+	}
+	if pp == nil {
+		return fmt.Errorf("plan published payload is nil")
+	}
+	fileID := strings.TrimSpace(pp.FileID)
+	if fileID == "" {
+		return fmt.Errorf("file_id is required")
 	}
 	if route.OrgID == 0 {
 		return fmt.Errorf("org_id is required")
@@ -413,18 +674,19 @@ func (p *declaredArtifactPersister) PersistDeclaredArtifact(ctx context.Context,
 	if sessionID == "" {
 		return fmt.Errorf("session_id is required")
 	}
-	storageKey := strings.TrimSpace(item.StorageKey)
-	if storageKey == "" {
-		logs.WarnContextf(ctx, "persist declared artifact: storage_key is empty, artifact_id=%s session_id=%s", artifactID, sessionID)
-		return fmt.Errorf("storage_key is required")
+	storageURI := strings.TrimSpace(pp.StorageURI)
+	if storageURI == "" {
+		logs.InfoContextf(ctx, "persist published plan: storage_uri is empty, skipping file_id=%s session_id=%s", fileID, sessionID)
+		return nil
 	}
 
-	existing, err := infradb.GetArtifactByPublicID(ctx, p.db, route.OrgID, artifactID)
+	// Check idempotency via ProjectFile.FilePublicID unique index.
+	existingPF, err := infradb.GetProjectFileByFilePublicID(ctx, p.db, route.OrgID, fileID)
 	if err != nil {
 		return err
 	}
-	if existing != nil {
-		logs.InfoContextf(ctx, "persist declared artifact: already exists, artifact_id=%s session_id=%s", artifactID, sessionID)
+	if existingPF != nil {
+		logs.InfoContextf(ctx, "persist published plan: already exists, file_id=%s session_id=%s", fileID, sessionID)
 		return nil
 	}
 
@@ -433,145 +695,93 @@ func (p *declaredArtifactPersister) PersistDeclaredArtifact(ctx context.Context,
 		return fmt.Errorf("find session %s: %w", sessionID, err)
 	}
 	if session == nil {
-		logs.WarnContextf(ctx, "persist declared artifact: session not found, artifact_id=%s session_id=%s", artifactID, sessionID)
 		return fmt.Errorf("session %s not found", sessionID)
 	}
 	if session.OrgID != route.OrgID {
-		logs.WarnContextf(ctx, "persist declared artifact: org mismatch, artifact_id=%s session_org=%d route_org=%d",
-			artifactID, session.OrgID, route.OrgID)
 		return fmt.Errorf("session %s does not belong to org %d", sessionID, route.OrgID)
 	}
 	if session.ProjectID == nil || *session.ProjectID == 0 {
-		logs.WarnContextf(ctx, "persist declared artifact: session has no project_id, artifact_id=%s session_id=%s",
-			artifactID, sessionID)
-		return fmt.Errorf("session project_id is required for artifact persistence")
+		return fmt.Errorf("session project_id is required")
 	}
 	if session.TaskID == nil || *session.TaskID == 0 {
-		logs.WarnContextf(ctx, "persist declared artifact: session has no task_id, artifact_id=%s session_id=%s",
-			artifactID, sessionID)
-		return fmt.Errorf("session task_id is required for artifact persistence")
+		return fmt.Errorf("session task_id is required")
 	}
 
-	projects, err := infradb.GetProjectsByIDs(ctx, p.db, []uint{*session.ProjectID})
-	if err != nil {
-		return fmt.Errorf("find project %d: %w", *session.ProjectID, err)
-	}
-	if len(projects) == 0 {
-		return fmt.Errorf("project %d not found", *session.ProjectID)
-	}
-	project := projects[0]
-	projectPublicID := project.PublicID
-
-	filename := strings.TrimSpace(item.Filename)
+	filename := strings.TrimSpace(pp.Filename)
 	if filename == "" {
-		filename = item.Title
+		filename = "plan.md"
 	}
-	originalName := strings.TrimSpace(item.OriginalName)
+	originalName := strings.TrimSpace(pp.OriginalName)
 	if originalName == "" {
 		originalName = filename
 	}
-	storageURI := strings.TrimSpace(item.StorageURI)
-	fileURL := storageURI
-	if fileURL == "" {
-		fileURL = projectPublicID + "/" + storageKey
+	mimeType := strings.TrimSpace(pp.MimeType)
+	if mimeType == "" {
+		mimeType = "text/markdown"
+	}
+	relativePath, err := workspace.NormalizeRelativePath(filepath.Base(filename))
+	if err != nil {
+		return fmt.Errorf("normalize plan relative path: %w", err)
 	}
 
-	artifact := &types.Artifact{
-		PublicID:     artifactID,
-		OrgID:        session.OrgID,
-		OwnerID:      session.Uin,
-		TaskID:       *session.TaskID,
-		ProjectID:    *session.ProjectID,
-		SessionID:    &session.ID,
-		Title:        artifactTitle(item),
-		Filename:     filename,
-		Description:  strings.TrimSpace(item.Description),
-		ArtifactType: artifactType(item.ArtifactType),
-		FileURL:      fileURL,
-		FileSize:     item.FileSize,
-		RelativePath: item.RelativePath,
-		StorageKey:   storageKey,
-		MimeType:     item.MimeType,
-		Sha256:       item.Sha256,
-		Source:       artifactSource(item.Source),
-		Status:       artifactStatus(item.Status),
-		Metadata: types.ObjectMetadata{
-			Extra: map[string]interface{}{
-				"worker_id":         route.WorkerID,
-				"project_public_id": projectPublicID,
-			},
-		},
-	}
-	if artifact.Title == "" {
-		artifact.Title = filename
-	}
-	if err := infradb.CreateArtifact(ctx, p.db, artifact); err != nil {
-		logs.WarnContextf(ctx, "persist declared artifact: create artifact record failed, artifact_id=%s err=%v", artifactID, err)
-		existing, findErr := infradb.GetArtifactByPublicID(ctx, p.db, route.OrgID, artifactID)
-		if findErr == nil && existing != nil {
-			return nil
+	err = p.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		fileUpload, err := filestore.RecordUpload(ctx, tx, filestore.RecordUploadParams{
+			StorageURI:   storageURI,
+			Filename:     filename,
+			OriginalName: originalName,
+			MimeType:     mimeType,
+			OrgID:        session.OrgID,
+			OwnerID:      session.Uin,
+			FileSize:     pp.FileSize,
+			Sha256:       pp.Sha256,
+			Purpose:      filestore.PurposePlan,
+			PublicID:     fileID,
+		})
+		if err != nil {
+			return fmt.Errorf("record plan upload: %w", err)
 		}
+
+		projectFile := &types.ProjectFile{
+			FilePublicID: fileUpload.PublicID,
+			OrgID:        session.OrgID,
+			ProjectID:    *session.ProjectID,
+			TaskID:       *session.TaskID,
+			ResourceID:   fileUpload.ID,
+			ResourceType: types.ProjectFileResourceTypePlan,
+			Uin:          session.Uin,
+			RelativePath: relativePath,
+		}
+		if err := infradb.CreateProjectFileVersion(ctx, tx, projectFile); err != nil {
+			return fmt.Errorf("create plan project file: %w", err)
+		}
+		projResource, err := infradb.GetResourceByBizID(ctx, tx, session.OrgID, types.ResourceTypeProject, *session.ProjectID)
+		if err != nil {
+			return fmt.Errorf("get project resource for plan: %w", err)
+		}
+		if projResource != nil {
+			fr := &types.Resource{
+				OrgID:                 session.OrgID,
+				Uin:                   session.Uin,
+				Type:                  types.ResourceTypeFile,
+				BizID:                 projectFile.ID,
+				ParentResourceID:      &projResource.ID,
+				ParentResourcePathIDs: types.ResourcePathIDs{projResource.ID},
+			}
+			if err := infradb.CreateResource(ctx, tx, fr); err != nil {
+				return fmt.Errorf("sync plan file resource: %w", err)
+			}
+		} else {
+			logs.WarnContextf(ctx, "project resource not found, skip plan file resource sync, project_id=%d", *session.ProjectID)
+		}
+		return nil
+	})
+	if err != nil {
+		logs.WarnContextf(ctx, "persist published plan: transaction failed, file_id=%s err=%v", fileID, err)
 		return err
 	}
 
-	if storageURI == "" {
-		return nil
-	}
-	fileUpload, err := filestore.RecordUpload(ctx, p.db, filestore.RecordUploadParams{
-		StorageURI:   storageURI,
-		Filename:     filename,
-		OriginalName: originalName,
-		MimeType:     strings.TrimSpace(item.MimeType),
-		OrgID:        session.OrgID,
-		OwnerID:      session.Uin,
-		FileSize:     item.FileSize,
-		Sha256:       item.Sha256,
-		Purpose:      filestore.PurposeArtifact,
-	})
-	if err != nil {
-		return fmt.Errorf("record artifact upload: %w", err)
-	}
-	projectFile := &types.ProjectFile{
-		FilePublicID: fileUpload.PublicID,
-		OrgID:        session.OrgID,
-		ProjectID:    *session.ProjectID,
-		TaskID:       *session.TaskID,
-		ResourceID:   artifact.ID,
-		ResourceType: types.ProjectFileResourceTypeArtifact,
-		Uin:          session.Uin,
-	}
-	if err := infradb.CreateProjectFile(ctx, p.db, projectFile); err != nil {
-		return fmt.Errorf("create artifact project file: %w", err)
-	}
+	logs.InfoContextf(ctx, "persist published plan: success, file_id=%s session_id=%s", fileID, sessionID)
 	return nil
-}
-
-func artifactTitle(item events.ArtifactPayload) string {
-	if t := strings.TrimSpace(item.Title); t != "" {
-		return t
-	}
-	return strings.TrimSpace(item.Filename)
-}
-
-func artifactType(value string) string {
-	if v := strings.TrimSpace(value); v != "" {
-		return v
-	}
-	return "unknown"
-}
-
-func artifactSource(value string) string {
-	if v := strings.TrimSpace(value); v != "" {
-		return v
-	}
-	return "unknown"
-}
-
-func artifactStatus(value string) string {
-	if v := strings.TrimSpace(value); v != "" {
-		return v
-	}
-	return "pending"
 }
 
 func extractSkillName(toolName string, arguments json.RawMessage) string {

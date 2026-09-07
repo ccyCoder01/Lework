@@ -1,8 +1,8 @@
 "use client";
 
 import { AlertCircle, Table2 } from "lucide-react";
-import { useMemo, useState } from "react";
-import { read, utils, type WorkBook } from "xlsx";
+import { useEffect, useState } from "react";
+import type { WorkBook } from "xlsx";
 
 const MAX_PREVIEW_ROWS = 200;
 const MAX_PREVIEW_COLUMNS = 50;
@@ -14,6 +14,13 @@ type SheetPreview = {
 	totalColumns: number;
 };
 
+type SpreadsheetParseResult =
+	| { status: "loading" }
+	| { status: "ready"; sheets: SheetPreview[] }
+	| { status: "error"; error: string };
+
+type XlsxModule = typeof import("xlsx");
+
 export function SpreadsheetPreview({
 	buffer,
 	fileName,
@@ -21,10 +28,53 @@ export function SpreadsheetPreview({
 	buffer: ArrayBuffer;
 	fileName: string;
 }) {
-	const result = useMemo(() => parseWorkbook(buffer), [buffer]);
+	const [result, setResult] = useState<SpreadsheetParseResult>({ status: "loading" });
 	const [selectedSheet, setSelectedSheet] = useState(0);
 
-	if (result.error) {
+	useEffect(() => {
+		let cancelled = false;
+		setSelectedSheet(0);
+		setResult({ status: "loading" });
+
+		async function parsePreview() {
+			try {
+				// 按需加载 xlsx，避免 Next dev 启动时把重型表格解析库编进常驻依赖图。
+				const xlsx = await import("xlsx");
+				const { hydrateXlsxFormulaCache } = await import("./xlsx-formula-preview");
+				let previewBuffer = buffer;
+				try {
+					previewBuffer = await hydrateXlsxFormulaCache(buffer);
+				} catch {
+					previewBuffer = buffer;
+				}
+				const workbook = xlsx.read(previewBuffer, { type: "array" });
+				const sheets = workbook.SheetNames.map((name) => parseSheet(workbook, name, xlsx.utils));
+				if (!cancelled) setResult({ status: "ready", sheets });
+			} catch (err) {
+				if (cancelled) return;
+				setResult({
+					status: "error",
+					error: err instanceof Error ? err.message : "表格格式不正确或文件已损坏",
+				});
+			}
+		}
+
+		void parsePreview();
+
+		return () => {
+			cancelled = true;
+		};
+	}, [buffer]);
+
+	if (result.status === "loading") {
+		return (
+			<div className="flex h-full min-h-[320px] items-center justify-center text-sm text-[var(--leros-text-muted)]">
+				正在解析表格...
+			</div>
+		);
+	}
+
+	if (result.status === "error") {
 		return (
 			<div className="flex h-full min-h-[320px] items-center justify-center px-8 text-center text-sm text-[var(--leros-text-muted)]">
 				<div>
@@ -133,24 +183,7 @@ function columnName(columnIndex: number): string {
 	return name;
 }
 
-function parseWorkbook(buffer: ArrayBuffer):
-	| { sheets: SheetPreview[]; error?: undefined }
-	| {
-			sheets: [];
-			error: string;
-	  } {
-	try {
-		const workbook = read(buffer, { type: "array", cellDates: true });
-		return { sheets: workbook.SheetNames.map((name) => parseSheet(workbook, name)) };
-	} catch (err) {
-		return {
-			sheets: [],
-			error: err instanceof Error ? err.message : "表格格式不正确或文件已损坏",
-		};
-	}
-}
-
-function parseSheet(workbook: WorkBook, name: string): SheetPreview {
+function parseSheet(workbook: WorkBook, name: string, utils: XlsxModule["utils"]): SheetPreview {
 	const worksheet = workbook.Sheets[name];
 	if (!worksheet?.["!ref"]) {
 		return { name, rows: [], totalRows: 0, totalColumns: 0 };

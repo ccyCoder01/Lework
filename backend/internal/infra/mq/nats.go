@@ -8,24 +8,42 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/insmtx/Leros/backend/pkg/messaging"
 	"github.com/nats-io/nats.go"
 	"github.com/ygpkg/yg-go/logs"
 )
 
+// publishDefaultTimeout 是所有发布操作的统一超时（普通与终态事件一致）。
+const publishDefaultTimeout = 5 * time.Second
+
 // natsBus 表示一个 NATS 客户端，实现 Publisher 和 Subscriber 接口
+//
+// 并发模型（关闭/发布生命周期协议）：
+//   - 发布持有 mu 的读锁（RLock）：不同 Run 可并行发布，互不串行；同时保证
+//     关闭期间不会有发布跨过边界进入已关闭连接。
+//   - Close 持有写锁（Lock）：等待所有在途发布完成后再关闭底层连接，消除
+//     "发布检查 closed=false 后并发 Close" 的生命周期竞态。
+//   - closed 用 atomic 加速只读判断，避免在已关闭后仍加锁做发布尝试。
+//   - JetStream Publish 本身是 goroutine 安全的。
 type natsBus struct {
 	conn   *nats.Conn
 	js     nats.JetStreamContext
-	closed bool
-	mu     sync.Mutex
+	closed atomic.Bool
+	mu     sync.RWMutex
 }
 
-// NewNATS 创建一个新的 NATS JetStream 客户端实例
-// 在初始化阶段创建所有预配置的 Streams
+// 编译期断言：natsBus 满足 Core Requester 契约。
+var (
+	_ CoreRequester = (*natsBus)(nil)
+)
+
+// NewNATS 创建一个新的 NATS JetStream 客户端实例，并确保预配置 Stream 可用。
 func NewNATS(url string) (*natsBus, error) {
 	conn, err := nats.Connect(url)
 	if err != nil {
@@ -41,12 +59,11 @@ func NewNATS(url string) (*natsBus, error) {
 	}
 
 	bus := &natsBus{
-		conn:   conn,
-		js:     js,
-		closed: false,
+		conn: conn,
+		js:   js,
 	}
 
-	if err := bus.initStreams(); err != nil {
+	if err := bus.ensureStreams(); err != nil {
 		conn.Close()
 		logs.Errorf("Failed to initialize NATS streams: %v", err)
 		return nil, fmt.Errorf("failed to initialize NATS streams: %w", err)
@@ -56,62 +73,57 @@ func NewNATS(url string) (*natsBus, error) {
 	return bus, nil
 }
 
-// initStreams 在初始化阶段创建或更新所有预配置的 Stream
-func (p *natsBus) initStreams() error {
-	// 先清理可能冲突的旧 streams
-	existingStreamsCh := p.js.StreamNames()
-	var existingStreams []string
-	for name := range existingStreamsCh {
-		existingStreams = append(existingStreams, name)
-	}
-	for _, name := range existingStreams {
-		info, err := p.js.StreamInfo(name)
-		if err != nil {
+// ensureStreams 创建缺失的预配置 Stream，并更新同名 Stream。
+//
+// Subject overlap 是 NATS 全局资源冲突，不能由任意 Server/Worker 启动过程
+// 擅自删除。若既有 Stream 已承接对应 subject，则保留它并让按 subject 的
+// 发布和订阅继续使用实际路由。
+func (p *natsBus) ensureStreams() error {
+	for _, cfg := range messaging.StreamConfigs() {
+		if _, err := p.js.StreamInfo(cfg.Name); err == nil {
+			if _, err := p.js.UpdateStream(&cfg); err != nil {
+				return fmt.Errorf("update JetStream stream %q: %w", cfg.Name, err)
+			}
+			logs.Infof("Updated JetStream stream '%s' with subjects: %v", cfg.Name, cfg.Subjects)
 			continue
 		}
-		// 检查是否与预配置的 stream 冲突（同 subjects 但不同名）
-		isConfigured := false
-		for _, cfg := range messaging.StreamConfigs() {
-			if name == cfg.Name {
-				isConfigured = true
-				break
-			}
-			// 判断 subjects 是否重叠
-			if hasOverlap(info.Config.Subjects, cfg.Subjects) {
-				logs.Warnf("Deleting conflicting stream '%s' (subjects: %v)", name, info.Config.Subjects)
-				if err := p.js.DeleteStream(name); err != nil {
-					logs.Warnf("Failed to delete conflicting stream '%s': %v", name, err)
-				}
-			}
-		}
-		// 如果 stream 已存在但不是我们配置的，检查其 subjects
-		if !isConfigured {
-			for _, subj := range info.Config.Subjects {
-				for _, cfg := range messaging.StreamConfigs() {
-					if hasOverlap([]string{subj}, cfg.Subjects) {
-						logs.Warnf("Deleting conflicting stream '%s' with subject %q", name, subj)
-						_ = p.js.DeleteStream(name)
-						break
-					}
-				}
-			}
-		}
-	}
 
-	for _, cfg := range messaging.StreamConfigs() {
 		_, addErr := p.js.AddStream(&cfg)
 		if addErr == nil {
 			logs.Infof("Created JetStream stream '%s' with subjects: %v", cfg.Name, cfg.Subjects)
 			continue
 		}
 
-		// AddStream 失败，尝试 UpdateStream
-		if _, err := p.js.UpdateStream(&cfg); err != nil {
-			return fmt.Errorf("failed to initialize stream '%s': AddStream=%v, UpdateStream=%w", cfg.Name, addErr, err)
+		conflicts, err := p.findOverlappingStreams(cfg.Name, cfg.Subjects)
+		if err != nil {
+			return fmt.Errorf("inspect conflicting streams for %q: %w", cfg.Name, err)
 		}
-		logs.Infof("Updated JetStream stream '%s' with subjects: %v", cfg.Name, cfg.Subjects)
+		if len(conflicts) > 0 {
+			logs.Warnf("JetStream stream %q was not created because existing streams overlap its subjects; preserving existing streams: expected_subjects=%v conflicts=%v",
+				cfg.Name, cfg.Subjects, conflicts)
+			continue
+		}
+		return fmt.Errorf("create JetStream stream %q: %w", cfg.Name, addErr)
 	}
 	return nil
+}
+
+func (p *natsBus) findOverlappingStreams(expectedName string, subjects []string) ([]string, error) {
+	streamNames := p.js.StreamNames()
+	conflicts := make([]string, 0)
+	for name := range streamNames {
+		if name == expectedName {
+			continue
+		}
+		info, err := p.js.StreamInfo(name)
+		if err != nil {
+			return nil, err
+		}
+		if hasOverlap(info.Config.Subjects, subjects) {
+			conflicts = append(conflicts, fmt.Sprintf("%s:%v", name, info.Config.Subjects))
+		}
+	}
+	return conflicts, nil
 }
 
 // hasOverlap 检查两组 subjects 是否有重叠
@@ -177,12 +189,13 @@ func partialMatch(p1, p2 []string) bool {
 	return false
 }
 
-// publishWithContext 在给定上下文环境中发布消息到指定主题
+// publishWithContext 在给定上下文环境中发布消息到指定主题。
+//
+// 生命周期协议：发布持有读锁（并行），Close 持有写锁（独占）。
+// 因此发布要么完整执行、要么在 Close 已持有写锁后返回"已关闭"，不会跨入已关闭连接。
 func (p *natsBus) publishWithContext(ctx context.Context, topic string, message any) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.closed {
+	start := time.Now()
+	if p.closed.Load() {
 		return fmt.Errorf("NATS client is closed")
 	}
 
@@ -192,23 +205,56 @@ func (p *natsBus) publishWithContext(ctx context.Context, topic string, message 
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	// 发布消息
-	_, err = p.js.Publish(topic, body, nats.Context(ctx))
+	publishCtx := ctx
+	if publishCtx == nil {
+		publishCtx = context.Background()
+	}
+	publishCtx, cancel := context.WithTimeout(publishCtx, publishDefaultTimeout)
+	defer cancel()
+
+	// 读锁保证与 Close（写锁）互斥：在途发布不被并发关闭打断。
+	p.mu.RLock()
+	if p.closed.Load() {
+		p.mu.RUnlock()
+		return fmt.Errorf("NATS client is closed")
+	}
+	_, err = p.js.Publish(topic, body, nats.Context(publishCtx))
+	p.mu.RUnlock()
+
+	elapsed := time.Since(start).Milliseconds()
+	switch {
+	case err == nil:
+		logs.DebugContextf(publishCtx, "nats publish: topic=%s payload_bytes=%d elapsed_ms=%d",
+			topic, len(body), elapsed)
+	case elapsed > 500:
+		logs.WarnContextf(publishCtx,
+			"nats publish failed: topic=%s payload_bytes=%d elapsed_ms=%d err=%v",
+			topic, len(body), elapsed, err,
+		)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to publish message to topic '%s': %w", topic, err)
 	}
-
 	return nil
 }
 
 // subscribeWithContext 在给定上下文环境中订阅特定主题的消息。
 // 该函数会阻塞直到 context 被取消或订阅返回错误。
 func (p *natsBus) subscribeWithContext(ctx context.Context, topic string, handler func(msg *nats.Msg)) error {
+	if p.closed.Load() {
+		return fmt.Errorf("NATS client is closed")
+	}
 	// 使用 OrderedConsumer 不依赖 durable consumer，避免重启时 "consumer already bound" 错误。
 	// OrderedConsumer 使用 AckNone 策略，无需手动 ack。
+	p.mu.RLock()
+	if p.closed.Load() {
+		p.mu.RUnlock()
+		return fmt.Errorf("NATS client is closed")
+	}
 	sub, err := p.js.Subscribe(topic, func(msg *nats.Msg) {
 		handler(msg)
 	}, nats.OrderedConsumer(), nats.Context(ctx))
+	p.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to topic '%s': %w", topic, err)
 	}
@@ -237,12 +283,9 @@ func (p *natsBus) Publish(ctx context.Context, topic string, event any) error {
 // inbox is also injected into the JSON body at body.reply_to. Worker handlers must
 // read this field to know where to send their response.
 func (p *natsBus) Request(ctx context.Context, topic string, event any) (*nats.Msg, error) {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
+	if p.closed.Load() {
 		return nil, fmt.Errorf("NATS client is closed")
 	}
-	p.mu.Unlock()
 
 	body, err := json.Marshal(event)
 	if err != nil {
@@ -250,8 +293,15 @@ func (p *natsBus) Request(ctx context.Context, topic string, event any) (*nats.M
 	}
 
 	inbox := nats.NewInbox()
+	// 生命周期协议：订阅+发布在读锁内完成（与 Close 写锁互斥），随后解锁等待回复。
+	p.mu.RLock()
+	if p.closed.Load() {
+		p.mu.RUnlock()
+		return nil, fmt.Errorf("NATS client is closed")
+	}
 	sub, err := p.conn.SubscribeSync(inbox)
 	if err != nil {
+		p.mu.RUnlock()
 		return nil, fmt.Errorf("failed to subscribe to inbox %s: %w", inbox, err)
 	}
 	defer sub.Unsubscribe()
@@ -266,8 +316,11 @@ func (p *natsBus) Request(ctx context.Context, topic string, event any) (*nats.M
 		Data:    body,
 	})
 	if err != nil {
+		p.mu.RUnlock()
 		return nil, fmt.Errorf("failed to publish request to topic %s: %w", topic, err)
 	}
+	// 设置完成，释放读锁；下方等待回复不阻塞 Close。
+	p.mu.RUnlock()
 
 	// Wait for a single reply
 	reply, err := sub.NextMsgWithContext(ctx)
@@ -302,6 +355,57 @@ func (p *natsBus) Conn() *nats.Conn {
 	return p.conn
 }
 
+// RequestReply implements CoreRequester. It sends a Core-NATS request/reply
+// using a temporary inbox, without going through JetStream.
+//
+// This is deliberately distinct from Request() (which publishes through
+// JetStream): ops-style queries should not pollute the task message stream.
+// The caller supplies a deadline via ctx so that a timeout can be told apart
+// from an unavailable connection.
+func (p *natsBus) RequestReply(ctx context.Context, subject string, request any) (*nats.Msg, error) {
+	if p.closed.Load() {
+		return nil, fmt.Errorf("NATS client is closed")
+	}
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// 生命周期协议：订阅+发布在读锁内完成（与 Close 写锁互斥），随后解锁等待回复。
+	// Core NATS request/reply 按需可空（requestData == nil 时仅发 subject，不带 data）。
+	p.mu.RLock()
+	if p.closed.Load() {
+		p.mu.RUnlock()
+		return nil, fmt.Errorf("NATS client is closed")
+	}
+	inbox := nats.NewInbox()
+	sub, err := p.conn.SubscribeSync(inbox)
+	if err != nil {
+		p.mu.RUnlock()
+		return nil, fmt.Errorf("failed to subscribe to inbox %s: %w", inbox, err)
+	}
+	if err := p.conn.PublishRequest(subject, inbox, body); err != nil {
+		_ = sub.Unsubscribe()
+		p.mu.RUnlock()
+		return nil, fmt.Errorf("failed to send request to subject %s: %w", subject, err)
+	}
+	// 发布完成，释放读锁；下方等待回复不阻塞 Close。
+	p.mu.RUnlock()
+	defer sub.Unsubscribe()
+
+	reply, err := sub.NextMsgWithContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to receive reply on inbox %s for subject %s: %w", inbox, subject, err)
+	}
+	// Core NATS 在请求 subject 没有订阅者时，会向 inbox 投递一个空的
+	// 503 状态消息。不能把它当作正常业务回复交给上层 JSON 解码。
+	if len(reply.Data) == 0 && reply.Header.Get("Status") == "503" {
+		return nil, nats.ErrNoResponders
+	}
+	return reply, nil
+}
+
 // Subscribe implements the eventbus.Subscriber interface.
 // consumer 为空时使用临时消费者（OrderedConsumer, AckNone），非空时创建持久化消费者并自动 ACK/NAK。
 func (p *natsBus) Subscribe(ctx context.Context, topic string, consumer string, handler func(msg *nats.Msg)) error {
@@ -312,11 +416,19 @@ func (p *natsBus) Subscribe(ctx context.Context, topic string, consumer string, 
 }
 
 // subscribeWithDurable 使用持久化消费者订阅，handler 正常返回后自动 Ack，panic 时自动 Nak（不传播 panic）。
+// 适用于 handler 可同步完成确认的场景（如 control、interaction 等轻量 lane）。
+// 注意：Ack 时机是 handler 函数返回的时刻，如果 handler 内部有异步操作，
+// 需要改用 SubscribeManualDurable 自行控制确认时机。
 func (p *natsBus) subscribeWithDurable(ctx context.Context, topic string, consumer string, handler func(msg *nats.Msg)) error {
+	p.mu.RLock()
+	if p.closed.Load() {
+		p.mu.RUnlock()
+		return fmt.Errorf("NATS client is closed")
+	}
 	sub, err := p.js.Subscribe(topic, func(msg *nats.Msg) {
 		defer func() {
 			if r := recover(); r != nil {
-				logs.ErrorContextf(ctx, "Panic in handler for topic '%s', consumer '%s': %v", topic, consumer, r)
+				logs.ErrorContextf(ctx, "Panic in handler for topic '%s', consumer '%s': %v\n%s", topic, consumer, r, debug.Stack())
 				_ = msg.Nak()
 			} else {
 				_ = msg.Ack()
@@ -324,6 +436,7 @@ func (p *natsBus) subscribeWithDurable(ctx context.Context, topic string, consum
 		}()
 		handler(msg)
 	}, nats.Durable(consumer), nats.ManualAck(), nats.Context(ctx))
+	p.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to topic '%s' with consumer '%s': %w", topic, consumer, err)
 	}
@@ -338,15 +451,55 @@ func (p *natsBus) subscribeWithDurable(ctx context.Context, topic string, consum
 	return ctx.Err()
 }
 
-// SubscribeFrom implements the eventbus.Subscriber interface.
+// SubscribeManualDurable 使用持久化消费者订阅，handler 手动控制消息确认（不自动 Ack/Nak）。
+// handler 收到消息后自行决定何时调用 Ack、Nak、NakWithDelay 或 Term。
+// 适用于需要在确认前完成额外操作的场景（如持久化到本地 inbox 后再 Ack）。
+// handler 中发生 panic 时自动 Nak（不传播 panic）。
+func (p *natsBus) SubscribeManualDurable(ctx context.Context, topic string, consumer string, handler func(msg *nats.Msg)) error {
+	p.mu.RLock()
+	if p.closed.Load() {
+		p.mu.RUnlock()
+		return fmt.Errorf("NATS client is closed")
+	}
+	sub, err := p.js.Subscribe(topic, func(msg *nats.Msg) {
+		defer func() {
+			if r := recover(); r != nil {
+				logs.ErrorContextf(ctx, "Panic in manual handler for topic '%s', consumer '%s': %v\n%s", topic, consumer, r, debug.Stack())
+				_ = msg.Nak()
+			}
+		}()
+		handler(msg)
+	}, nats.Durable(consumer), nats.ManualAck(), nats.Context(ctx))
+	p.mu.RUnlock()
+	if err != nil {
+		return fmt.Errorf("failed to manually subscribe to topic '%s' with consumer '%s': %w", topic, consumer, err)
+	}
+
+	<-ctx.Done()
+
+	if err := sub.Unsubscribe(); err != nil {
+		logs.WarnContextf(ctx, "Failed to unsubscribe from topic '%s': %v", topic, err)
+	}
+	logs.InfoContextf(ctx, "Unsubscribed from topic: %s (consumer: %s)", topic, consumer)
+
+	return ctx.Err()
+}
+
+// SubscribeFrom 从指定序列号开始订阅，支持断点续传场景。
 // startSeq == 0 时使用 DeliverNew 仅投递新消息；
 // startSeq > 0 时使用 DeliverByStartSequence 从指定序列号开始投递。
+// 当本地记录的序列号超出 stream 的最新序列号时，自动降级为只订阅新消息。
 func (p *natsBus) SubscribeFrom(ctx context.Context, topic string, startSeq int64, handler func(msg *nats.Msg)) error {
 	if startSeq <= 0 {
 		return p.subscribeNewOnly(ctx, topic, handler)
 	}
-	streamName := messaging.StreamNameFromSubject(topic)
-	if streamName != "" {
+	p.mu.RLock()
+	if p.closed.Load() {
+		p.mu.RUnlock()
+		return fmt.Errorf("NATS client is closed")
+	}
+	streamName, resolveErr := p.js.StreamNameBySubject(topic)
+	if resolveErr == nil && streamName != "" {
 		info, err := p.js.StreamInfo(streamName)
 		if err != nil {
 			logs.WarnContextf(ctx, "Failed to inspect stream %s before subscribing to %s from seq %d: %v", streamName, topic, startSeq, err)
@@ -358,13 +511,17 @@ func (p *natsBus) SubscribeFrom(ctx context.Context, topic string, startSeq int6
 				streamName,
 				info.State.LastSeq,
 			)
+			p.mu.RUnlock()
 			return p.subscribeNewOnly(ctx, topic, handler)
 		}
+	} else if resolveErr != nil {
+		logs.DebugContextf(ctx, "Skip stream sequence precheck for topic %s: %v", topic, resolveErr)
 	}
 	sub, err := p.js.Subscribe(topic, handler,
 		nats.StartSequence(uint64(startSeq)),
 		nats.Context(ctx),
 	)
+	p.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("failed to subscribe from seq %d on topic '%s': %w", startSeq, topic, err)
 	}
@@ -381,14 +538,17 @@ func (p *natsBus) SubscribeFrom(ctx context.Context, topic string, startSeq int6
 
 // subscribeNewOnly 使用 JetStream DeliverNew 策略订阅，仅接收订阅之后的新消息。
 func (p *natsBus) subscribeNewOnly(ctx context.Context, topic string, handler func(msg *nats.Msg)) error {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
+	if p.closed.Load() {
 		return fmt.Errorf("NATS client is closed")
 	}
-	p.mu.Unlock()
 
+	p.mu.RLock()
+	if p.closed.Load() {
+		p.mu.RUnlock()
+		return fmt.Errorf("NATS client is closed")
+	}
 	sub, err := p.js.Subscribe(topic, handler, nats.DeliverNew(), nats.Context(ctx))
+	p.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to topic '%s' (new only): %w", topic, err)
 	}
@@ -408,11 +568,11 @@ func (p *natsBus) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.closed {
+	if p.closed.Load() {
 		return nil
 	}
 
-	p.closed = true
+	p.closed.Store(true)
 	p.conn.Close()
 
 	return nil

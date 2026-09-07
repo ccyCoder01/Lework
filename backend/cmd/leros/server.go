@@ -13,11 +13,16 @@ import (
 	"strings"
 
 	"github.com/insmtx/Leros/backend/config"
+	"github.com/insmtx/Leros/backend/internal/adapter"
 	"github.com/insmtx/Leros/backend/internal/api"
-	skilllinks "github.com/insmtx/Leros/backend/internal/assistant/bootstrap/skilllinks"
 	infradb "github.com/insmtx/Leros/backend/internal/infra/db"
 	"github.com/insmtx/Leros/backend/internal/infra/filestore"
 	"github.com/insmtx/Leros/backend/internal/infra/mq"
+	infrasms "github.com/insmtx/Leros/backend/internal/infra/sms"
+	"github.com/insmtx/Leros/backend/internal/llm"
+	"github.com/insmtx/Leros/backend/internal/modelrouter"
+	"github.com/insmtx/Leros/backend/internal/seed"
+	"github.com/insmtx/Leros/backend/internal/service"
 	"github.com/insmtx/Leros/backend/pkg/leros"
 	"github.com/spf13/cobra"
 	"github.com/ygpkg/yg-go/lifecycle"
@@ -30,6 +35,11 @@ var (
 	serverConfigPath    string
 	serverWorkspaceRoot string
 )
+
+// defaultSeedScriptDir 是 SQL 种子脚本目录，相对进程工作目录。
+// 本地开发（cwd=仓库根）指向 deployments/dev/seed；容器内 WORKDIR=/app，
+// 与 Dockerfile COPY 的 /app/deployments/dev/seed 对齐，故无需配置。
+const defaultSeedScriptDir = "deployments/dev/seed"
 
 func newServerCommand() *cobra.Command {
 	cmd := &cobra.Command{
@@ -55,9 +65,6 @@ func newServerCommand() *cobra.Command {
 				logs.Fatalf("Failed to ensure state dir: %v", err)
 				return
 			}
-			if err := skilllinks.SyncServerSkillsDir(""); err != nil {
-				logs.Warnf("Sync server built-in skills failed: %v", err)
-			}
 
 			natsUrl := "nats://nats:4222"
 			if cfg.NATS != nil && cfg.NATS.URL != "" {
@@ -72,7 +79,7 @@ func newServerCommand() *cobra.Command {
 
 			var db *gorm.DB
 			if cfg.Database != nil && cfg.Database.URL != "" {
-				db, err = infradb.InitDB(*cfg.Database, cfg.LLM)
+				db, err = infradb.InitDB(*cfg.Database)
 				if err != nil {
 					logs.Fatalf("Failed to initialize database: %v", err)
 					return
@@ -91,7 +98,43 @@ func newServerCommand() *cobra.Command {
 			}
 			logs.Info("Storage initialized successfully")
 
-			r := api.SetupRouter(*cfg, publisher, db)
+			var modelInvoker modelrouter.Invoker
+			if db != nil {
+				modelInvoker = modelrouter.NewModelRouter(
+					llm.NewManager(db),
+					llm.NewCallerHTTP(nil, llm.NewRecorder(db)),
+				)
+			}
+
+			var iamCfg *config.IAMConfig
+			if cfg.Auth != nil {
+				iamCfg = cfg.Auth
+			}
+			var workerProvisioning *service.WorkerProvisioningService
+			if db != nil {
+				workerProvisioning = service.NewWorkerProvisioningService(db, cfg.Scheduler)
+			}
+			edition := adapter.NewEdition(adapter.Config{
+				DB:                 db,
+				JWTSecret:          cfg.Server.JWT.Secret,
+				IAM:                iamCfg,
+				Env:                cfg.Env,
+				SmsSender:          infrasms.NewSender(cfg.Aliyun),
+				WorkerAuth:         cfg.WorkerAuth,
+				WorkerProvisioning: workerProvisioning,
+			})
+
+			if db != nil {
+				if err := seed.Run(cmd.Context(), db, edition, seed.Options{
+					LLMConfig:     cfg.LLM,
+					SQLScriptDir:  defaultSeedScriptDir,
+					MCPConnectors: cfg.MCPConnectors,
+				}); err != nil {
+					logs.Fatalf("Failed to seed initial data: %v", err)
+				}
+			}
+
+			r, workerScheduler := api.SetupRouter(*cfg, edition, publisher, publisher, db, modelInvoker)
 
 			srv := &http.Server{
 				Addr:    fmt.Sprintf(":%s", cfg.Server.Port),
@@ -107,6 +150,16 @@ func newServerCommand() *cobra.Command {
 				}
 			}()
 
+			if workerScheduler != nil {
+				lifecycle.Std().AddCloseFunc(func() error {
+					logs.Info("Shutting down worker scheduler")
+					if err := workerScheduler.Shutdown(cmd.Context()); err != nil {
+						logs.Errorf("Worker scheduler shutdown error: %v", err)
+					}
+					return nil
+				})
+			}
+
 			lifecycle.Std().AddCloseFunc(func() error {
 				if err := srv.Shutdown(cmd.Context()); err != nil {
 					logs.Errorf("Server forced to shutdown: %v", err)
@@ -115,6 +168,10 @@ func newServerCommand() *cobra.Command {
 			})
 
 			lifecycle.Std().AddCloseFunc(publisher.Close)
+			lifecycle.Std().AddCloseFunc(func() error {
+				logs.Close()
+				return nil
+			})
 			lifecycle.Std().WaitExit()
 
 			logs.Info("Server exited")
@@ -131,6 +188,9 @@ func applyServerWorkspaceRoot(cfg *config.Config) error {
 		return fmt.Errorf("config is required")
 	}
 	root := strings.TrimSpace(cfg.WorkspaceRoot)
+	if root == "" && cfg.Scheduler != nil {
+		root = strings.TrimSpace(cfg.Scheduler.WorkspaceHostPathRoot)
+	}
 	if root == "" {
 		return nil
 	}
@@ -165,6 +225,12 @@ func loadConfig(configPath string) (*config.Config, error) {
 		}
 	}
 
+	if err := applyLoggerConfig("leros-server", cfg.Logger); err != nil {
+		return nil, fmt.Errorf("failed to configure logger: %w", err)
+	}
+	if len(cfg.Logger) == 0 {
+		applyLogLevel(cfg.Log.Level)
+	}
 	logs.Info("Configuration loaded successfully")
 	return &cfg, nil
 }

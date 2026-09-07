@@ -49,6 +49,7 @@ func TestPrepareTaskWorkspaceClonesPullsAndPreservesTurnDirectories(t *testing.T
 	if got, readErr := os.ReadFile(filepath.Join(plan.RepoDir, "README.md")); readErr != nil || string(got) != "first" {
 		t.Fatalf("cloned README = %q, error = %v", got, readErr)
 	}
+	assertNoAssetsDir(t, plan.RepoDir)
 
 	writeWorkspaceFile(t, filepath.Join(source, "README.md"), "second")
 	runGit(t, source, "add", "README.md")
@@ -62,6 +63,54 @@ func TestPrepareTaskWorkspaceClonesPullsAndPreservesTurnDirectories(t *testing.T
 	}
 	if _, statErr := os.Stat(plan.ArtifactManifestPath); statErr != nil {
 		t.Fatalf("artifact manifest after pull: %v", statErr)
+	}
+	assertNoAssetsDir(t, plan.RepoDir)
+}
+
+func TestPrepareTaskWorkspaceDoesNotCreateAssetsDirForLocalInit(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	t.Setenv(leros.EnvWorkspaceRoot, workspaceRoot)
+
+	plan, err := PrepareTaskWorkspace(context.Background(), TaskWorkspaceRequest{
+		OrgID:     7,
+		ProjectID: "project-1",
+		TaskID:    "task-1",
+		RequestID: "request-1",
+	})
+	if err != nil {
+		t.Fatalf("PrepareTaskWorkspace() error = %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(plan.RepoDir, ".git")); statErr != nil {
+		t.Fatalf("git repo was not initialized: %v", statErr)
+	}
+	assertNoAssetsDir(t, plan.RepoDir)
+}
+
+func TestPrepareTaskWorkspacePreservesLocalGitRepoWithoutRemote(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	t.Setenv(leros.EnvWorkspaceRoot, workspaceRoot)
+
+	request := TaskWorkspaceRequest{
+		OrgID:     7,
+		ProjectID: "project-1",
+		TaskID:    "task-1",
+		RequestID: "request-1",
+	}
+	plan, err := PrepareTaskWorkspace(context.Background(), request)
+	if err != nil {
+		t.Fatalf("PrepareTaskWorkspace() error = %v", err)
+	}
+	writeWorkspaceFile(t, filepath.Join(plan.RepoDir, "report.md"), "keep me")
+	runGit(t, plan.RepoDir, "add", "report.md")
+	runGit(t, plan.RepoDir, "-c", "user.name=Leros Test", "-c", "user.email=test@example.com", "commit", "-m", "add report")
+
+	request.RequestID = "request-2"
+	plan, err = PrepareTaskWorkspace(context.Background(), request)
+	if err != nil {
+		t.Fatalf("second PrepareTaskWorkspace() error = %v", err)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(plan.RepoDir, "report.md")); readErr != nil || string(got) != "keep me" {
+		t.Fatalf("local repo file after second prepare = %q, error = %v", got, readErr)
 	}
 }
 
@@ -81,5 +130,16 @@ func writeWorkspaceFile(t *testing.T, path, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func assertNoAssetsDir(t *testing.T, repoDir string) {
+	t.Helper()
+	_, err := os.Stat(filepath.Join(repoDir, "assets"))
+	if err == nil {
+		t.Fatalf("assets dir should not be created")
+	}
+	if !os.IsNotExist(err) {
+		t.Fatalf("stat assets dir: %v", err)
 	}
 }

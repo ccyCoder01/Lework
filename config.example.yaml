@@ -32,5 +32,13 @@ organization:
 cli:
   default: "claude"
 
-logging:
+log:
   level: "info"                        # Logging Level: debug, info, warn, error
+
+# Authentication adapter configuration
+# The auth block delegates to the IAM service when building with -tags enterprise.
+# auth:
+#   base_url: "https://iam.example.com"  # IAM 服务地址
+#   domain_name: "example.com"              # 域名，用于登录配置查询
+#   phone_code_login_enabled: true          # 是否开启手机号验证码登录，默认 true
+

@@ -4,6 +4,6 @@
 		"baseUrl": ".",
 		"ignoreDeprecations": "5.0"
 	},
-	"include": ["**/*.ts", "**/*.tsx"],
+	"include": ["**/*.ts", "**/*.tsx", "**/*.d.ts"],
 	"exclude": ["node_modules"]
 }

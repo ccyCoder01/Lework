@@ -1,3 +1,5 @@
+//go:build !enterprise
+
 package handler
 
 import (
@@ -12,20 +14,44 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/insmtx/Leros/backend/config"
-	"github.com/insmtx/Leros/backend/internal/api/auth"
+	"github.com/insmtx/Leros/backend/internal/adapter/account/oss"
+	localauth "github.com/insmtx/Leros/backend/internal/api/auth"
 	"github.com/insmtx/Leros/backend/types"
 )
+
+func setupWorkerAuthTestDatabase(t *testing.T, orgID, workerID uint) *gorm.DB {
+	t.Helper()
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	if err := database.AutoMigrate(&types.DigitalAssistant{}, &types.WorkerDeployment{}); err != nil {
+		t.Fatalf("migrate database: %v", err)
+	}
+	if err := database.Create(&types.DigitalAssistant{
+		Model:    gorm.Model{ID: workerID},
+		PublicID: "agent-config",
+		OrgID:    orgID,
+		Name:     "Config Agent",
+		Status:   string(types.DigitalAssistantStatusActive),
+	}).Error; err != nil {
+		t.Fatalf("create assistant: %v", err)
+	}
+	return database
+}
 
 func TestWorkerAuthHandlerIssueToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	database := setupWorkerAuthTestDatabase(t, 3, 7)
 	cfg := &config.WorkerAuthConfig{
 		BootstrapTokens: []config.WorkerBootstrapToken{
 			{OrgID: 3, WorkerID: 7, Token: "bootstrap-token"},
 		},
 		TokenTTLSeconds: 3600,
 	}
-	RegisterWorkerAuthRoutes(router, cfg, "jwt-secret", nil)
+	parser := oss.NewTokenParser(database, "jwt-secret", cfg)
+	RegisterWorkerAuthRoutes(router, parser)
 
 	body, err := json.Marshal(map[string]uint{
 		"org_id":    3,
@@ -58,7 +84,7 @@ func TestWorkerAuthHandlerIssueToken(t *testing.T) {
 		t.Fatal("auth_token should not be empty")
 	}
 
-	claims, err := auth.ParseWorkerToken(resp.Data.AuthToken, "jwt-secret")
+	claims, err := localauth.ParseWorkerToken(resp.Data.AuthToken, "jwt-secret")
 	if err != nil {
 		t.Fatalf("parse worker token: %v", err)
 	}
@@ -70,12 +96,14 @@ func TestWorkerAuthHandlerIssueToken(t *testing.T) {
 func TestWorkerAuthHandlerRejectsWrongBootstrapToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	database := setupWorkerAuthTestDatabase(t, 3, 7)
 	cfg := &config.WorkerAuthConfig{
 		BootstrapTokens: []config.WorkerBootstrapToken{
 			{OrgID: 3, WorkerID: 7, Token: "bootstrap-token"},
 		},
 	}
-	RegisterWorkerAuthRoutes(router, cfg, "jwt-secret", nil)
+	parser := oss.NewTokenParser(database, "jwt-secret", cfg)
+	RegisterWorkerAuthRoutes(router, parser)
 
 	body := []byte(`{"org_id":3,"worker_id":7}`)
 	req := httptest.NewRequest(http.MethodPost, "/workers/token", bytes.NewReader(body))
@@ -100,10 +128,10 @@ func TestWorkerAuthHandlerIssueTokenFromDeploymentHash(t *testing.T) {
 		t.Fatalf("migrate database: %v", err)
 	}
 	assistant := &types.DigitalAssistant{
-		Code:   "agent-a",
-		OrgID:  3,
-		Name:   "Agent A",
-		Status: "active",
+		PublicID: "agent-a",
+		OrgID:    3,
+		Name:     "Agent A",
+		Status:   "active",
 	}
 	if err := database.Create(assistant).Error; err != nil {
 		t.Fatalf("create assistant: %v", err)
@@ -115,13 +143,14 @@ func TestWorkerAuthHandlerIssueTokenFromDeploymentHash(t *testing.T) {
 		WorkerID:           9,
 		DeploymentName:     "leros-worker-o3-w9",
 		Status:             string(types.WorkerDeploymentStatusProvisioning),
-		BootstrapTokenHash: auth.HashBootstrapToken(bootstrapToken),
+		BootstrapTokenHash: localauth.HashBootstrapToken(bootstrapToken),
 	}).Error; err != nil {
 		t.Fatalf("create deployment: %v", err)
 	}
 
 	router := gin.New()
-	RegisterWorkerAuthRoutes(router, nil, "jwt-secret", database)
+	parser := oss.NewTokenParser(database, "jwt-secret", nil)
+	RegisterWorkerAuthRoutes(router, parser)
 
 	body := []byte(`{"org_id":3,"worker_id":9}`)
 	req := httptest.NewRequest(http.MethodPost, "/workers/token", bytes.NewReader(body))

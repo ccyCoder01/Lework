@@ -1,13 +1,17 @@
 "use client";
 
-import { type AppNavigation, Shell } from "@leros/app-ui";
+import { type AppNavigation, PrivateDeploymentGate, Shell } from "@leros/app-ui";
 import { usePathname, useRouter } from "next/navigation";
 import type { ReactNode } from "react";
 
 export function LerosShell({ children }: { children: ReactNode }) {
 	const navigation = useWebNavigation();
 
-	return <Shell navigation={navigation}>{children}</Shell>;
+	return (
+		<PrivateDeploymentGate>
+			<Shell navigation={navigation}>{children}</Shell>
+		</PrivateDeploymentGate>
+	);
 }
 
 export function useWebNavigation(): AppNavigation {
@@ -21,23 +25,37 @@ export function useWebNavigation(): AppNavigation {
 				chat: "/chat",
 				workbench: "/workbench",
 				tasks: "/tasks",
-				project: "/workbench",
+				project: "/chat",
 				projectsHub: "/projects",
-				taskDetail: "/workbench",
-				digitalAssistant: "/assistants",
-				aiTeammates: "/ai-teammates",
+				taskDetail: "/chat",
+				orgProfile: "/org/profile",
+				orgDepartments: "/org/departments",
+				orgAssistants: "/org/assistants",
+				orgModels: "/org/models",
 				knowledge: "/knowledge",
 				skills: "/skills",
+				automation: "/automation",
 				settings: "/settings",
 			}[route];
+			if (!routePath) {
+				router.push("/chat");
+				return;
+			}
 			router.push(routePath);
 		},
 		goToProject(projectId) {
 			router.push(`/projects/${projectId}`);
 		},
+		goToProjectTasks(projectId) {
+			router.push(`/projects/${projectId}/tasks`);
+		},
 		goToTaskDetail(projectId, taskId, sessionId) {
-			const search = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
-			router.push(`/projects/${projectId}/tasks/${taskId}${search}`);
+			router.push(
+				`/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(taskId)}/sessions/${encodeURIComponent(sessionId)}`,
+			);
+		},
+		goToAutomationDetail(publicId) {
+			router.push(`/automation/${encodeURIComponent(publicId)}`);
 		},
 	};
 }
