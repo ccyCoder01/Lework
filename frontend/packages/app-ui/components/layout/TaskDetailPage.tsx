@@ -46,6 +46,8 @@ import { CanGate } from "../permission/CanGate";
 import { openProjectFilePreview } from "./file-preview-store";
 import { PROJECT_FILE_VERSION_CHANGED_EVENT } from "./file-preview-utils";
 import type { AppNavigation } from "./LeftRail";
+import { PayrollTaskPanel } from "./PayrollTaskPanel";
+import { isPayrollTaskSession } from "./payroll-service-client";
 import { getProjectChatLayoutClasses, type ProjectChatLayoutMode } from "./project-chat-layout";
 import { ProjectFileTypeIcon } from "./project-file-type-icon";
 import {
@@ -120,6 +122,7 @@ export function TaskDetailPage({
 	const [teammate, setTeammate] = useState<DigitalAssistantItem | null>(null);
 	const [renameDialogOpen, setRenameDialogOpen] = useState(false);
 	const [renameValue, setRenameValue] = useState("");
+	const [payrollWorkbenchOpen, setPayrollWorkbenchOpen] = useState(false);
 	const [taskFiles, setTaskFiles] = useState<ProjectFileNode[]>([]);
 	const [rightSidebarWidth, setRightSidebarWidth] = useState(
 		TASK_DETAIL_RIGHT_SIDEBAR_DEFAULT_WIDTH,
@@ -556,6 +559,32 @@ export function TaskDetailPage({
 						contentClassName={taskChatLayout.timelineInner}
 						projectId={resolvedProjectId}
 					/>
+					{isPayrollTaskSession(resolvedSessionId) &&
+					resolvedProjectId &&
+					resolvedTaskId &&
+					resolvedSessionId ? (
+						<>
+							<div className={cn("shrink-0 bg-white pb-2", taskChatLayout.shell)}>
+								<div className={taskChatLayout.inner}>
+									<Button
+										type="button"
+										variant="outline"
+										size="sm"
+										onClick={() => setPayrollWorkbenchOpen(true)}
+									>
+										人员工资基准
+									</Button>
+								</div>
+							</div>
+							<PayrollTaskPanel
+								open={payrollWorkbenchOpen}
+								onOpenChange={setPayrollWorkbenchOpen}
+								projectId={resolvedProjectId}
+								taskId={resolvedTaskId}
+								sessionId={resolvedSessionId}
+							/>
+						</>
+					) : null}
 					<ChatInput
 						variant="project"
 						projectLayoutMode={taskChatLayoutMode}

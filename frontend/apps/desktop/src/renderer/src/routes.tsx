@@ -3,6 +3,7 @@ import {
 	AutomationExecutionPage,
 	AutomationListView,
 	OrgAdminPage,
+	PayrollAccountingPage,
 	WorkbenchPage,
 	ProjectPage,
 	ProjectsHubView,
@@ -27,6 +28,8 @@ export function AppRoutes() {
 				<Route path="/chat" element={<NewTaskRoutePage />} />
 
 				<Route path="/workbench" element={<WorkbenchRoutePage />} />
+
+				<Route path="/workbench/payroll" element={<PayrollAccountingRoutePage />} />
 
 				<Route path="/projects" element={<ProjectsHubRoutePage />} />
 
@@ -114,6 +117,10 @@ function useDesktopNavigation(): AppNavigation {
 			navigate(routePath ?? "/chat");
 		},
 
+		goToPath(path) {
+			navigate(path);
+		},
+
 		goToProject(projectId) {
 			navigate(`/projects/${projectId}`);
 		},
@@ -138,6 +145,12 @@ function WorkbenchRoutePage() {
 	const navigation = useDesktopNavigation();
 
 	return <WorkbenchPage navigation={navigation} />;
+}
+
+function PayrollAccountingRoutePage() {
+	const navigation = useDesktopNavigation();
+
+	return <PayrollAccountingPage navigation={navigation} />;
 }
 
 function NewTaskRoutePage() {
