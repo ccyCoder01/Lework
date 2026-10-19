@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import tempfile
 import time
@@ -19,13 +18,17 @@ except ImportError as exc:
 
 MAX_PAGES_PER_PDF = 50
 MAX_IMAGE_SIDE = 2200
-OVERVIEW_DPI = 160
 DETAIL_DPI = 300
 MAX_DATA_PARTITIONS = 3
 MAX_VIEWS_PER_PAGE = 1 + MAX_DATA_PARTITIONS
 CONTENT_THRESHOLD = 6
 CONTENT_GAP_PX = 20
 PARTITION_OVERLAP = 0.08
+PREPROCESS_VERSION = 3
+DESKEW_MIN_ANGLE = 0.35
+DESKEW_MAX_ANGLE = 2.0
+DESKEW_STEP = 0.1
+DESKEW_MIN_SCORE_GAIN = 0.01
 
 
 def _sha256(path: Path) -> str:
@@ -34,6 +37,30 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _preprocess_config() -> dict:
+    return {
+        "version": PREPROCESS_VERSION,
+        "detail_dpi": DETAIL_DPI,
+        "max_image_side": MAX_IMAGE_SIDE,
+        "max_data_partitions": MAX_DATA_PARTITIONS,
+        "content_threshold": CONTENT_THRESHOLD,
+        "content_gap_px": CONTENT_GAP_PX,
+        "partition_overlap": PARTITION_OVERLAP,
+        "deskew": {
+            "algorithm": "bounded_horizontal_projection_v1",
+            "minimum_angle_degrees": DESKEW_MIN_ANGLE,
+            "maximum_angle_degrees": DESKEW_MAX_ANGLE,
+            "step_degrees": DESKEW_STEP,
+            "minimum_score_gain": DESKEW_MIN_SCORE_GAIN,
+        },
+    }
+
+
+def _preprocess_config_sha256() -> str:
+    raw = json.dumps(_preprocess_config(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _write_runtime_record(workdir: Path, event: dict) -> None:
@@ -66,10 +93,23 @@ def _cached_result(inputs: list[Path], workdir: Path, started_ns: int) -> dict |
     expected_sources = [path.expanduser().resolve() for path in inputs]
     if not isinstance(documents, list) or [Path(doc.get("source", "")).resolve() for doc in documents] != expected_sources:
         raise ValueError("当前任务已存在不同的 PDF 清单；不支持追加或替换上传")
-    if manifest.get("view_schema_version") == 2:
-        for document in documents:
-            if document.get("source_sha256") != _sha256(Path(document["source"])):
-                raise ValueError("原始 PDF 已变化；请在新任务中重新预处理")
+    if manifest.get("preprocess_version") != PREPROCESS_VERSION:
+        raise ValueError("当前任务图片使用旧预处理版本；为避免混用视图，请在新任务工作目录中预处理")
+    if manifest.get("view_schema_version") != PREPROCESS_VERSION:
+        raise ValueError("当前任务视图结构版本不匹配；请在新任务工作目录中预处理")
+    if (manifest.get("preprocess_config_sha256") != _preprocess_config_sha256()
+            or manifest.get("preprocess_config") != _preprocess_config()):
+        raise ValueError("当前任务预处理参数已变化；为避免复用旧视图，请在新任务工作目录中预处理")
+    for document in documents:
+        if document.get("source_sha256") != _sha256(Path(document["source"])):
+            raise ValueError("原始 PDF 已变化；请在新任务中重新预处理")
+        for page in document.get("pages", []):
+            for view in page.get("views", []):
+                image = Path(view.get("image", ""))
+                resolved_image = image.resolve()
+                if (image.is_symlink() or not resolved_image.is_relative_to(workdir.resolve())
+                        or not resolved_image.is_file() or _sha256(resolved_image) != view.get("image_sha256")):
+                    raise ValueError(f"缓存视图缺失或摘要不一致: {view.get('view_id')}")
     total_pages = sum(len(document.get("pages", [])) for document in documents)
     total_views = sum(len(page.get("views", [])) for document in documents for page in document.get("pages", []))
     elapsed_ms = round((time.perf_counter_ns() - started_ns) / 1_000_000, 3)
@@ -98,6 +138,79 @@ def _cached_result(inputs: list[Path], workdir: Path, started_ns: int) -> dict |
         "reused_view_images": total_views,
         "cached": True,
     }
+
+
+def _alignment_score(image: Image.Image, angle: float) -> float:
+    width = 480
+    height = max(1, round(image.height * width / image.width))
+    gray = image.convert("L").resize((width, height), Image.Resampling.BILINEAR)
+    rotated = gray.rotate(angle, resample=Image.Resampling.BILINEAR, expand=False, fillcolor=255)
+    pixels = rotated.point(lambda value: 0 if value < 180 else 255).tobytes()
+    x0, x1 = int(width * 0.04), int(width * 0.96)
+    y0, y1 = int(height * 0.05), int(height * 0.95)
+    row_width = x1 - x0
+    score = 0
+    for y in range(y0, y1):
+        count = pixels[y * width + x0:y * width + x1].count(0)
+        score += count * count
+    return score / max(1, (y1 - y0) * row_width * row_width)
+
+
+def _deskew(image: Image.Image) -> tuple[Image.Image, dict]:
+    source_size = list(image.size)
+    try:
+        angles = [round(step * DESKEW_STEP, 1) for step in range(
+            round(-DESKEW_MAX_ANGLE / DESKEW_STEP),
+            round(DESKEW_MAX_ANGLE / DESKEW_STEP) + 1,
+        )]
+        scores = [(angle, _alignment_score(image, angle)) for angle in angles]
+        best_angle, best_score = max(scores, key=lambda item: item[1])
+        zero_score = next(score for angle, score in scores if angle == 0)
+        gain = (best_score - zero_score) / zero_score if zero_score else 0.0
+        at_limit = abs(best_angle) >= DESKEW_MAX_ANGLE
+        above_minimum = abs(best_angle) >= DESKEW_MIN_ANGLE
+        reliable = above_minimum and zero_score > 0 and gain >= DESKEW_MIN_SCORE_GAIN and not at_limit
+        if abs(best_angle) < DESKEW_MIN_ANGLE:
+            reason = "angle_below_threshold"
+        elif at_limit:
+            reason = "angle_exceeds_safe_limit"
+        elif not reliable:
+            reason = "low_detection_confidence"
+        else:
+            reason = None
+        if not reliable:
+            return image, {
+                "detected_angle_degrees": best_angle,
+                "correction_angle_degrees": 0.0,
+                "applied": False,
+                "confidence": round(max(0.0, min(1.0, gain)), 4),
+                "reason": reason,
+                "source_size": source_size,
+                "output_size": source_size,
+                "algorithm": "bounded_horizontal_projection_v1",
+            }
+        corrected = image.rotate(best_angle, resample=Image.Resampling.BICUBIC, expand=True, fillcolor="white")
+        return corrected, {
+            "detected_angle_degrees": best_angle,
+            "correction_angle_degrees": best_angle,
+            "applied": True,
+            "confidence": round(max(0.0, min(1.0, gain)), 4),
+            "reason": None,
+            "source_size": source_size,
+            "output_size": list(corrected.size),
+            "algorithm": "bounded_horizontal_projection_v1",
+        }
+    except Exception as exc:
+        return image, {
+            "detected_angle_degrees": None,
+            "correction_angle_degrees": 0.0,
+            "applied": False,
+            "confidence": 0.0,
+            "reason": f"correction_failed:{type(exc).__name__}",
+            "source_size": source_size,
+            "output_size": source_size,
+            "algorithm": "bounded_horizontal_projection_v1",
+        }
 
 
 def _content_bounds(image: Image.Image) -> tuple[int, int] | None:
@@ -220,6 +333,7 @@ def prepare(inputs: list[Path], workdir: Path) -> dict:
     folder.mkdir(parents=True, exist_ok=True)
     documents, rendered_pages, rendered_views = [], 0, 0
     overview_count = partition_count_total = 0
+    deskewed_page_count = 0
     for idx, raw in enumerate(inputs, 1):
         source = raw.expanduser().resolve()
         if not source.is_file() or source.suffix.lower() != ".pdf":
@@ -233,12 +347,13 @@ def prepare(inputs: list[Path], workdir: Path) -> dict:
             pages = []
             for page_idx, page in enumerate(pdf, 1):
                 overview_path = page_dir / f"page-{page_idx}.png"
-                overview_pix = page.get_pixmap(dpi=OVERVIEW_DPI, alpha=False)
-                overview = Image.frombytes("RGB", (overview_pix.width, overview_pix.height), overview_pix.samples)
-                overview.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.Resampling.LANCZOS)
-                overview.save(overview_path, format="PNG", optimize=True)
                 detail_pix = page.get_pixmap(dpi=DETAIL_DPI, alpha=False)
                 detail = Image.frombytes("RGB", (detail_pix.width, detail_pix.height), detail_pix.samples)
+                detail, deskew = _deskew(detail)
+                overview = detail.copy()
+                overview.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.Resampling.LANCZOS)
+                overview.save(overview_path, format="PNG", optimize=True)
+                deskewed_page_count += int(deskew["applied"])
                 document_id = f"doc-{idx}"
                 result_path = page_dir / f"page-{page_idx}.json"
                 views, limited = _make_views(detail, overview_path, document_id, page_idx, source_hash)
@@ -253,11 +368,25 @@ def prepare(inputs: list[Path], workdir: Path) -> dict:
                     "source_sha256": source_hash,
                     "detail_width": detail.width,
                     "detail_height": detail.height,
+                    "deskew": deskew,
                     "view_status": "LIMITED" if limited else "READY",
                     "views": views,
                 })
             documents.append({"document_id": f"doc-{idx}", "source": str(source), "source_sha256": source_hash, "pages": pages})
-    manifest = {"schema_version": 1, "view_schema_version": 2, "documents": documents}
+    manifest = {
+        "schema_version": 1,
+        "view_schema_version": PREPROCESS_VERSION,
+        "preprocess_version": PREPROCESS_VERSION,
+        "preprocess_config_sha256": _preprocess_config_sha256(),
+        "preprocess_config": _preprocess_config(),
+        "deskew_policy": {
+            "algorithm": "bounded_horizontal_projection_v1",
+            "minimum_angle_degrees": DESKEW_MIN_ANGLE,
+            "maximum_angle_degrees": DESKEW_MAX_ANGLE,
+            "minimum_score_gain": DESKEW_MIN_SCORE_GAIN,
+        },
+        "documents": documents,
+    }
     manifest_path = workdir / "attendance-manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     total_pages = sum(len(document["pages"]) for document in documents)
@@ -274,6 +403,7 @@ def prepare(inputs: list[Path], workdir: Path) -> dict:
         "reused_view_images": 0,
         "overview_view_count": overview_count,
         "row_partition_view_count": partition_count_total,
+        "deskewed_page_count": deskewed_page_count,
         "preprocess_status": "generated",
     })
     return {
@@ -287,6 +417,7 @@ def prepare(inputs: list[Path], workdir: Path) -> dict:
         "reused_view_images": 0,
         "overview_view_count": overview_count,
         "row_partition_view_count": partition_count_total,
+        "deskewed_page_count": deskewed_page_count,
         "cached": False,
     }
 

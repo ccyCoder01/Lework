@@ -26,7 +26,9 @@ def write_page(path, doc="doc-1", page=1, month="2026-06"):
     day_count = calendar.monthrange(year, month_number)[1]
     path.write_text(json.dumps({
         "schema_version": 1, "document_id": doc, "page": page, "month": month,
-        "project": "项目A", "people": [{"row_index": 1, "name": "张三", "position": "施工员", "printed_work_days": "1",
+        "project": "项目A", "people": [{"row_index": 1, "source_view_id": f"{doc}-p{page:03d}-rows-01",
+        "row_binding_status": "VERIFIED", "printed_work_days_row_index": 1,
+        "name": "张三", "position": "施工员", "printed_work_days": "1",
         "daily": [{"day": day, "raw_mark": "8" if day == 1 else "", "status": "work" if day == 1 else "blank"}
                   for day in range(1, day_count + 1)]}], "warnings": [],
     }, ensure_ascii=False), encoding="utf-8")

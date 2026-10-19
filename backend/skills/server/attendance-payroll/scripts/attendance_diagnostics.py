@@ -120,7 +120,7 @@ def diagnose(workdir: Path) -> dict:
                     observed = sum(1 for item in person.get("daily", []) if item.get("status") == "work")
                     if printed != observed:
                         printed_daily_mismatch_count += 1
-                validate_page(result, document, page)
+                validate_page(result, document, page, manifest.get("view_schema_version", 1))
                 page_rows.append({
                     "document_id": document_id,
                     "page": page["page"],

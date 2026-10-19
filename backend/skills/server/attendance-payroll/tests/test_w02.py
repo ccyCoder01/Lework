@@ -14,7 +14,8 @@ from attendance_review import analyze, apply_file, apply_operations
 def person(record_id="doc-1-p1-r1", name="张三", project="项目A", **extra):
     daily = [{"day": day, "raw_mark": "8", "status": "work"} for day in range(1, 26)]
     daily += [{"day": day, "raw_mark": "休", "status": "rest"} for day in range(26, 31)]
-    return {"record_id": record_id, "name": name, "position": "施工员", "printed_work_days": "25", "project": project,
+    return {"record_id": record_id, "row_index": 1, "row_binding_status": "VERIFIED",
+            "printed_work_days_row_index": 1, "name": name, "position": "施工员", "printed_work_days": "25", "project": project,
             "source_document": "/source/attendance.pdf", "note": "", "daily": daily, **extra}
 
 
@@ -86,7 +87,7 @@ def test_unknown_symbol_status_and_missing_dates_are_pending():
     item["daily"] = [d for d in item["daily"] if d["day"] != 2]
     report = analyze(dataset(item))
     stats = report["stats"][item["record_id"]]
-    assert stats["actual_work_days"] == "待确认"
+    assert stats["actual_work_days"] == 25
     assert stats["absence_days"] == "待确认"
     assert any(i["reason"] == "状态待确认" for i in report["issues"])
     assert any(i["reason"] == "日期缺失" for i in report["issues"])
@@ -96,7 +97,7 @@ def test_unmapped_raw_mark_cannot_be_counted_as_work():
     item = person()
     item["daily"][0] = {"day": 1, "raw_mark": "调", "status": "work"}
     report = analyze(dataset(item))
-    assert report["stats"][item["record_id"]]["actual_work_days"] == "待确认"
+    assert report["stats"][item["record_id"]]["actual_work_days"] == 25
     assert any(i["field"] == "2026-06-01" and i["reason"] == "状态待确认" for i in report["issues"])
 
 
@@ -105,7 +106,7 @@ def test_confirmed_absence_symbol_is_counted_without_calendar_subtraction():
     item["daily"][24] = {"day": 25, "raw_mark": "事", "status": "personal_leave"}
     stats = analyze(dataset(item))["stats"][item["record_id"]]
     assert stats["absence_days"] == 1
-    assert stats["actual_work_days"] == "待确认"
+    assert stats["actual_work_days"] == 25
 
 
 @pytest.mark.parametrize("status", ["transfer", "departed"])
@@ -114,7 +115,7 @@ def test_transfer_or_departure_is_not_counted_as_absence(status):
     item["daily"][-1] = {"day": 30, "raw_mark": "离", "status": status}
     report = analyze(dataset(item))
     assert report["stats"][item["record_id"]]["absence_days"] == "待确认"
-    assert report["stats"][item["record_id"]]["actual_work_days"] == "待确认"
+    assert report["stats"][item["record_id"]]["actual_work_days"] == 25
 
 
 def test_cross_project_duplicate_requires_two_effective_work_statuses():

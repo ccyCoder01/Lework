@@ -40,7 +40,21 @@ def checked_manifest(workdir: Path):
     manifest = load_json(workdir / "attendance-manifest.json")
     if manifest.get("schema_version") != 1 or not isinstance(manifest.get("documents"), list) or not manifest["documents"]:
         raise ValueError("无效任务清单")
-    if manifest.get("view_schema_version") == 2:
+    view_version = manifest.get("view_schema_version")
+    if view_version in {2, 3}:
+        if view_version == 3 and manifest.get("preprocess_version") != 3:
+            raise ValueError("视图清单预处理版本无效")
+        if view_version == 3 and (
+            not isinstance(manifest.get("preprocess_config"), dict)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("preprocess_config_sha256", "")))
+        ):
+            raise ValueError("预处理参数摘要无效")
+        if view_version == 3:
+            config_hash = hashlib.sha256(json.dumps(
+                manifest["preprocess_config"], sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            if config_hash != manifest["preprocess_config_sha256"]:
+                raise ValueError("预处理参数内容与摘要不一致")
         seen_view_ids = set()
         for document in manifest["documents"]:
             if not isinstance(document, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(document.get("source_sha256", ""))):
@@ -53,6 +67,16 @@ def checked_manifest(workdir: Path):
                 if not isinstance(page, dict) or type(page.get("page")) is not int or page["page"] < 1:
                     raise ValueError("视图清单页码无效")
                 page_numbers.append(page["page"])
+                if view_version == 3:
+                    deskew = page.get("deskew")
+                    if (not isinstance(deskew, dict) or type(deskew.get("applied")) is not bool
+                            or not isinstance(deskew.get("algorithm"), str)
+                            or deskew.get("algorithm") != "bounded_horizontal_projection_v1"
+                            or type(deskew.get("confidence")) not in {int, float}
+                            or not 0 <= deskew["confidence"] <= 1
+                            or not isinstance(deskew.get("source_size"), list)
+                            or not isinstance(deskew.get("output_size"), list)):
+                        raise ValueError("页面纠偏元数据无效")
                 views = page.get("views")
                 if not isinstance(views, list) or not 2 <= len(views) <= 4:
                     raise ValueError(f"{document['document_id']}/page-{page['page']} 视图数必须为 2–4")
@@ -146,7 +170,7 @@ def page_descriptor(manifest: dict, document_id: str, page_number: int):
     raise ValueError(f"清单中不存在页面 {document_id}/page-{page_number}")
 
 
-def validate_page(result: dict, doc: dict, p: dict):
+def validate_page(result: dict, doc: dict, p: dict, view_version: int = 1):
     if not isinstance(result, dict) or result.get("schema_version") != 1:
         raise ValueError("识别结果缺少 schema_version=1")
     if result.get("document_id") != doc["document_id"] or result.get("page") != p["page"]:
@@ -168,6 +192,10 @@ def validate_page(result: dict, doc: dict, p: dict):
         for view in p.get("views", [])
     )
     row_indices = []
+    row_views = {
+        view.get("view_id"): view for view in p.get("views", [])
+        if isinstance(view, dict) and view.get("view_type") == "row_partition"
+    }
     for index, person in enumerate(people):
         if not isinstance(person, dict) or not isinstance(person.get("name"), str) or not person["name"].strip():
             raise ValueError(f"people[{index}] 缺少姓名；不清晰时使用明确的占位名并标记不确定")
@@ -183,8 +211,18 @@ def validate_page(result: dict, doc: dict, p: dict):
             if type(row_index) is not int or row_index < 1:
                 raise ValueError(f"people[{index}] row_index 必须为正整数")
             row_indices.append(row_index)
-        elif requires_row_index and row_status != "UNRESOLVED":
+        if row_index is None and requires_row_index and row_status != "UNRESOLVED":
             raise ValueError(f"people[{index}] 缺少行索引且未标记行绑定待核")
+        if view_version == 3 and row_index is not None:
+            source_view_id = person.get("source_view_id")
+            source_view = row_views.get(source_view_id) if isinstance(source_view_id, str) else None
+            if source_view is None:
+                raise ValueError(f"people[{index}] row_index 必须绑定清单中的 source_view_id")
+            expected_range = source_view.get("expected_row_range")
+            if expected_range is not None and not expected_range[0] <= row_index <= expected_range[1]:
+                raise ValueError(f"people[{index}] row_index 不属于 source_view_id 的预期行范围")
+        if row_status == "VERIFIED" and row_index is None:
+            raise ValueError(f"people[{index}] VERIFIED 行绑定必须有 row_index")
         if requires_row_index and row_index is None and row_status == "UNRESOLVED":
             if not isinstance(person.get("row_binding_warning"), str) or not person["row_binding_warning"].strip():
                 raise ValueError(f"people[{index}] 行绑定待核时必须提供 row_binding_warning")
@@ -208,6 +246,19 @@ def validate_page(result: dict, doc: dict, p: dict):
         for field in ("printed_work_days", "position", "note"):
             if field in person and person[field] is not None and not isinstance(person[field], (str, int, float)):
                 raise ValueError(f"people[{index}] {field} 类型错误")
+        if "printed_work_days_row_index" in person and person["printed_work_days_row_index"] is not None and (
+            type(person["printed_work_days_row_index"]) is not int or person["printed_work_days_row_index"] < 1
+        ):
+            raise ValueError(f"people[{index}] printed_work_days_row_index 必须为正整数或 null")
+        if "note_row_index" in person and person["note_row_index"] is not None and (
+            type(person["note_row_index"]) is not int or person["note_row_index"] < 1
+        ):
+            raise ValueError(f"people[{index}] note_row_index 必须为正整数或 null")
+        if view_version == 3:
+            if person.get("printed_work_days") not in (None, "") and person.get("printed_work_days_row_index") != row_index:
+                raise ValueError(f"people[{index}] 印刷出勤必须明确绑定到同一 row_index")
+            if str(person.get("note", "")).strip() and person.get("note_row_index") != row_index:
+                raise ValueError(f"people[{index}] 备注必须明确绑定到同一 row_index")
     if len(row_indices) != len(set(row_indices)):
         raise ValueError("页级人员 row_index 重复，可能存在重叠视图行重复或绑定错误")
     warnings = result.get("warnings", [])
@@ -222,7 +273,7 @@ def save_page(workdir: Path, result_file: Path):
     manifest = checked_manifest(workdir)
     result = load_json(result_file)
     doc, p = page_descriptor(manifest, result.get("document_id"), result.get("page"))
-    validate_page(result, doc, p)
+    validate_page(result, doc, p, manifest.get("view_schema_version", 1))
     if any(view.get("view_type") == "row_partition" for view in p.get("views", [])):
         for view in p["views"]:
             image_path = Path(view["image"]).resolve()
@@ -275,7 +326,7 @@ def status(workdir: Path):
                 missing.append(key)
             else:
                 try:
-                    validate_page(load_json(path), doc, p)
+                    validate_page(load_json(path), doc, p, manifest.get("view_schema_version", 1))
                     found.append(key)
                 except (ValueError, json.JSONDecodeError) as exc:
                     invalid.append({"page": key, "error": str(exc)})

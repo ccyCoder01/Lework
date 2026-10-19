@@ -48,6 +48,7 @@ def _validate_document(data: dict) -> tuple[int, list[dict]]:
             or len({ref["warning_index"] for ref in resolved_warnings if isinstance(ref, dict) and type(ref.get("warning_index")) is int}) != len(resolved_warnings)):
         raise ValueError("resolved_source_warnings 必须绑定到未变更且不重复的 source_warnings 原文")
     seen_ids = set()
+    page_rows = set()
     for i, person in enumerate(people):
         if not isinstance(person, dict):
             raise ValueError(f"people[{i}] 必须为对象")
@@ -64,6 +65,33 @@ def _validate_document(data: dict) -> tuple[int, list[dict]]:
             if (not isinstance(confirmed_person_id, str) or not confirmed_person_id
                     or confirmed_person_id != confirmed_person_id.strip()):
                 raise ValueError(f"{record_id} 的 confirmed_person_id 必须为无首尾空格的非空字符串")
+        row_index = person.get("row_index")
+        row_status = person.get("row_binding_status")
+        if row_index is not None and (type(row_index) is not int or row_index < 1):
+            raise ValueError(f"{record_id} 的 row_index 必须为正整数或 null")
+        if row_status is not None and (
+            not isinstance(row_status, str) or row_status not in {"VERIFIED", "UNRESOLVED", "CONFLICT"}
+        ):
+            raise ValueError(f"{record_id} 的 row_binding_status 无效")
+        if row_status == "VERIFIED" and row_index is None:
+            raise ValueError(f"{record_id} VERIFIED 行绑定必须有 row_index")
+        source_document, source_page = person.get("source_document"), person.get("source_page")
+        if source_page is not None:
+            if not isinstance(source_document, str) or not source_document.strip() or type(source_page) is not int or source_page < 1:
+                raise ValueError(f"{record_id} 的来源文档/页码绑定无效")
+            if row_index is not None:
+                page_row = (source_document, source_page, row_index)
+                if page_row in page_rows:
+                    raise ValueError(f"{record_id} 在同一来源页重复绑定 row_index={row_index}")
+                page_rows.add(page_row)
+        for field in ("printed_work_days_row_index", "note_row_index"):
+            bound_index = person.get(field)
+            if bound_index is not None and (type(bound_index) is not int or bound_index < 1):
+                raise ValueError(f"{record_id} 的 {field} 必须为正整数或 null")
+        if person.get("printed_work_days_row_index") is not None and person.get("printed_work_days_row_index") != row_index:
+            raise ValueError(f"{record_id} 印刷出勤行号与人员行号不一致")
+        if person.get("note_row_index") is not None and person.get("note_row_index") != row_index:
+            raise ValueError(f"{record_id} 备注行号与人员行号不一致")
         daily = person.get("daily")
         if not isinstance(daily, list):
             raise ValueError(f"{record_id} 的 daily 必须为数组")
@@ -184,8 +212,7 @@ def _person_stats(person: dict, days_in_month: int, month: str) -> tuple[dict, l
         issues.append({"record_id": person["record_id"], "field": "daily", "reason": "日期缺失", "days": missing})
 
     work_count, absence_count = 0, 0
-    unresolved_work = unresolved or bool(missing)
-    unresolved_absence = unresolved_work
+    unresolved_absence = unresolved or bool(missing)
     for day, item in daily_by_day.items():
         status = _effective_status(item)
         if status == "work":
@@ -193,7 +220,6 @@ def _person_stats(person: dict, days_in_month: int, month: str) -> tuple[dict, l
         elif status in ABSENCE_STATUSES:
             absence_count += 1
         elif status in UNRESOLVED_STATUSES or status not in STATUS:
-            unresolved_work = True
             unresolved_absence = True
             issues.append({"record_id": person["record_id"], "field": f"{month}-{day:02d}", "reason": "状态待确认", "raw_mark": item.get("user_confirmed_mark", item.get("raw_mark", ""))})
         if status in {"transfer", "departed"}:
@@ -207,10 +233,23 @@ def _person_stats(person: dict, days_in_month: int, month: str) -> tuple[dict, l
             printed_count = int(str(printed).strip())
         except (TypeError, ValueError):
             issues.append({"record_id": person["record_id"], "field": "printed_work_days", "reason": "印刷出勤数无法解析", "value": printed})
-    if printed_count is not None and printed_count != work_count:
+        else:
+            if not 0 <= printed_count <= days_in_month:
+                issues.append({"record_id": person["record_id"], "field": "printed_work_days", "reason": "印刷出勤数超出当月范围", "value": printed})
+                printed_count = None
+    row_bound_print = (
+        person.get("row_binding_status") == "VERIFIED"
+        and type(person.get("row_index")) is int
+        and person.get("printed_work_days_row_index") == person.get("row_index")
+    )
+    if printed_count is not None and not row_bound_print:
+        issues.append({
+            "record_id": person["record_id"], "field": "printed_work_days",
+            "reason": "印刷出勤行绑定待确认",
+        })
+    if printed_count is not None and row_bound_print and printed_count != work_count:
         issues.append({"record_id": person["record_id"], "field": "printed_work_days", "reason": "印刷出勤与逐日统计不一致", "printed": printed_count, "daily": work_count})
-        unresolved_work = True
-    actual = confirmed if confirmed is not None else ("待确认" if unresolved_work else work_count)
+    actual = confirmed if confirmed is not None else (printed_count if row_bound_print and printed_count is not None else "待确认")
     absence = "待确认" if unresolved_absence else absence_count
     return {"actual_work_days": actual, "absence_days": absence, "observed_work_days": work_count}, issues
 

@@ -61,13 +61,17 @@ def _person(row_index, *, same_name="同名", missing_day=None, printed="20", un
     ]
     person = {
         "row_index": row_index,
+        "source_view_id": "doc-1-p001-rows-01" if row_index is not None else None,
+        "row_binding_status": "VERIFIED" if row_index is not None else None,
+        "printed_work_days_row_index": row_index,
         "name": same_name,
         "position": "施工员",
         "printed_work_days": printed,
         "daily": daily,
     }
     if unresolved:
-        person.update({"row_index": None, "row_binding_status": "UNRESOLVED", "row_binding_warning": "姓名行边界模糊"})
+        person.update({"row_index": None, "row_binding_status": "UNRESOLVED", "printed_work_days_row_index": None,
+                       "row_binding_warning": "姓名行边界模糊"})
     return person
 
 
@@ -147,6 +151,40 @@ def test_same_name_different_row_indices_are_preserved_and_duplicate_index_is_re
     with pytest.raises(ValueError, match="row_index 重复"):
         save_page(duplicate_workdir, source)
     assert not Path(duplicate_workdir / ".attendance-pages/doc-1/page-1.json").exists()
+
+
+def test_row_binding_must_reference_a_data_partition_not_overview(tmp_path):
+    pdf = tmp_path / "dense.pdf"
+    _dense_attendance_pdf(pdf, rows=4)
+    workdir = tmp_path / "work"
+    prepared = prepare([pdf], workdir)
+    overview_id = prepared["documents"][0]["pages"][0]["views"][0]["view_id"]
+    page_file = tmp_path / "page.json"
+    person = _person(1)
+    person["source_view_id"] = overview_id
+    _write_json(page_file, _page_result([person]))
+    with pytest.raises(ValueError, match="source_view_id"):
+        save_page(workdir, page_file)
+
+
+def test_printed_summary_and_note_row_indices_must_match_person_row(tmp_path):
+    pdf = tmp_path / "dense.pdf"
+    _dense_attendance_pdf(pdf, rows=4)
+    workdir = tmp_path / "work"
+    prepare([pdf], workdir)
+    page_file = tmp_path / "page.json"
+    person = _person(1)
+    person["printed_work_days_row_index"] = 2
+    _write_json(page_file, _page_result([person]))
+    with pytest.raises(ValueError, match="印刷出勤必须明确绑定"):
+        save_page(workdir, page_file)
+
+    person["printed_work_days_row_index"] = 1
+    person["note"] = "离职"
+    person["note_row_index"] = 2
+    _write_json(page_file, _page_result([person]))
+    with pytest.raises(ValueError, match="备注必须明确绑定"):
+        save_page(workdir, page_file)
 
 
 def test_missing_days_require_explicit_declaration_and_printed_mismatch_is_preserved(tmp_path):

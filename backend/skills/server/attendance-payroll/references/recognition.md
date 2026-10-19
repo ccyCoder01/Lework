@@ -1,11 +1,13 @@
-# 考勤 PDF 固定视图识别（W02.3）
+# 考勤 PDF 固定视图识别（W02.4）
 
 ## 识别边界
 
-预处理脚本在一次调用中为每个物理页生成：
+预处理脚本在一次调用中以 300 DPI 渲染每个物理页，并进行一次有界的整体倾斜评估；随后为每页生成：
 
 - 一张整页布局概览，用于识别标题、月份、列顺序、表格行和跨页续表关系。概览只做布局观察，不录入业务事实。
 - 一至三张固定全宽人员行带，供识别姓名、岗位、每日标记、印刷实际出勤及备注。每页概览加数据视图最多四张。
+
+整体纠偏只搜索约 `-2.0°..+2.0°`，步长 `0.1°`；仅在检测角度至少 `0.35°`、水平投影分数相对提升至少 `1%` 且最佳角度未触及搜索边界时执行旋转。旋转采用扩边，避免裁掉页面边缘。条件不足或处理异常时保留原图并在 manifest `deskew` 元数据中说明原因。该算法只处理整页轻微旋转，不能修复透视、弯曲纸面或局部倾斜；若页面仍不可读，记录质量限制并待核。预处理版本为 3；旧版本缓存不得与新视图混用，应在新任务目录运行。
 
 清单 `recognition_role` 使用 `layout_only_no_business_fact_extraction` 标记概览，使用 `primary_rows_by_printed_row_index` 标记人员行数据视图。
 
@@ -45,10 +47,13 @@ python3 scripts/attendance_diagnostics.py --workdir <工作目录>
   "people": [
     {
       "row_index": 1,
+      "source_view_id": "doc-1-p001-rows-01",
       "name": "张三",
       "position": "施工员",
       "printed_work_days": "25",
       "row_binding_status": "VERIFIED",
+      "printed_work_days_row_index": 1,
+      "note_row_index": null,
       "daily": [
         {"day": 1, "raw_mark": "8", "status": "work"},
         {"day": 2, "raw_mark": "休", "status": "rest"},
@@ -62,11 +67,11 @@ python3 scripts/attendance_diagnostics.py --workdir <工作目录>
 }
 ```
 
-`row_index` 是表格印刷行号，不是数组位置。无法绑定时使用 `row_index: null`、`row_binding_status: "UNRESOLVED"`，并填写 `row_binding_warning`。跨行冲突不得把相邻行姓名、岗位、每日格或汇总值拼到同一人。
+`row_index` 是表格印刷行号，不是数组位置。每条有确定行号的记录还须填写 `source_view_id`，引用本页清单中的 `row_partition`；若清单给出 `expected_row_range`，行号必须在该范围内。无法绑定时使用 `row_index: null`、`row_binding_status: "UNRESOLVED"`，并填写 `row_binding_warning`。`printed_work_days_row_index` 必须等于该人的 `row_index`；非空备注须通过 `note_row_index` 绑定到同一行。任一字段不能可靠绑定时，对应索引置为 `null` 并将行绑定标记为待核，不得把相邻行姓名、岗位、每日格、印刷汇总或备注拼到同一人。
 
 每天必须有一条 `daily` 记录；看不清时保留原始可见符号（不清晰写 `?`）并用 `status: "unknown"`。确实无法列出日期时，将日期逐一放入 `missing_days` 并写警告。空格只有在原件明确为空时才写 `raw_mark: ""`、`status: "blank"`。已确认符号例如 `8/√=work`、`休=rest`、`换=comp_leave`；其他含义不确定则用 `unknown`。
 
-`printed_work_days` 与逐日观察互相独立保存。保存校验若发现两者计数不同，会在 `quality_warnings` 增加差异说明，不会改动任一事实。逐日出勤和印刷汇总一致不代表视觉识别无误；仍须检查行序、人员身份、日期列及未知状态。`quality_warnings` 和原始 `warnings` 都会进入后续核对数据。
+`printed_work_days` 与逐日观察互相独立保存。保存校验若发现两者计数不同，会在 `quality_warnings` 增加差异说明，不会改动任一事实。逐日出勤和印刷汇总一致不代表视觉识别无误；仍须检查行序、人员身份、日期列及未知状态。核对表的实际出勤优先采用明确的 `confirmed_work_days`；否则仅在 `row_binding_status=VERIFIED` 且 `printed_work_days_row_index=row_index` 时采用可解析的印刷值。逐日出勤数用于差异诊断，不覆盖可靠绑定的印刷值；印刷行绑定不可靠时显示待确认。`quality_warnings` 和原始 `warnings` 都会进入后续核对数据。
 
 识别结果及用户确认不得覆盖原 PDF 或原始 `raw_mark/status`。`attendance_store.py assemble` 只在所有页级 JSON 有效时生成工作数据；历史 JSON 没有视图字段时继续按旧 W01 结构读取。
 

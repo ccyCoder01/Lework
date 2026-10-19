@@ -27,7 +27,9 @@ def _person(record_id="doc-1-p1-r1", *, missing_day=None):
         else:
             daily.append({"day": day, "raw_mark": "休", "status": "rest"})
     return {
-        "record_id": record_id, "row_index": 1, "name": "测试人员", "position": "施工员",
+        "record_id": record_id, "row_index": 1, "source_view_id": "doc-1-p001-rows-01",
+        "row_binding_status": "VERIFIED", "printed_work_days_row_index": 1,
+        "name": "测试人员", "position": "施工员",
         "printed_work_days": "25", "project": "项目A", "source_document": "source.pdf",
         "daily": daily,
     }
@@ -90,7 +92,7 @@ def test_unknown_and_missing_days_remain_pending_not_work_or_rest():
     report = analyze(_attendance(_person(missing_day=30)))
     stats = report["stats"]["doc-1-p1-r1"]
     assert stats["observed_work_days"] == 25
-    assert stats["actual_work_days"] == "待确认"
+    assert stats["actual_work_days"] == 25
     assert stats["absence_days"] == "待确认"
     assert any(issue["reason"] == "状态待确认" and issue["field"] == "2026-06-01" for issue in report["issues"])
     assert any(issue["reason"] == "日期缺失" and issue["days"] == [30] for issue in report["issues"])
