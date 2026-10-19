@@ -83,6 +83,16 @@ describe("McpConnectorPanel", () => {
 							origin: "marketplace",
 							current_revision: 1,
 						},
+						{
+							public_id: "plugin_payroll",
+							code: "payroll-user",
+							kind: "mcp",
+							name: "Payroll",
+							description: "人员、考勤与工资核算服务",
+							status: "active",
+							origin: "manual",
+							current_revision: 1,
+						},
 					],
 				},
 			},
@@ -118,6 +128,14 @@ describe("McpConnectorPanel", () => {
 							auto_connect_supported: true,
 							connected: true,
 							plugin_id: "plugin_corekg",
+						},
+						{
+							code: "payroll",
+							name: "Payroll",
+							description: "人员、考勤与工资核算服务",
+							auto_connect_supported: true,
+							connected: true,
+							plugin_id: "plugin_payroll",
 						},
 					],
 				},
@@ -159,8 +177,9 @@ describe("McpConnectorPanel", () => {
 		expect(screen.getByText("平台连接器")).toBeInTheDocument();
 		expect(screen.getByText("自定义连接器")).toBeInTheDocument();
 		expect(screen.getByText("CoreKG")).toBeInTheDocument();
+		expect(screen.getAllByText("Payroll").length).toBeGreaterThan(0);
 		expect(screen.getByText("CoreKG 连接知识库、知识图谱与智能问答能力")).toBeInTheDocument();
-		expect(screen.getByText("已连接")).toBeInTheDocument();
+		expect(screen.getAllByText("已连接")).not.toHaveLength(0);
 		expect(screen.getByRole("button", { name: "管理 CoreKG" })).toBeInTheDocument();
 		expect(screen.queryByText("自定义 MCP 服务")).not.toBeInTheDocument();
 		expect(screen.getByRole("button", { name: "管理 浏览器连接器" })).toBeInTheDocument();
@@ -179,7 +198,7 @@ describe("McpConnectorPanel", () => {
 	it("relies on the MCP list API to ensure CoreKG server-side", async () => {
 		render(<McpConnectorPanel />);
 
-		expect(await screen.findByText("已连接")).toBeInTheDocument();
+		expect(await screen.findAllByText("已连接")).not.toHaveLength(0);
 		expect(mockPluginConnectMCPPlatform).not.toHaveBeenCalled();
 		expect(mockPluginAddMCP).not.toHaveBeenCalled();
 	});
@@ -276,7 +295,7 @@ describe("McpConnectorPanel", () => {
 	it("exposes only the test action for CoreKG", async () => {
 		render(<McpConnectorPanel />);
 
-		expect(await screen.findByText("已连接")).toBeInTheDocument();
+		expect(await screen.findAllByText("已连接")).not.toHaveLength(0);
 		fireEvent.click(screen.getByRole("button", { name: "管理 CoreKG" }));
 		expect(await screen.findByRole("menuitem", { name: "测试连接" })).toBeInTheDocument();
 		expect(screen.queryByText("断开连接")).not.toBeInTheDocument();

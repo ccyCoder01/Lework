@@ -163,8 +163,12 @@ func callRecordToEntity(r *CallRecord) *types.LLMHistory {
 		StartedAt:       r.StartedAt,
 		FinishedAt:      r.FinishedAt,
 	}
-	e.InputLen = len(r.Input)
-	e.OutputLen = len(r.Output)
+	if e.InputLen <= 0 {
+		e.InputLen = len(r.Input)
+	}
+	if e.OutputLen <= 0 {
+		e.OutputLen = len(r.Output)
+	}
 	e.Input = truncateIfNeeded(r.Input, &e.InputTruncated)
 	e.Output = truncateIfNeeded(r.Output, &e.OutputTruncated)
 	if r.ID > 0 {

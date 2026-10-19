@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-
+import { pluginApi } from "../api/pluginApi";
 import { projectApi } from "../api/projectApi";
 import * as authStorage from "../utils/authStorage";
 import type { Project, ProjectMember } from "./layoutSlice";
@@ -227,7 +227,167 @@ describe("LayoutActionImpl.updateProjectMembers", () => {
 });
 
 describe("LayoutActionImpl.sendWorkbenchMessage", () => {
-	it("续聊已有任务时先拉历史再走任务群聊发送，不再 bootstrap 覆盖历史", async () => {
+	it("adds an already-connected payroll connector through the standard message binding path", async () => {
+		const listPlatforms = vi.spyOn(pluginApi, "listMCPPlatforms").mockResolvedValue({
+			data: {
+				code: 0,
+				data: {
+					platforms: [
+						{
+							code: "payroll",
+							name: "Payroll",
+							description: "",
+							mode: "mcp_only",
+							auth_type: "none",
+							auto_connect_supported: true,
+							connected: true,
+							plugin_id: "plugin-payroll",
+						},
+					],
+				},
+			},
+		} as never);
+		vi.spyOn(pluginApi, "listProject").mockResolvedValue({
+			data: { code: 0, data: [] },
+		} as never);
+		const sendProjectMessage = vi
+			.fn()
+			.mockResolvedValue({ project_id: "project-1", task_id: "task-1", session_id: "session-1" });
+		const actions = new LayoutActionImpl(
+			vi.fn() as never,
+			(() => ({
+				activeWorkbenchProjectId: null,
+				activeWorkbenchTaskId: null,
+				projects: [],
+				sendProjectMessage,
+			})) as never,
+		);
+
+		await actions.sendWorkbenchMessage(
+			"核算",
+			"project-1",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"salary_accounting",
+		);
+
+		expect(listPlatforms).toHaveBeenCalledTimes(1);
+		expect(sendProjectMessage).toHaveBeenCalledWith(
+			"核算",
+			"project-1",
+			undefined,
+			undefined,
+			expect.objectContaining({ connectorIds: ["plugin-payroll"], scene: "salary_accounting" }),
+		);
+	});
+
+	it("does not send the salary accounting message when connector discovery fails", async () => {
+		vi.spyOn(pluginApi, "listMCPPlatforms").mockRejectedValue(new Error("unavailable"));
+		const sendProjectMessage = vi.fn();
+		const actions = new LayoutActionImpl(
+			vi.fn() as never,
+			(() => ({
+				activeWorkbenchProjectId: null,
+				activeWorkbenchTaskId: null,
+				projects: [],
+				sendProjectMessage,
+			})) as never,
+		);
+
+		await actions.sendWorkbenchMessage(
+			"核算",
+			"project-1",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"salary_accounting",
+		);
+
+		expect(sendProjectMessage).not.toHaveBeenCalled();
+	});
+
+	it("connects an unconnected Payroll platform with the standard action before sending", async () => {
+		vi.spyOn(pluginApi, "listMCPPlatforms").mockResolvedValue({
+			data: {
+				code: 0,
+				data: {
+					platforms: [
+						{
+							code: "payroll",
+							name: "Payroll",
+							description: "",
+							mode: "mcp_only",
+							auth_type: "none",
+							auto_connect_supported: true,
+							connected: false,
+						},
+					],
+				},
+			},
+		} as never);
+		const connect = vi.spyOn(pluginApi, "connectMCPPlatform").mockResolvedValue({
+			data: { code: 0, data: { plugin: { public_id: "plugin-payroll" } } },
+		} as never);
+		vi.spyOn(pluginApi, "listProject").mockResolvedValue({ data: { code: 0, data: [] } } as never);
+		const sendProjectMessage = vi
+			.fn()
+			.mockResolvedValue({ project_id: "project-1", task_id: "task-1", session_id: "session-1" });
+		const actions = new LayoutActionImpl(
+			vi.fn() as never,
+			(() => ({
+				activeWorkbenchProjectId: null,
+				activeWorkbenchTaskId: null,
+				projects: [],
+				sendProjectMessage,
+			})) as never,
+		);
+
+		await actions.sendWorkbenchMessage(
+			"核算",
+			"project-1",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"salary_accounting",
+		);
+
+		expect(connect).toHaveBeenCalledWith("payroll");
+		expect(sendProjectMessage).toHaveBeenCalledWith(
+			"核算",
+			"project-1",
+			undefined,
+			undefined,
+			expect.objectContaining({ connectorIds: ["plugin-payroll"] }),
+		);
+	});
+
+	it("核算续聊已有任务时复用已有 Payroll 项目绑定", async () => {
+		vi.spyOn(pluginApi, "listMCPPlatforms").mockResolvedValue({
+			data: {
+				code: 0,
+				data: {
+					platforms: [
+						{
+							code: "payroll",
+							name: "Payroll",
+							description: "",
+							mode: "mcp_only",
+							auth_type: "none",
+							auto_connect_supported: true,
+							connected: true,
+							plugin_id: "plugin-payroll",
+						},
+					],
+				},
+			},
+		} as never);
 		const setActiveSession = vi.fn();
 		const loadConversationMessages = vi.fn().mockResolvedValue(undefined);
 		const sendTaskRoomMessage = vi.fn().mockResolvedValue({
@@ -263,7 +423,19 @@ describe("LayoutActionImpl.sendWorkbenchMessage", () => {
 		const setState = vi.fn();
 		const actions = new LayoutActionImpl(setState as never, (() => state) as never);
 
-		const result = await actions.sendWorkbenchMessage("继续提问", "project-1");
+		vi.spyOn(pluginApi, "listProject").mockResolvedValue({
+			data: { code: 0, data: [{ public_id: "plugin-payroll" }] },
+		} as never);
+		const result = await actions.sendWorkbenchMessage(
+			"继续提问",
+			"project-1",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"salary_accounting",
+		);
 
 		expect(result).toEqual({
 			project_id: "project-1",
@@ -279,6 +451,8 @@ describe("LayoutActionImpl.sendWorkbenchMessage", () => {
 				taskId: "task-1",
 				sessionId: "session-1",
 				metadata: undefined,
+				connectorIds: undefined,
+				scene: "salary_accounting",
 			},
 			undefined,
 		);

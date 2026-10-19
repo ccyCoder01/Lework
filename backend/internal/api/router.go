@@ -7,6 +7,8 @@ package api
 import (
 	"context"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"code.gitea.io/sdk/gitea"
@@ -89,12 +91,18 @@ func SetupRouter(cfg config.Config, edition adapter.Edition, eventbus eventbus.E
 
 	v1 := r.Group("/v1")
 	displayTranslation := service.NewSkillDisplayTranslationService(db)
-	pluginService := service.NewPluginServiceWithAPIKeyIssuer(
-		db,
-		edition.APIKeyIssuer(),
-		userRepo,
-		displayTranslation,
-	)
+	managedCredentialProviders := make(map[string]service.ManagedCredentialProvider, len(cfg.ManagedCredentials)+1)
+	if provider := service.NewAPIKeyIssuerCredentialProvider(edition.APIKeyIssuer()); provider != nil {
+		managedCredentialProviders["corekg"] = provider
+	}
+	for handlerName, providerConfig := range cfg.ManagedCredentials {
+		managedCredentialProviders[strings.ToLower(strings.TrimSpace(handlerName))] = service.NewHTTPManagedCredentialProvider(
+			providerConfig.Endpoint,
+			os.ExpandEnv(providerConfig.ServiceToken),
+		)
+	}
+	managedCredentials := service.NewManagedCredentialService(managedCredentialProviders)
+	pluginService := service.NewPluginServiceWithManagedCredentials(db, managedCredentials, userRepo, displayTranslation)
 
 	// Worker server routes 注册公开管理端点；放在全局中间件之后以继承 CORS/Logger/Recovery。
 	workerManager := workerserver.NewServer(workerScheduler)
@@ -141,6 +149,9 @@ func SetupRouter(cfg config.Config, edition adapter.Edition, eventbus eventbus.E
 	permSvc := service.NewPermissionService(db, service.NewPermissionCore(db))
 	authed := v1.Group("/", middleware.RequireCallerOrg())
 	{
+		payrollProxy := handler.NewPayrollProxyHandler(cfg.PayrollProxy.Endpoint, managedCredentials)
+		handler.RegisterPayrollProxyRoutes(authed, payrollProxy)
+
 		digitalAssistantService := service.NewDigitalAssistantServiceWithProvisioningAndUserRepo(db, workerScheduler, workerProvisioningService, userRepo)
 		handler.RegisterDigitalAssistantRoutes(authed, digitalAssistantService)
 		logs.Info("Digital assistant routes registered successfully")

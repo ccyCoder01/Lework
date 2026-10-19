@@ -6,25 +6,21 @@ import {
 	Dialog,
 	DialogContent,
 	DialogDescription,
+	DialogFooter,
 	DialogHeader,
 	DialogTitle,
 } from "@leros/ui/components/ui/dialog";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
-import {
-	type BidComparisonProjectFile,
-	ProjectFilePicker,
-} from "../input/BidComparisonConfigDialog";
 import { filePreviewActions } from "./file-preview-store";
 import { PayrollFileSlots } from "./PayrollFileSlots";
+import { PayrollHistoricalSalaryTable } from "./PayrollHistoricalSalaryTable";
+import { PayrollProjectFilePicker } from "./PayrollProjectFilePicker";
 import { PayrollStoredPeopleTable } from "./PayrollStoredPeopleTable";
 import {
 	canStartPayrollAccounting,
-	canStartPayrollBaselineImport,
-	canStartPayrollTask,
 	type PayrollSelectedFile,
 	type PayrollSourceKind,
-	payrollImportPrompt,
 	payrollStarterPrompt,
 } from "./payroll-accounting-mock";
 import {
@@ -32,7 +28,6 @@ import {
 	revokePayrollPreviewUrl,
 	uploadPayrollAttachments,
 } from "./payroll-file-upload";
-import { parsePayrollBaselineMock } from "./payroll-service-client";
 
 export function PayrollTaskPanel({
 	open,
@@ -51,6 +46,8 @@ export function PayrollTaskPanel({
 	const sendTaskRoomMessage = useChatStore((s) => s.sendTaskRoomMessage);
 	const [files, setFiles] = useState<PayrollSelectedFile[]>([]);
 	const [submitting, setSubmitting] = useState(false);
+	const [rosterRefreshToken, setRosterRefreshToken] = useState(0);
+	const [salaryRefreshToken, setSalaryRefreshToken] = useState(0);
 	const [filePickerRole, setFilePickerRole] = useState<PayrollSourceKind | null>(null);
 	const filesRef = useRef(files);
 	filesRef.current = files;
@@ -62,29 +59,19 @@ export function PayrollTaskPanel({
 
 	useEffect(() => {
 		return () => {
-			for (const file of filesRef.current) {
-				revokePayrollPreviewUrl(file.previewUrl);
-			}
+			for (const file of filesRef.current) revokePayrollPreviewUrl(file.previewUrl);
 		};
 	}, []);
 
 	const startTask = async () => {
-		if (!canStartPayrollTask(files) || submitting) return;
+		if (!canStartPayrollAccounting(files) || submitting) return;
 		setSubmitting(true);
 		try {
-			if (canStartPayrollBaselineImport(files)) {
-				await parsePayrollBaselineMock();
-			}
-			const computing = canStartPayrollAccounting(files);
-			const attachments = await uploadPayrollAttachments(files, projectId);
+			const attendanceFiles = files.filter((file) => file.role === "attendance");
+			const attachments = await uploadPayrollAttachments(attendanceFiles, projectId);
 			const result = await sendTaskRoomMessage(
-				computing ? payrollStarterPrompt(files) : payrollImportPrompt(files),
-				{
-					projectId,
-					taskId,
-					sessionId,
-					...(computing ? { scene: "salary_accounting" } : {}),
-				},
+				payrollStarterPrompt(files),
+				{ projectId, taskId, sessionId, scene: "salary_accounting" },
 				attachments,
 			);
 			if (!result) throw new Error("提交失败");
@@ -93,26 +80,35 @@ export function PayrollTaskPanel({
 				return [];
 			});
 			onOpenChange(false);
-		} catch (error) {
-			toast.error(error instanceof Error ? error.message : "提交失败");
+		} catch {
+			toast.error("暂时无法启动工资核算任务，请稍后重试。");
 		} finally {
 			setSubmitting(false);
 		}
 	};
 
+	const openProjectFilePicker = (role: PayrollSourceKind) => {
+		if (!projects.length) {
+			toast.info("当前账号暂无项目，请先创建项目");
+			return;
+		}
+		setFilePickerRole(role);
+	};
+
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent className="flex max-h-[calc(100dvh-2rem)] w-[min(96vw,88rem)] max-w-none flex-col overflow-hidden p-6">
-				<DialogHeader>
-					<DialogTitle>人员基准</DialogTitle>
+			<DialogContent className="flex h-[min(92dvh,64rem)] max-h-[calc(100dvh-2rem)] w-[min(98vw,88rem)] max-w-none flex-col overflow-hidden p-0">
+				<DialogHeader className="shrink-0 px-6 pt-6">
+					<DialogTitle>人员工资基准</DialogTitle>
 					<DialogDescription>
-						可编辑已落库基准，或在此上传资料后继续核算。解析问题会在对话里说明。
+						人员底表和历史工资直接维护 Payroll 数据；这里只需上传当月考勤后继续核算。
 					</DialogDescription>
 				</DialogHeader>
-				<div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto py-3">
-					<PayrollStoredPeopleTable />
+				<div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-6 py-4">
 					<PayrollFileSlots
+						key="payroll-attendance"
 						files={files}
+						roles={["attendance"]}
 						onAddFiles={(selected, role) =>
 							setFiles((current) => appendPayrollLocalFiles(current, selected, role))
 						}
@@ -135,75 +131,46 @@ export function PayrollTaskPanel({
 								projectPath: file.projectPath,
 							})
 						}
-						onPickProject={(role) => {
-							if (!projects.length) {
-								toast.info("当前账号暂无项目，请先创建项目");
-								return;
-							}
-							setFilePickerRole(role);
-						}}
+						onPickProject={openProjectFilePicker}
+					/>
+					<PayrollStoredPeopleTable
+						key="payroll-roster"
+						refreshToken={rosterRefreshToken}
+						onPickProject={() => openProjectFilePicker("roster")}
+					/>
+					<PayrollHistoricalSalaryTable
+						key="payroll-historical-salary"
+						refreshToken={salaryRefreshToken}
+						onPickProject={() => openProjectFilePicker("historical_payroll")}
 					/>
 				</div>
-				<div className="flex justify-end">
+				<DialogFooter className="shrink-0 border-t px-6 py-3">
 					<Button
 						type="button"
-						disabled={submitting || !canStartPayrollTask(files)}
+						disabled={submitting || !canStartPayrollAccounting(files)}
 						onClick={() => void startTask()}
 						className="bg-[var(--leros-primary)] text-white hover:bg-[var(--leros-primary)]/90"
 					>
 						{submitting ? "提交中..." : "开始核算"}
 					</Button>
-				</div>
+				</DialogFooter>
 			</DialogContent>
-			{filePickerRole ? (
-				<ProjectFilePicker
-					open
-					mode="compare"
-					titleOverride={
-						filePickerRole === "roster"
-							? "选择人员底表"
-							: filePickerRole === "historical_payroll"
-								? "选择历史工资表"
-								: "选择当月考勤表"
-					}
-					maxCountOverride={Number.POSITIVE_INFINITY}
-					projects={projectOptions}
-					initialSelected={files
-						.filter((file) => file.role === filePickerRole && file.publicId && file.projectId)
-						.map(
-							(file) =>
-								({
-									name: file.name,
-									publicId: file.publicId,
-									projectId: file.projectId,
-									storageUri: file.storageUri,
-									mimeType: file.mimeType,
-									size: file.size,
-								}) satisfies BidComparisonProjectFile,
-						)}
-					onConfirm={(selected) => {
-						if (!filePickerRole) return;
-						const role = filePickerRole;
-						setFiles((current) => {
-							const uploads = current.filter((file) => file.role === role && !file.publicId);
-							const projectFiles = selected.map((file) => ({
-								id: `payroll-project-${file.publicId}`,
-								name: file.name,
-								publicId: file.publicId,
-								projectId: file.projectId,
-								storageUri: file.storageUri,
-								mimeType: file.mimeType,
-								size: file.size ?? 0,
-								role,
-								projectPath: file.projectPath,
-							}));
-							return [...current.filter((file) => file.role !== role), ...uploads, ...projectFiles];
-						});
-						setFilePickerRole(null);
-					}}
-					onClose={() => setFilePickerRole(null)}
-				/>
-			) : null}
+			<PayrollProjectFilePicker
+				role={filePickerRole}
+				projects={projectOptions}
+				files={files}
+				onClose={() => setFilePickerRole(null)}
+				onAttendanceSelected={(projectFiles) =>
+					setFiles((current) => [
+						...current.filter((file) => file.role !== "attendance"),
+						...projectFiles,
+					])
+				}
+				onImported={(role) => {
+					if (role === "roster") setRosterRefreshToken((value) => value + 1);
+					if (role === "historical_payroll") setSalaryRefreshToken((value) => value + 1);
+				}}
+			/>
 		</Dialog>
 	);
 }

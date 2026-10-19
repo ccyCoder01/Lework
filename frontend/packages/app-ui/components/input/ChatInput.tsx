@@ -175,9 +175,13 @@ export function ChatInput({
 		void reloadSkillOptions();
 	}, [reloadSkillOptions]);
 	const handleAssistantPickerOpen = useCallback(() => fetchAssistants(), [fetchAssistants]);
-	const { connectorOptions, connectorsLoading } = useComposerConnectorOptions({
-		projectId: isProjectVariant ? currentProjectId : null,
-	});
+	const { connectorOptions, connectorsLoading, reloadConnectorOptions } =
+		useComposerConnectorOptions({
+			projectId: isProjectVariant ? currentProjectId : null,
+		});
+	const handleConnectorPickerOpen = useCallback(() => {
+		void reloadConnectorOptions();
+	}, [reloadConnectorOptions]);
 	const [selectedConnectorIds, setSelectedConnectorIds] = useState<string[]>([]);
 	const handleSelectConnector = useCallback(
 		(publicId: string) => {
@@ -411,6 +415,7 @@ export function ChatInput({
 			}
 			// 中文注释：发送成功后清空已选连接器；失败时不进入这里，保留以便重试。
 			setSelectedConnectorIds([]);
+			if (isProjectVariant && currentProjectId) void reloadConnectorOptions();
 			if (docxSelectionDraft && activeSelectionReference) {
 				docxSelectionComposerActions.markSubmitted(pendingVersionSync);
 				docxSelectionComposerActions.clearDraft(docxSelectionDraft.id);
@@ -438,6 +443,7 @@ export function ChatInput({
 		sendProjectMessage,
 		sendTaskRoomMessage,
 		reloadSkillOptions,
+		reloadConnectorOptions,
 		selectedConnectorIds,
 		projectConnectorsDisabled,
 	]);
@@ -676,6 +682,7 @@ export function ChatInput({
 									isGenerating={composerLocked}
 									connectorOptions={connectorOptions}
 									connectorsLoading={connectorsLoading}
+									onConnectorPickerOpen={handleConnectorPickerOpen}
 									selectedConnectorIds={projectConnectorsDisabled ? [] : selectedConnectorIds}
 									onSelectConnector={handleSelectConnector}
 									onRemoveConnector={handleRemoveConnector}

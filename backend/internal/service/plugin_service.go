@@ -49,8 +49,10 @@ var skillAutoInstallLocks = struct {
 }
 
 type pluginService struct {
-	db                 *gorm.DB
+	db *gorm.DB
+	// apiKeyIssuer remains for source-compatible construction in package tests and legacy callers.
 	apiKeyIssuer       account.APIKeyIssuer
+	managedCredentials *ManagedCredentialService
 	userRepo           account.UserRepository
 	oauth              *connectorOAuthManager
 	displayTranslation *SkillDisplayTranslationService
@@ -72,9 +74,26 @@ func NewPluginServiceWithAPIKeyIssuer(
 	userRepo account.UserRepository,
 	displayTranslation *SkillDisplayTranslationService,
 ) contract.PluginService {
+	providers := map[string]ManagedCredentialProvider{}
+	if provider := NewAPIKeyIssuerCredentialProvider(issuer); provider != nil {
+		providers[coreKGPlatformCode] = provider
+	}
+	return &pluginService{
+		db: database, apiKeyIssuer: issuer, managedCredentials: NewManagedCredentialService(providers),
+		userRepo: userRepo, oauth: newConnectorOAuthManager(), displayTranslation: displayTranslation,
+	}
+}
+
+// NewPluginServiceWithManagedCredentials enables connectors resolved by configured managed credential handlers.
+func NewPluginServiceWithManagedCredentials(
+	database *gorm.DB,
+	credentials *ManagedCredentialService,
+	userRepo account.UserRepository,
+	displayTranslation *SkillDisplayTranslationService,
+) contract.PluginService {
 	return &pluginService{
 		db:                 database,
-		apiKeyIssuer:       issuer,
+		managedCredentials: credentials,
 		userRepo:           userRepo,
 		oauth:              newConnectorOAuthManager(),
 		displayTranslation: displayTranslation,
@@ -105,7 +124,7 @@ func (s *pluginService) ListPlugins(
 		if err != nil {
 			return nil, err
 		}
-		if channel != nil && s.apiKeyIssuer != nil {
+		if channel != nil && s.canResolveManagedCredentials(types.MCPChannelAuthConfig(channel.AuthConfig).Handler) {
 			if _, err := s.ConnectMCPPlatform(ctx, orgID, uin, coreKGPlatformCode, nil); err != nil {
 				return nil, fmt.Errorf("ensure CoreKG MCP platform: %w", err)
 			}

@@ -3,27 +3,23 @@
 import { useLayoutStore } from "@leros/store";
 import { Button } from "@leros/ui/components/ui/button";
 import { ArrowLeft, Calculator } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useAuth } from "../auth";
-import {
-	type BidComparisonProjectFile,
-	ProjectFilePicker,
-} from "../input/BidComparisonConfigDialog";
 import { filePreviewActions } from "./file-preview-store";
 import type { AppNavigation } from "./LeftRail";
 import { PayrollFileSlots } from "./PayrollFileSlots";
+import { PayrollHistoricalSalaryTable } from "./PayrollHistoricalSalaryTable";
+import { PayrollProjectFilePicker } from "./PayrollProjectFilePicker";
 import { PayrollStoredPeopleTable } from "./PayrollStoredPeopleTable";
 import { ProjectTaskPickerField } from "./ProjectTaskPicker";
 import {
 	canStartPayrollAccounting,
-	canStartPayrollBaselineImport,
 	canStartPayrollTask,
-	payrollImportPrompt,
-	payrollStarterPrompt,
-	WORKBENCH_PAYROLL_PATH,
 	type PayrollSelectedFile,
 	type PayrollSourceKind,
+	payrollStarterPrompt,
+	WORKBENCH_PAYROLL_PATH,
 } from "./payroll-accounting-mock";
 import {
 	appendPayrollLocalFiles,
@@ -31,9 +27,9 @@ import {
 	uploadPayrollAttachments,
 } from "./payroll-file-upload";
 import {
-	hasPersistedPayrollBaseline,
+	listPayrollPeople,
+	listPayrollSalary,
 	markPayrollTaskSession,
-	parsePayrollBaselineMock,
 } from "./payroll-service-client";
 
 export function PayrollAccountingPage({ navigation }: { navigation?: AppNavigation }) {
@@ -44,6 +40,10 @@ export function PayrollAccountingPage({ navigation }: { navigation?: AppNavigati
 	const [files, setFiles] = useState<PayrollSelectedFile[]>([]);
 	const [submitting, setSubmitting] = useState(false);
 	const [hasBaseline, setHasBaseline] = useState(false);
+	const [rosterInitialized, setRosterInitialized] = useState(false);
+	const [hisSalaryInitialized, setHisSalaryInitialized] = useState(false);
+	const [rosterRefreshToken, setRosterRefreshToken] = useState(0);
+	const [salaryRefreshToken, setSalaryRefreshToken] = useState(0);
 	const [filePickerRole, setFilePickerRole] = useState<PayrollSourceKind | null>(null);
 	const filesRef = useRef(files);
 	filesRef.current = files;
@@ -67,8 +67,34 @@ export function PayrollAccountingPage({ navigation }: { navigation?: AppNavigati
 	}, [fetchProjects, isAuthenticated]);
 
 	useEffect(() => {
-		void hasPersistedPayrollBaseline().then(setHasBaseline);
+		void Promise.all([listPayrollPeople({ limit: 1 }), listPayrollSalary({ limit: 1 })])
+			.then(([roster, salary]) => {
+				setRosterInitialized(roster.initialized);
+				setHisSalaryInitialized(salary.initialized);
+				setHasBaseline(roster.initialized && salary.initialized);
+			})
+			.catch(() => {
+				toast.error("暂时无法读取工资基础数据，请稍后重试。");
+			});
 	}, []);
+
+	const refreshBaselineState = useCallback(async () => {
+		const [roster, salary] = await Promise.all([
+			listPayrollPeople({ limit: 1 }),
+			listPayrollSalary({ limit: 1 }),
+		]);
+		setRosterInitialized(roster.initialized);
+		setHisSalaryInitialized(salary.initialized);
+		setHasBaseline(roster.initialized && salary.initialized);
+	}, []);
+
+	const handleRosterInitializedChange = useCallback(
+		(initialized: boolean) => {
+			setRosterInitialized(initialized);
+			setHasBaseline(initialized && hisSalaryInitialized);
+		},
+		[hisSalaryInitialized],
+	);
 
 	const goBack = () => {
 		if (navigation?.goToPath) {
@@ -84,27 +110,6 @@ export function PayrollAccountingPage({ navigation }: { navigation?: AppNavigati
 			return;
 		}
 		setFilePickerRole(role);
-	};
-
-	const selectProjectFiles = (selected: BidComparisonProjectFile[]) => {
-		if (!filePickerRole) return;
-		const role = filePickerRole;
-		setFiles((current) => {
-			const uploads = current.filter((file) => file.role === role && !file.publicId);
-			const projectFiles = selected.map((file) => ({
-				id: `payroll-project-${file.publicId}`,
-				name: file.name,
-				publicId: file.publicId,
-				projectId: file.projectId,
-				storageUri: file.storageUri,
-				mimeType: file.mimeType,
-				size: file.size ?? 0,
-				role,
-				projectPath: file.projectPath,
-			}));
-			return [...current.filter((file) => file.role !== role), ...uploads, ...projectFiles];
-		});
-		setFilePickerRole(null);
 	};
 
 	const openPreview = (file: PayrollSelectedFile) => {
@@ -144,14 +149,12 @@ export function PayrollAccountingPage({ navigation }: { navigation?: AppNavigati
 		if (!canStartPayrollTask(files) || submitting) return;
 		setSubmitting(true);
 		try {
-			if (canStartPayrollBaselineImport(files)) {
-				await parsePayrollBaselineMock();
-				setHasBaseline(true);
-			}
 			const computing = canStartPayrollAccounting(files);
-			const attachments = await uploadPayrollAttachments(files, projectId);
+			if (!computing) return;
+			const attendanceFiles = files.filter((file) => file.role === "attendance");
+			const attachments = await uploadPayrollAttachments(attendanceFiles, projectId);
 			const result = await sendWorkbenchMessage(
-				computing ? payrollStarterPrompt(files) : payrollImportPrompt(files),
+				payrollStarterPrompt(files),
 				projectId || undefined,
 				"default",
 				attachments,
@@ -165,7 +168,7 @@ export function PayrollAccountingPage({ navigation }: { navigation?: AppNavigati
 			goToCreatedTask(result ?? {});
 		} catch (error) {
 			console.error("PayrollAccountingPage start analysis error:", error);
-			toast.error(error instanceof Error ? error.message : "启动工资核算失败");
+			toast.error("工资核算服务连接失败，请重试。");
 		} finally {
 			setSubmitting(false);
 		}
@@ -222,16 +225,10 @@ export function PayrollAccountingPage({ navigation }: { navigation?: AppNavigati
 					}}
 				/>
 
-				{hasBaseline ? (
-					<PayrollStoredPeopleTable />
-				) : (
-					<section className="rounded-xl border border-dashed border-slate-200 bg-white px-4 py-8 text-center text-sm text-slate-400">
-						尚未沉淀人员基准。可上传人员底表和历史工资表后开始核算，解析结果会在对话中说明。
-					</section>
-				)}
-
 				<PayrollFileSlots
+					key="payroll-attendance"
 					files={files}
+					roles={["attendance"]}
 					onAddFiles={(selected, role) =>
 						setFiles((current) => appendPayrollLocalFiles(current, selected, role))
 					}
@@ -239,38 +236,48 @@ export function PayrollAccountingPage({ navigation }: { navigation?: AppNavigati
 					onPreview={openPreview}
 					onPickProject={openProjectFilePicker}
 				/>
+
+				<PayrollStoredPeopleTable
+					key="payroll-roster"
+					onInitializedChange={handleRosterInitializedChange}
+					refreshToken={rosterRefreshToken}
+					onPickProject={() => openProjectFilePicker("roster")}
+				/>
+				{hasBaseline ? null : (
+					<p className="text-xs text-slate-400">
+						底表：{rosterInitialized ? "已初始化" : "未初始化"}；历史工资：
+						{hisSalaryInitialized ? "已初始化" : "未初始化"}
+					</p>
+				)}
+
+				<PayrollHistoricalSalaryTable
+					key="payroll-historical-salary"
+					refreshToken={salaryRefreshToken}
+					onInitializedChange={(initialized) => {
+						setHisSalaryInitialized(initialized);
+						setHasBaseline(rosterInitialized && initialized);
+					}}
+					onPickProject={() => openProjectFilePicker("historical_payroll")}
+				/>
 			</main>
 
-			{filePickerRole ? (
-				<ProjectFilePicker
-					open
-					mode="compare"
-					titleOverride={
-						filePickerRole === "roster"
-							? "选择人员底表"
-							: filePickerRole === "historical_payroll"
-								? "选择历史工资表"
-								: "选择当月考勤表"
-					}
-					maxCountOverride={Number.POSITIVE_INFINITY}
-					projects={projectOptions}
-					initialSelected={files
-						.filter((file) => file.role === filePickerRole && file.publicId && file.projectId)
-						.map(
-							(file) =>
-								({
-									name: file.name,
-									publicId: file.publicId,
-									projectId: file.projectId,
-									storageUri: file.storageUri,
-									mimeType: file.mimeType,
-									size: file.size,
-								}) satisfies BidComparisonProjectFile,
-						)}
-					onConfirm={selectProjectFiles}
-					onClose={() => setFilePickerRole(null)}
-				/>
-			) : null}
+			<PayrollProjectFilePicker
+				role={filePickerRole}
+				projects={projectOptions}
+				files={files}
+				onClose={() => setFilePickerRole(null)}
+				onAttendanceSelected={(projectFiles) =>
+					setFiles((current) => [
+						...current.filter((file) => file.role !== "attendance"),
+						...projectFiles,
+					])
+				}
+				onImported={(role) => {
+					void refreshBaselineState();
+					if (role === "roster") setRosterRefreshToken((value) => value + 1);
+					if (role === "historical_payroll") setSalaryRefreshToken((value) => value + 1);
+				}}
+			/>
 		</div>
 	);
 }

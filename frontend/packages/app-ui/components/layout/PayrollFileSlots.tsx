@@ -63,7 +63,9 @@ export function PayrollFileSlots({
 											className="flex min-h-10 items-center gap-2 rounded-lg bg-white px-3 py-2 text-sm shadow-sm"
 										>
 											<FileSpreadsheet className="size-4 shrink-0 text-emerald-600" />
-											<span className="min-w-0 flex-1 truncate text-slate-700">{selected.name}</span>
+											<span className="min-w-0 flex-1 truncate text-slate-700">
+												{selected.name}
+											</span>
 											{canPreview(selected) ? (
 												<button
 													type="button"
@@ -115,40 +117,46 @@ export function PayrollFileSlots({
 				);
 			})}
 			{slots.some((slot) => slot.role === "roster") ? (
-			<input
-				ref={rosterInputRef}
-				type="file"
-				className="hidden"
-				multiple
-				onChange={(event) => {
-					onAddFiles(event.target.files, "roster");
-					event.target.value = "";
-				}}
-			/>
+				<input
+					ref={rosterInputRef}
+					aria-label="上传人员底表文件"
+					type="file"
+					className="hidden"
+					multiple
+					accept=".xlsx"
+					onChange={(event) => {
+						onAddFiles(event.target.files, "roster");
+						event.target.value = "";
+					}}
+				/>
 			) : null}
 			{slots.some((slot) => slot.role === "historical_payroll") ? (
-			<input
-				ref={historicalInputRef}
-				type="file"
-				className="hidden"
-				multiple
-				onChange={(event) => {
-					onAddFiles(event.target.files, "historical_payroll");
-					event.target.value = "";
-				}}
-			/>
+				<input
+					ref={historicalInputRef}
+					aria-label="上传历史工资文件"
+					type="file"
+					className="hidden"
+					multiple
+					accept=".xlsx"
+					onChange={(event) => {
+						onAddFiles(event.target.files, "historical_payroll");
+						event.target.value = "";
+					}}
+				/>
 			) : null}
 			{slots.some((slot) => slot.role === "attendance") ? (
-			<input
-				ref={attendanceInputRef}
-				type="file"
-				className="hidden"
-				multiple
-				onChange={(event) => {
-					onAddFiles(event.target.files, "attendance");
-					event.target.value = "";
-				}}
-			/>
+				<input
+					ref={attendanceInputRef}
+					aria-label="上传当月考勤文件"
+					type="file"
+					className="hidden"
+					multiple
+					accept=".xlsx,.pdf"
+					onChange={(event) => {
+						onAddFiles(event.target.files, "attendance");
+						event.target.value = "";
+					}}
+				/>
 			) : null}
 		</>
 	);

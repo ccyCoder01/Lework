@@ -13,7 +13,6 @@ import (
 	"github.com/ygpkg/yg-go/logs"
 	"gorm.io/gorm"
 
-	"github.com/insmtx/Leros/backend/internal/adapter/account"
 	"github.com/insmtx/Leros/backend/internal/api/contract"
 	infradb "github.com/insmtx/Leros/backend/internal/infra/db"
 	"github.com/insmtx/Leros/backend/types"
@@ -74,9 +73,16 @@ func (s *pluginService) ConnectMCPPlatform(
 		if existing.CreatedBy != uin {
 			return nil, contract.ErrPluginNotFound
 		}
+		toolCount := 0
+		if channel.AuthType == types.MCPChannelAuthTypeManaged {
+			toolCount, err = s.ensureManagedConnectorRevision(ctx, uin, channel, existing)
+			if err != nil {
+				return nil, err
+			}
+		}
 		platform := mcpPlatformViewFromPlugin(channel, s.channelCanConnect(channel), existing.PublicID)
 		view := pluginView(*existing)
-		return &contract.ConnectMCPPlatformResponse{Platform: platform, Plugin: view}, nil
+		return &contract.ConnectMCPPlatformResponse{Platform: platform, Plugin: view, ToolCount: toolCount}, nil
 	}
 
 	var definition json.RawMessage
@@ -91,8 +97,8 @@ func (s *pluginService) ConnectMCPPlatform(
 		definition, sourceRevisionID, err = s.instantiateSystemConnectorTemplate(ctx, channel, values)
 	case types.MCPChannelAuthTypeManaged:
 		handler := strings.TrimSpace(types.MCPChannelAuthConfig(channel.AuthConfig).Handler)
-		if handler != coreKGPlatformCode || s.apiKeyIssuer == nil {
-			return nil, invalidMCPConfig("current edition does not support this managed authorization")
+		if !s.canResolveManagedCredentials(handler) {
+			return nil, invalidMCPConfig("managed credential handler is not configured")
 		}
 		var template *ConnectorDefinition
 		var templateRevision *types.PluginRevision
@@ -100,15 +106,17 @@ func (s *pluginService) ConnectMCPPlatform(
 		if err != nil {
 			return nil, err
 		}
-		var credential *account.CreatedAPIKey
-		credential, err = s.apiKeyIssuer.CreateAPIKey(ctx, account.CreateAPIKeyInput{
-			Name: "SingerOS " + channel.Name + " MCP", Purpose: "mcp_connector",
-			ResourceType: "mcp", ResourceID: 0, ExpireHours: 0,
+		values, credentialErr := s.resolveManagedCredentials(ctx, handler, ManagedCredentialRequest{
+			ConnectorCode: channelCode, ConnectorName: channel.Name, Purpose: "mcp_connector",
 		})
+		err = credentialErr
 		if err != nil {
-			return nil, fmt.Errorf("create CoreKG API key: %w", err)
+			return nil, fmt.Errorf("resolve managed connector credentials: %w", err)
 		}
-		definition, err = instantiateSystemConnectorDefinition(template, map[string]string{"api_key": credential.APIKey})
+		if err = validateManagedCredentialBindings(template, values); err != nil {
+			return nil, err
+		}
+		definition, err = instantiateSystemConnectorDefinition(template, values)
 		sourceRevisionID = &templateRevision.ID
 	case types.MCPChannelAuthTypeNone:
 		definition, sourceRevisionID, err = s.instantiateSystemConnectorTemplate(ctx, channel, nil)
@@ -147,6 +155,96 @@ func (s *pluginService) ConnectMCPPlatform(
 		Platform: mcpPlatformViewFromPlugin(channel, true, created.PublicID),
 		Plugin:   *created, ToolCount: toolCount,
 	}, nil
+}
+
+func (s *pluginService) ensureManagedConnectorRevision(
+	ctx context.Context,
+	uin uint,
+	channel *types.MCPChannel,
+	existing *types.Plugin,
+) (int, error) {
+	config := types.MCPChannelAuthConfig(channel.AuthConfig)
+	if !s.canResolveManagedCredentials(config.Handler) {
+		return 0, invalidMCPConfig("managed credential handler is not configured")
+	}
+	template, templateRevision, err := s.loadSystemConnectorTemplate(ctx, channel)
+	if err != nil {
+		return 0, err
+	}
+	currentRevision, err := infradb.GetCurrentPluginRevision(ctx, s.db, existing)
+	if err != nil {
+		return 0, err
+	}
+	if currentRevision == nil {
+		return 0, invalidMCPConfig("connected managed connector has no current revision")
+	}
+	current, err := ConnectorFromDefinition(currentRevision.Definition)
+	if err != nil || current == nil {
+		return 0, invalidMCPConfig("connected managed connector definition is invalid")
+	}
+	if current.Auth.Type == types.MCPChannelAuthTypeManaged && validateManagedCredentialBindings(template, current.Auth.Values) == nil {
+		return 0, nil
+	}
+	values, err := s.resolveManagedCredentials(ctx, config.Handler, ManagedCredentialRequest{
+		ConnectorCode: channel.Channel, ConnectorName: channel.Name, Purpose: "mcp_connector",
+	})
+	if err != nil {
+		return 0, fmt.Errorf("resolve managed connector credentials: %w", err)
+	}
+	if err := validateManagedCredentialBindings(template, values); err != nil {
+		return 0, err
+	}
+	definition, err := instantiateSystemConnectorDefinition(template, values)
+	if err != nil {
+		return 0, err
+	}
+	mcp, err := MCPFromDefinition(definition)
+	if err != nil {
+		return 0, err
+	}
+	toolCount := 0
+	if mcp != nil && mcp.Transport == "http" {
+		result, err := s.TestMCPPlugin(ctx, &contract.TestMCPPluginRequest{
+			Transport: mcp.Transport, URL: mcp.URL, BearerToken: mcp.BearerToken, Headers: mcp.Headers,
+		})
+		if err != nil {
+			return 0, err
+		}
+		toolCount = result.ToolCount
+	}
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		currentStored, err := infradb.GetPluginByID(ctx, tx, existing.ID)
+		if err != nil {
+			return err
+		}
+		if currentStored == nil || currentStored.CurrentRevision != existing.CurrentRevision {
+			return fmt.Errorf("managed connector changed concurrently; retry the connection")
+		}
+		nextRevision := currentStored.CurrentRevision + 1
+		if nextRevision <= 0 {
+			nextRevision = 1
+		}
+		revision := &types.PluginRevision{
+			PluginID: existing.ID, SourcePluginRevisionID: &templateRevision.ID,
+			Revision: nextRevision, Status: "published", Definition: definition,
+			PublishedByType: "user", PublishedByID: uin, PublishedAt: time.Now(),
+		}
+		if err := infradb.CreatePluginRevision(ctx, tx, revision); err != nil {
+			return err
+		}
+		result := tx.Model(&types.Plugin{}).Where("id = ? AND current_revision = ?", existing.ID, currentStored.CurrentRevision).
+			Select("current_revision", "updated_by").Updates(types.Plugin{CurrentRevision: nextRevision, UpdatedBy: uin})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("managed connector changed concurrently; retry the connection")
+		}
+		existing.CurrentRevision = nextRevision
+		existing.UpdatedBy = uin
+		return nil
+	})
+	return toolCount, err
 }
 
 // TestMCPPlatform tests a connected platform using its server-side revision and credentials.
@@ -434,7 +532,7 @@ func validateChannelAuthConfig(channel *types.MCPChannel, requireOAuthAppConfig 
 	}
 	knownValues := fields
 	if channel.AuthType == types.MCPChannelAuthTypeManaged {
-		knownValues = map[string]struct{}{"api_key": {}}
+		knownValues = nil // The configured provider is the source of truth for managed credential keys.
 	}
 	if channel.AuthType == types.MCPChannelAuthTypeOAuth {
 		if strings.TrimSpace(config.Handler) != baiduNetdiskPlatformCode || config.OAuth == nil {
@@ -546,13 +644,50 @@ func (s *pluginService) channelCanConnect(channel *types.MCPChannel) bool {
 		return false
 	}
 	if channel.AuthType == types.MCPChannelAuthTypeManaged {
-		return strings.TrimSpace(types.MCPChannelAuthConfig(channel.AuthConfig).Handler) == coreKGPlatformCode &&
-			s.apiKeyIssuer != nil
+		return s.canResolveManagedCredentials(types.MCPChannelAuthConfig(channel.AuthConfig).Handler)
 	}
 	if channel.AuthType == types.MCPChannelAuthTypeOAuth {
 		return strings.TrimSpace(types.MCPChannelAuthConfig(channel.AuthConfig).Handler) == baiduNetdiskPlatformCode
 	}
 	return true
+}
+
+func (s *pluginService) canResolveManagedCredentials(handler string) bool {
+	if s.managedCredentials != nil && s.managedCredentials.CanResolve(handler) {
+		return true
+	}
+	return strings.TrimSpace(handler) == coreKGPlatformCode && s.apiKeyIssuer != nil
+}
+
+func (s *pluginService) resolveManagedCredentials(ctx context.Context, handler string, req ManagedCredentialRequest) (map[string]string, error) {
+	if s.managedCredentials != nil && s.managedCredentials.CanResolve(handler) {
+		return s.managedCredentials.Resolve(ctx, handler, req)
+	}
+	if strings.TrimSpace(handler) == coreKGPlatformCode && s.apiKeyIssuer != nil {
+		return NewAPIKeyIssuerCredentialProvider(s.apiKeyIssuer).Resolve(ctx, req)
+	}
+	return nil, fmt.Errorf("managed credential handler is unavailable")
+}
+
+func validateManagedCredentialBindings(template *ConnectorDefinition, values map[string]string) error {
+	if template == nil {
+		return invalidMCPConfig("connector template definition is invalid")
+	}
+	bindings := template.Auth.Bindings
+	for _, destinations := range []map[string]string{bindings.SkillEnv, bindings.MCPHeaders, bindings.MCPEnv, bindings.MCPQuery} {
+		for _, expression := range destinations {
+			references, _, err := connectorBindingReferences(expression)
+			if err != nil {
+				return invalidMCPConfig("managed connector binding is invalid")
+			}
+			for _, reference := range references {
+				if values[reference] == "" {
+					return invalidMCPConfig("managed credential provider did not return a required value")
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func mcpPlatformViewFromPlugin(

@@ -50,23 +50,36 @@ type Config struct {
 		DisableEventConsumers bool      `yaml:"disable_event_consumers,omitempty"` // 是否禁用后台事件消费者
 		JWT                   JWTConfig `yaml:"jwt,omitempty"`                     // JWT 认证配置
 	} `yaml:"server,omitempty"` // 服务器地址
-	Env                 string                     `yaml:"env,omitempty"`
-	WorkspaceRoot       string                     `yaml:"workspace_root,omitempty" json:"workspace_root,omitempty"`
-	Log                 LogConfig                  `yaml:"log,omitempty" json:"log,omitempty"`
-	Logger              LogsConfig                 `yaml:"logger,omitempty" json:"logger,omitempty"`
-	NATS                *NATSConfig                `yaml:"nats,omitempty"`
-	Database            *DatabaseConfig            `yaml:"database,omitempty"`
-	LLM                 *LLMConfig                 `yaml:"llm,omitempty"`
-	Scheduler           *SchedulerConfig           `yaml:"scheduler,omitempty"`
-	Storage             *StorageConfig             `yaml:"storage,omitempty"`
-	Gitea               *GiteaConfig               `yaml:"gitea,omitempty"`
-	WorkerAuth          *WorkerAuthConfig          `yaml:"worker_auth,omitempty" json:"worker_auth,omitempty"`
-	Aliyun              *AliyunConfig              `yaml:"aliyun,omitempty" json:"aliyun,omitempty"`
-	ClientUpdate        *ClientUpdateConfig        `yaml:"client_update,omitempty" json:"client_update,omitempty"`
-	Feishu              *FeishuConfig              `yaml:"feishu,omitempty" json:"feishu,omitempty"`
-	Auth                *IAMConfig                 `yaml:"auth,omitempty" json:"auth,omitempty"`
-	AutomationScheduler *AutomationSchedulerConfig `yaml:"automation_scheduler,omitempty" json:"automation_scheduler,omitempty"`
-	MCPConnectors       []MCPConnectorConfig       `yaml:"mcp_connectors,omitempty" json:"mcp_connectors,omitempty"`
+	Env                 string                                     `yaml:"env,omitempty"`
+	WorkspaceRoot       string                                     `yaml:"workspace_root,omitempty" json:"workspace_root,omitempty"`
+	Log                 LogConfig                                  `yaml:"log,omitempty" json:"log,omitempty"`
+	Logger              LogsConfig                                 `yaml:"logger,omitempty" json:"logger,omitempty"`
+	NATS                *NATSConfig                                `yaml:"nats,omitempty"`
+	Database            *DatabaseConfig                            `yaml:"database,omitempty"`
+	LLM                 *LLMConfig                                 `yaml:"llm,omitempty"`
+	Scheduler           *SchedulerConfig                           `yaml:"scheduler,omitempty"`
+	Storage             *StorageConfig                             `yaml:"storage,omitempty"`
+	Gitea               *GiteaConfig                               `yaml:"gitea,omitempty"`
+	WorkerAuth          *WorkerAuthConfig                          `yaml:"worker_auth,omitempty" json:"worker_auth,omitempty"`
+	Aliyun              *AliyunConfig                              `yaml:"aliyun,omitempty" json:"aliyun,omitempty"`
+	ClientUpdate        *ClientUpdateConfig                        `yaml:"client_update,omitempty" json:"client_update,omitempty"`
+	Feishu              *FeishuConfig                              `yaml:"feishu,omitempty" json:"feishu,omitempty"`
+	Auth                *IAMConfig                                 `yaml:"auth,omitempty" json:"auth,omitempty"`
+	AutomationScheduler *AutomationSchedulerConfig                 `yaml:"automation_scheduler,omitempty" json:"automation_scheduler,omitempty"`
+	MCPConnectors       []MCPConnectorConfig                       `yaml:"mcp_connectors,omitempty" json:"mcp_connectors,omitempty"`
+	ManagedCredentials  map[string]ManagedCredentialProviderConfig `yaml:"managed_credentials,omitempty" json:"managed_credentials,omitempty"`
+	PayrollProxy        PayrollProxyConfig                         `yaml:"payroll_proxy,omitempty" json:"payroll_proxy,omitempty"`
+}
+
+// PayrollProxyConfig contains the trusted Go Payroll HTTP API base URL.
+type PayrollProxyConfig struct {
+	Endpoint string `yaml:"endpoint" json:"endpoint"`
+}
+
+// ManagedCredentialProviderConfig points to an internal service that resolves credentials for a managed connector.
+type ManagedCredentialProviderConfig struct {
+	Endpoint     string `yaml:"endpoint" json:"endpoint"`
+	ServiceToken string `yaml:"service_token,omitempty" json:"service_token,omitempty"`
 }
 
 // MCPConnectorConfig describes one system MCP connector declared by the server configuration.

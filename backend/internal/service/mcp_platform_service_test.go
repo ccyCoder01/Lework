@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +22,95 @@ import (
 type mcpPlatformAPIKeyIssuer struct {
 	input account.CreateAPIKeyInput
 	calls int
+}
+
+type staticManagedCredentialProvider struct {
+	values  map[string]string
+	request ManagedCredentialRequest
+	calls   int
+}
+
+func (p *staticManagedCredentialProvider) Resolve(_ context.Context, request ManagedCredentialRequest) (map[string]string, error) {
+	p.request = request
+	p.calls++
+	return p.values, nil
+}
+
+func TestManagedMCPConnectorUsesConfiguredCredentialProvider(t *testing.T) {
+	const apiKey = "test-payroll-managed-key"
+	server := mcpserver.NewMCPServer("payroll-managed-test", "1.0.0")
+	server.AddTool(mcpsdk.NewTool("page_roster"), func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		return mcpsdk.NewToolResultText("ok"), nil
+	})
+	transport := mcpserver.NewStreamableHTTPServer(server)
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "Bearer "+apiKey {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		transport.ServeHTTP(w, req)
+	}))
+	defer httpServer.Close()
+
+	database := setupPluginServiceTestDB(t)
+	_, err := SyncSystemConnectorTemplate(context.Background(), database, "", types.MCPConnectorSpec{
+		Channel: "payroll", Name: "Payroll", Status: types.MCPChannelStatusActive,
+		Transport: "http", URL: httpServer.URL, AuthType: types.MCPChannelAuthTypeManaged,
+		AuthConfig: types.MCPChannelAuthConfig{
+			Handler:  "payroll",
+			Bindings: types.MCPChannelAuthBindings{MCPHeaders: map[string]string{"Authorization": "Bearer {{api_key}}"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SyncSystemConnectorTemplate() error = %v", err)
+	}
+	provider := &staticManagedCredentialProvider{values: map[string]string{"api_key": apiKey}}
+	credentials := NewManagedCredentialService(map[string]ManagedCredentialProvider{"payroll": provider})
+	pluginSvc := NewPluginServiceWithManagedCredentials(database, credentials, nil, nil)
+	connected, err := pluginSvc.ConnectMCPPlatform(context.Background(), 10, 20, "payroll", nil)
+	if err != nil {
+		t.Fatalf("ConnectMCPPlatform() error = %v", err)
+	}
+	if connected.ToolCount != 1 || provider.request.ConnectorCode != "payroll" ||
+		provider.request.ConnectorName != "Payroll" || provider.request.Purpose != "mcp_connector" || provider.calls != 1 {
+		t.Fatalf("connected=%#v provider_request=%#v", connected, provider.request)
+	}
+
+	plugin, err := infradb.GetPluginByPublicID(context.Background(), database, 10, connected.Plugin.PublicID)
+	if err != nil || plugin == nil {
+		t.Fatalf("GetPluginByPublicID() plugin/error = %#v/%v", plugin, err)
+	}
+	revision, err := infradb.GetCurrentPluginRevision(context.Background(), database, plugin)
+	if err != nil || revision == nil {
+		t.Fatalf("GetCurrentPluginRevision() revision/error = %#v/%v", revision, err)
+	}
+	var legacy ConnectorDefinition
+	if err := json.Unmarshal(revision.Definition, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacy.Auth.Type = types.MCPChannelAuthTypeNone
+	legacy.Auth.Values = nil
+	legacyDefinition, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Model(&types.PluginRevision{}).Where("id = ?", revision.ID).Update("definition", legacyDefinition).Error; err != nil {
+		t.Fatalf("downgrade connector revision fixture: %v", err)
+	}
+	migrated, err := pluginSvc.ConnectMCPPlatform(context.Background(), 10, 20, "payroll", nil)
+	if err != nil {
+		t.Fatalf("ConnectMCPPlatform() migrate old revision error = %v", err)
+	}
+	if migrated.Plugin.CurrentRevision != 2 || migrated.ToolCount != 1 || provider.calls != 2 {
+		t.Fatalf("migrated connector=%#v provider calls=%d", migrated, provider.calls)
+	}
+	repeated, err := pluginSvc.ConnectMCPPlatform(context.Background(), 10, 20, "payroll", nil)
+	if err != nil {
+		t.Fatalf("ConnectMCPPlatform() idempotent call error = %v", err)
+	}
+	if repeated.Plugin.CurrentRevision != 2 || provider.calls != 2 {
+		t.Fatalf("repeated connector=%#v provider calls=%d", repeated, provider.calls)
+	}
 }
 
 func (i *mcpPlatformAPIKeyIssuer) CreateAPIKey(

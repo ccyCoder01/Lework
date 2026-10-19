@@ -55,9 +55,9 @@ import {
 import { useComposerConnectorOptions } from "../input/useComposerConnectorOptions";
 import { useComposerSkillOptions } from "../input/useComposerSkillOptions";
 import { useBrandIdentity } from "../private-deployment/useBrandIdentity";
+import { usePaginatedProjectList } from "../project/usePaginatedProjectList";
 import { openPendingAttachmentPreview } from "./file-preview-store";
 import type { AppNavigation } from "./LeftRail";
-import { usePaginatedProjectList } from "../project/usePaginatedProjectList";
 import { formatProjectTaskPickerLabel, ProjectTaskPickerContent } from "./ProjectTaskPicker";
 import { ProjectIcon } from "./project-icon";
 
@@ -186,10 +186,14 @@ export function NewTaskPage({ navigation }: { navigation?: AppNavigation }) {
 		activeWorkbenchProjectId ?? null,
 		isAuthenticated,
 	);
-	const { connectorOptions, connectorsLoading } = useComposerConnectorOptions({
-		projectId: activeWorkbenchProjectId ?? null,
-		enabled: isAuthenticated,
-	});
+	const { connectorOptions, connectorsLoading, reloadConnectorOptions } =
+		useComposerConnectorOptions({
+			projectId: activeWorkbenchProjectId ?? null,
+			enabled: isAuthenticated,
+		});
+	const handleConnectorPickerOpen = useCallback(() => {
+		void reloadConnectorOptions();
+	}, [reloadConnectorOptions]);
 	const [selectedConnectorIds, setSelectedConnectorIds] = useState<string[]>([]);
 	const handleAssistantPickerOpen = useCallback(() => fetchAssistants(), [fetchAssistants]);
 	const handleSelectConnector = useCallback((publicId: string) => {
@@ -333,6 +337,7 @@ export function NewTaskPage({ navigation }: { navigation?: AppNavigation }) {
 			if (data && activeWorkbenchProjectId && hasInvokedSkill) {
 				void reloadSkillOptions();
 			}
+			if (data && activeWorkbenchProjectId) void reloadConnectorOptions();
 			if (navigation && data?.project_id && data?.task_id && data?.session_id) {
 				navigation.goToTaskDetail(data.project_id, data.task_id, data.session_id);
 			}
@@ -884,6 +889,7 @@ export function NewTaskPage({ navigation }: { navigation?: AppNavigation }) {
 									isGenerating={isSending}
 									connectorOptions={connectorOptions}
 									connectorsLoading={connectorsLoading}
+									onConnectorPickerOpen={handleConnectorPickerOpen}
 									selectedConnectorIds={selectedConnectorIds}
 									onSelectConnector={handleSelectConnector}
 									onRemoveConnector={handleRemoveConnector}
