@@ -150,6 +150,30 @@ dataHostPath: /opt/leros-data
 | `account.image` | `registry.yygu.cn/ygapp/account-api:v0.1.0` | Account 镜像（默认关闭） |
 | `worker.workspaceInitImage` | `busybox_1.36.1` | worker init 容器镜像 |
 
+### Worker 运行参数（`worker.config`）
+
+`worker.config.*` 会被渲染进 worker Pod 的 `/app/config/config.yaml`。其中
+`worker.config.run` 对应配置文件的顶层 `run:` 块，默认 `{}`（不渲染该块），
+此时各项由代码内置默认值兜底，与升级前行为一致：
+
+```yaml
+worker:
+  config:
+    run:
+      progress_idle_timeout_seconds: 1800   # 外部 CLI 无进度事件的最长等待（秒）
+```
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `worker.config.run.progress_idle_timeout_seconds` | `600` | opencode 单次 Run 内无任何进度事件的最长等待（秒）；到期以「长时间未操作」中止本次 Run，用户回复「继续」即可恢复 |
+| `worker.config.run.interaction_timeout_seconds` | `600` | 审批/问题等待的硬超时（秒） |
+| `worker.config.run.max_concurrency` | `10` | Worker 计算并发槽数量 |
+| `worker.config.run.max_run_duration_seconds` | `14400` | 单个 Run 的硬超时（秒） |
+
+其余 `run.*` 键（`max_inflight`、`max_interaction_waits`、`max_queued_commands`、
+`queue_retry_seconds`、`queue_start_timeout_seconds`、`debounce_ms`）同样可透传，
+完整清单与含义见 `docs/operations/private-deployment-config.md`。
+
 ### 数据库与消息队列
 
 默认内置部署，连接地址由 chart 自动用集群内部 Service 名计算。使用外部实例时：
@@ -198,7 +222,7 @@ redis:
 #### 情况 2：独立部署（默认，reuseCorekg=false）
 
 corekg 未部署时，随 chart 部署内置 MySQL/Redis，并通过**初始化 Job**（`post-install`/
-`post-upgrade` hook）依次执行 `--migrate-db` 建表与 `init` 种子数据：
+`post-upgrade` hook）执行 `init` 完成建表（`init` 内部 migrate）与种子数据：
 
 ```yaml
 account:
@@ -218,8 +242,9 @@ redis:
 ```
 
 > 初始化 Job 的 `image` 复用 `account.image`，二进制由 `account.initCommand.binary`
-> 指定（默认 `account`）；如需自定义 `core_settings.yaml`，设置
-> `account.initCommand.settingFile` 与 `account.initCommand.settingsConfigMap`。
+> 指定（默认 `account`）。`core_settings.yaml` 默认由 chart 按 `account.settings.*`
+> 自动生成 ConfigMap（`account.settings.create=true`）并挂载给 init Job；如需复用已有
+> ConfigMap，设 `account.settings.create=false` 且 `account.initCommand.settingsConfigMap=<名称>`。
 
 也可给两种情况的 account 都改用**外部实例**（此时不部署内置中间件，也不做初始化）：
 
