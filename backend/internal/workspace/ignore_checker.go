@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 )
@@ -14,6 +15,8 @@ import (
 // runtimeInternalDirs lists directories that contain runtime-private data
 // and should never be published as artifacts.
 var runtimeInternalDirs = []string{".opencode", ".leros"}
+
+var attendanceInternalDirs = []string{".attendance-work", ".attendance-pages"}
 
 // IsRuntimeInternalPath reports whether the given relative path belongs to
 // a runtime-internal directory that should be excluded from artifacts.
@@ -25,6 +28,45 @@ func IsRuntimeInternalPath(relPath string) bool {
 		}
 	}
 	return false
+}
+
+// IsAttendanceInternalPath reports whether a path belongs to private attendance work data.
+func IsAttendanceInternalPath(relPath string) bool {
+	relPath = filepath.ToSlash(filepath.Clean(strings.ReplaceAll(strings.TrimSpace(relPath), `\`, "/")))
+	for _, dir := range attendanceInternalDirs {
+		if relPath == dir || strings.HasPrefix(relPath, dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func effectiveFinalArtifactPath(repoDir string, item ManifestArtifact) (string, bool, error) {
+	if !item.IsFinal {
+		return "", false, nil
+	}
+
+	value := strings.ReplaceAll(strings.TrimSpace(item.Path), `\`, "/")
+	if value == "" || strings.HasPrefix(value, "/") || hasWindowsVolume(value) {
+		return "", false, fmt.Errorf("invalid artifact path %q", item.Path)
+	}
+	path := pathpkg.Clean(value)
+	if path == "." || path == ".." || strings.HasPrefix(path, "../") {
+		return "", false, fmt.Errorf("invalid artifact path %q", item.Path)
+	}
+	if IsAttendanceInternalPath(path) {
+		return path, false, nil
+	}
+	if strings.TrimSpace(repoDir) != "" {
+		if _, err := SafeJoin(repoDir, path); err != nil {
+			return "", false, fmt.Errorf("invalid artifact path %q: %w", item.Path, err)
+		}
+	}
+	return path, true, nil
+}
+
+func hasWindowsVolume(path string) bool {
+	return len(path) >= 2 && ((path[0] >= 'a' && path[0] <= 'z') || (path[0] >= 'A' && path[0] <= 'Z')) && path[1] == ':'
 }
 
 // builtinExcludedDirs lists directory base names that should never be scanned
@@ -58,12 +100,12 @@ func ShouldSkipArtifactFile(absPath string) bool {
 // ---- Manifest helpers ----
 
 // manifestHasFinalEntries checks whether the manifest already contains at least one final entry.
-func manifestHasFinalEntries(manifestPath string) (bool, error) {
-	paths, err := manifestFinalPaths(manifestPath)
+func manifestHasFinalEntries(manifestPath, repoDir string) (bool, error) {
+	paths, err := manifestFinalPaths(manifestPath, repoDir)
 	return len(paths) > 0, err
 }
 
-func manifestFinalPaths(manifestPath string) (map[string]bool, error) {
+func manifestFinalPaths(manifestPath, repoDir string) (map[string]bool, error) {
 	paths := make(map[string]bool)
 	file, err := os.Open(manifestPath)
 	if err != nil {
@@ -74,21 +116,27 @@ func manifestFinalPaths(manifestPath string) (map[string]bool, error) {
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
+	lineNumber := 0
 	for scanner.Scan() {
+		lineNumber++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
 		var entry ManifestArtifact
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			continue
+			return nil, fmt.Errorf("parse artifact manifest line %d: %w", lineNumber, err)
 		}
-		if entry.IsFinal {
-			path := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(entry.Path))))
-			if path != "." {
-				paths[path] = true
-			}
+		path, eligible, err := effectiveFinalArtifactPath(repoDir, entry)
+		if err != nil {
+			return nil, err
+		}
+		if eligible {
+			paths[path] = true
 		}
 	}
-	return paths, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read artifact manifest: %w", err)
+	}
+	return paths, nil
 }

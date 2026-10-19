@@ -13,6 +13,7 @@ from pathlib import Path
 
 CORE_IDENTITY_FIELDS = ("project_name", "company_name", "employee_type")
 IDENTITY_FIELDS = (*CORE_IDENTITY_FIELDS, "position")
+MATCHING_RULES_VERSION = "W03.3"
 DEFAULT_ALIASES = Path(__file__).resolve().parents[1] / "references" / "project-aliases.json"
 
 
@@ -442,10 +443,40 @@ def _candidate_advisories(candidate: dict, facts: dict) -> list[str]:
     return ["岗位信息存在差异（辅助信息，不阻断身份匹配）"] if len(positions) > 1 else []
 
 
+def _active_roster_matches(facts: dict, rosters: dict[int, dict], aliases: dict[str, str]) -> list[dict]:
+    name, project = facts.get("name"), facts.get("project_name")
+    if not name or not project:
+        return []
+    return [
+        roster for roster in rosters.values()
+        if _norm(roster["name"]) == _norm(name)
+        and _canonical_project(roster["project_name"], aliases) == project
+    ]
+
+
 def _classify(facts: dict, candidates: list[dict], rosters: dict[int, dict], aliases: dict[str, str] | None = None) -> tuple[str, int | None, list[str]]:
     aliases = aliases or {}
     if not candidates:
         return "unmatched", None, ["Payroll 未返回候选"]
+    roster_matches = _active_roster_matches(facts, rosters, aliases)
+    if len(roster_matches) == 1:
+        roster = roster_matches[0]
+        plausible = [candidate for candidate in candidates if not _candidate_conflicts(candidate, facts, aliases)]
+        linked = [
+            candidate for candidate in plausible
+            if candidate["roster_id"] == roster["roster_id"]
+            and not _candidate_safety(candidate, facts, rosters, aliases)
+        ]
+        if len(linked) == 1 and len(plausible) == 1:
+            return "matched", linked[0]["payroll_person_id"], [
+                "当前有效花名册中的姓名和规范项目唯一匹配；Payroll 人员关联由候选响应明确绑定到该 roster_id",
+                *_candidate_advisories(linked[0], facts),
+            ]
+        if len(plausible) > 1:
+            return "ambiguous", None, ["该花名册记录对应多个与已知身份事实相容的 Payroll 人员"]
+        return "pending_confirmation", None, [
+            "花名册姓名和规范项目唯一，但候选响应未提供唯一、有效的 Payroll 人员关联"
+        ]
     required = ("name", *CORE_IDENTITY_FIELDS)
     missing = [field for field in required if facts.get(field) is None or facts.get(field) == ""]
     plausible, exact = [], []
@@ -490,22 +521,35 @@ def build(
     ids = {person["record_id"] for person in people}
     rosters = _rosters(roster_data)
     candidate_map = _candidate_map(candidate_data, ids)
+    people_by_record = {person["record_id"]: person for person in people}
     matches = []
     for person in people:
         candidates = candidate_map[person["record_id"]]
         status, person_id, reasons = _classify(person["facts"], candidates, rosters, aliases)
-        matches.append({
+        roster_matches = _active_roster_matches(person["facts"], rosters, aliases)
+        row = {
             "record_id": person["record_id"],
             "status": status,
             "payroll_person_id": person_id,
-            "facts": person["facts"],
-            "candidate_ids": [candidate["payroll_person_id"] for candidate in candidates],
-            "candidates": candidates,
             "match_reasons": reasons,
             "user_confirmation": None,
-        })
+        }
+        if status == "matched" and len(roster_matches) == 1:
+            row.update({
+                "roster_id": roster_matches[0]["roster_id"],
+                "match_method": "active_roster_unique",
+                "reason": reasons[0],
+            })
+        else:
+            row.update({
+                "facts": person["facts"],
+                "candidate_ids": [candidate["payroll_person_id"] for candidate in candidates],
+                "candidates": candidates,
+            })
+        matches.append(row)
     result = {
         "schema_version": 1,
+        "matching_rules_version": MATCHING_RULES_VERSION,
         "attendance_sha256": _sha(attendance_raw),
         "roster_sha256": _sha(roster_raw),
         "candidate_response_sha256": _sha(candidate_raw),
@@ -526,19 +570,21 @@ def build(
                     if isinstance(candidate, dict) and candidate.get("payroll_person_id") == confirmed_id
                 ), None) if prior else None
                 current_candidate = next((
-                    candidate for candidate in row["candidates"]
+                    candidate for candidate in candidate_map[row["record_id"]]
                     if candidate["payroll_person_id"] == confirmed_id
                 ), None) if confirmed_id is not None else None
                 if confirmed_id is not None and prior_candidate == current_candidate and current_candidate is not None:
-                    blockers = _candidate_safety(current_candidate, row["facts"], rosters, aliases)
+                    facts = people_by_record[row["record_id"]]["facts"]
+                    blockers = _candidate_safety(current_candidate, facts, rosters, aliases)
                     if blockers:
                         continue
                     row["status"] = "matched"
                     row["payroll_person_id"] = confirmed_id
-                    row["match_reasons"] = [
-                        "保留仍存在于最新候选中的用户确认关系",
-                        *_candidate_advisories(current_candidate, row["facts"]),
-                    ]
+                    row["match_reasons"] = ["保留仍存在于最新候选中的用户确认关系",
+                                             *_candidate_advisories(current_candidate, facts)]
+                    row["facts"] = facts
+                    row["candidate_ids"] = [candidate["payroll_person_id"] for candidate in candidate_map[row["record_id"]]]
+                    row["candidates"] = candidate_map[row["record_id"]]
                     row["user_confirmation"] = prior["user_confirmation"]
     return result
 
@@ -578,6 +624,7 @@ def confirm(
             or matches_data.get("project_aliases_sha256") != aliases_sha):
         raise ValueError("Payroll 候选输入已变化；请重新构建最新映射后再确认")
     fresh = build(attendance_path, roster_path, candidates_path, query_path=query_path, aliases_path=aliases_path)
+    current_candidates = _candidate_map(candidate_data, {person["record_id"] for person in people})
     rows = matches_data.get("matches")
     confirmations = request.get("confirmations") if isinstance(request, dict) else None
     if not isinstance(rows, list) or not isinstance(confirmations, list) or not confirmations:
@@ -588,10 +635,18 @@ def confirm(
             raise ValueError("person-matches 包含无效或重复 record_id")
         by_record[row["record_id"]] = row
     fresh_by_record = {row["record_id"]: row for row in fresh["matches"]}
+    people_by_record = {person["record_id"]: person for person in people}
+
+    def unchanged(row: dict, current: dict, facts: dict, candidates: list[dict]) -> bool:
+        if row.get("match_method") == "active_roster_unique":
+            return all(row.get(field) == current.get(field) for field in (
+                "status", "payroll_person_id", "roster_id", "match_method", "reason",
+            ))
+        return row.get("facts") == facts and row.get("candidates") == candidates
+
     if set(by_record) != set(fresh_by_record) or any(
-        by_record[record_id].get("facts") != fresh_by_record[record_id]["facts"]
-        or by_record[record_id].get("candidates") != fresh_by_record[record_id]["candidates"]
-        for record_id in by_record
+        not unchanged(by_record[record_id], fresh_by_record[record_id], people_by_record[record_id]["facts"],
+                      current_candidates[record_id]) for record_id in by_record
     ):
         raise ValueError("person-matches 与当前考勤或 Payroll 候选摘要不一致；请重新构建")
     validated, seen = [], set()
@@ -608,20 +663,25 @@ def confirm(
         row = by_record.get(record_id)
         if row is None:
             raise ValueError(f"找不到考勤 record_id: {record_id}")
-        if not isinstance(row.get("candidates"), list) or not any(
+        row_candidates = row.get("candidates") or current_candidates[record_id]
+        if not any(
             isinstance(candidate, dict) and candidate.get("payroll_person_id") == person_id
-            for candidate in row["candidates"]
+            for candidate in row_candidates
         ):
             raise ValueError(f"人员 {person_id} 不属于 {record_id} 的候选列表")
-        selected = next(candidate for candidate in row["candidates"] if candidate["payroll_person_id"] == person_id)
-        blockers = _candidate_safety(selected, row["facts"], _rosters(roster_data), aliases)
+        selected = next(candidate for candidate in row_candidates if candidate["payroll_person_id"] == person_id)
+        facts = people_by_record[record_id]["facts"]
+        blockers = _candidate_safety(selected, facts, _rosters(roster_data), aliases)
         if blockers:
             raise ValueError(f"人员 {person_id} 不能普通确认: " + "; ".join(blockers))
-        validated.append((row, person_id, note, selected))
-    for row, person_id, note, selected in validated:
+        validated.append((row, person_id, note, selected, facts))
+    for row, person_id, note, selected, facts in validated:
         row["status"] = "matched"
         row["payroll_person_id"] = person_id
-        row["match_reasons"] = ["用户明确确认候选关系", *_candidate_advisories(selected, row["facts"])]
+        row["facts"] = facts
+        row["candidates"] = row.get("candidates") or current_candidates[row["record_id"]]
+        row["candidate_ids"] = [candidate["payroll_person_id"] for candidate in row["candidates"]]
+        row["match_reasons"] = ["用户明确确认候选关系", *_candidate_advisories(selected, facts)]
         row["user_confirmation"] = {"source": "user", "note": note}
     _write(matches_path, matches_data)
     return matches_data
@@ -650,6 +710,7 @@ def main() -> None:
     confirm_parser.add_argument("--query", required=True, help="实际发送给 Payroll 候选接口的请求 JSON")
     confirm_parser.add_argument("--aliases", default=str(DEFAULT_ALIASES))
     args = parser.parse_args()
+    status_counts = None
     if args.command == "candidate-request":
         if Path(args.output).resolve() in {Path(args.attendance).resolve(), Path(args.aliases).resolve()}:
             raise ValueError("候选请求输出路径不能覆盖考勤或项目别名配置")
@@ -667,12 +728,19 @@ def main() -> None:
         output_path = args.output
         _write(output_path, result)
         result_count = len(result["matches"])
+        status_counts = {
+            status: sum(row["status"] == status for row in result["matches"])
+            for status in ("matched", "ambiguous", "unmatched", "pending_confirmation")
+        }
     else:
         result = confirm(args.attendance, args.roster, args.candidates, args.matches, args.request,
                          query_path=args.query, aliases_path=args.aliases)
         output_path = args.matches
         result_count = len(result["matches"])
-    print(json.dumps({"ok": True, "count": result_count, "path": output_path}, ensure_ascii=False))
+    response = {"ok": True, "count": result_count, "path": output_path}
+    if status_counts is not None:
+        response["status_counts"] = status_counts
+    print(json.dumps(response, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -9,8 +9,10 @@ description: 识别、核对及整理项目考勤，支持用户明确更正，�
 
 1. **上传与识别**：新任务首次进入时读取 [recognition.md](references/recognition.md)，按下面九步执行。每个 PDF 只做一次确定性预处理；每页至多读取一次布局概览和每个固定数据分区，不能临时增图或补认。预处理可对轻微整体倾斜执行有界自动纠偏，不得将纠偏结果描述为修复透视或局部变形。逐页观察后立即保存，并按人员行号绑定印刷汇总及备注。
 2. **自然语言核对与修改**：用户要求查看、修改或确认考勤时读取 [attendance-review.md](references/attendance-review.md)。Agent 将明确的自然语言更正转成脚本 JSON 请求；目标或事实有歧义时只询问必要问题。每次修改后重新检查、导出最新核对表并重新声明该文件。
-3. **人员身份匹配**：用户要求进行人员匹配后读取 [identity-matching.md](references/identity-matching.md)，只调用 Payroll 的 `list_roster` 和 `resolve_payroll_person_candidates` 只读工具，并用 `scripts/person_matches.py` 构建或确认当前任务的身份映射。项目别名仅按 [project-aliases.json](references/project-aliases.json) 中的显式映射规范化；岗位是软辅助字段，不单独否决身份，也不能替代姓名、项目、公司和用工性质等核心证据。候选不等于可确认身份；展示候选的完整身份字段及关键证据后才接受用户明确选择。遇到关键冲突或无效花名册关联必须保留待核，禁止强制覆盖。匹配不等于考勤确认或核算授权。
-4. **用户明确授权后的工资阶段**：只有用户明确要求开始核算后，才可进入已配置的 Payroll 流程；不得把考勤表交付或身份匹配理解为核算授权。Payroll 提交/计算可能写入正式业务记录，禁止称为无副作用试算。若环境未配置该能力或授权不足，说明业务阻塞，不要求用户选择内部技术方案。
+3. **人员身份匹配**：用户要求进行人员匹配后读取 [identity-matching.md](references/identity-matching.md)，只调用 Payroll 的 `list_roster` 和 `resolve_payroll_person_candidates` 只读工具，并用 `scripts/person_matches.py` 构建或确认当前任务的身份映射。脚本先用姓名与显式规范项目筛查当前有效花名册，再要求候选响应明确证明唯一 Payroll 人员 ID 与该 `roster_id` 的关联；唯一且无已知关键冲突时自动匹配，即使考勤来源缺少公司或用工性质。岗位是软辅助字段，不单独阻断。异常候选继续走原有安全确认流程。`list_roster` 本身不返回 Payroll 人员 ID，因此不得从 `roster_id` 推测；现有候选接口仍可能执行历史证据查询，Skill 优化不代表服务端查询已减少。候选不等于可确认身份；展示完整候选信息后才接受用户明确选择。匹配不等于考勤确认或核算授权。
+4. **用户明确授权后的工资阶段**：用户明确要求进入工资处理后读取 [payroll-processing.md](references/payroll-processing.md)。考勤识别、身份关联、考勤正式提交、工资核算是四个独立完成阶段；任何一个阶段成功都不能代替后续阶段的用户授权或成功回执。Payroll 提交和核算会持久化正式业务批次，不能称为只读试算。
+
+内部识别、候选和请求/响应文件统一保存在当前任务仓库的 `.attendance-work/`，识别视图保存在 `.attendance-pages/`。不要声明这些内部文件；只声明 `考勤确认表.md` 和已成功核算并实际生成的正式工资表。Artifact 收集会排除上述两个内部目录，但不会删除其中的文件。
 
 ## 新任务识别与交付顺序
 
@@ -41,7 +43,7 @@ python3 scripts/attendance_export.py --data <工作目录>/attendance.json --out
 
 核对表应保留必要待确认事项；缺日、未知状态、印刷值冲突、来源页警告或无法确定项目归属不得伪装成完整确定数据。原始日明细仍在 JSON 工作数据中，Markdown 只显示项目分组汇总。
 
-诊断摘要保存在工作目录的 `.attendance-diagnostics.json`，仅供内部排查；不要声明为 Artifact，也不要复制到最终 Markdown 或对话回复。预处理耗时来自脚本的单调时钟；模型推理耗时和 Agent 实际图片读取次数不可观测时保持 `null`。
+诊断摘要保存在 `.attendance-work/.attendance-diagnostics.json`，仅供内部排查；不要声明为 Artifact，也不要复制到最终 Markdown 或对话回复。预处理耗时来自脚本的单调时钟；模型推理耗时和 Agent 实际图片读取次数不可观测时保持 `null`。
 
 ## 正式产物交付
 

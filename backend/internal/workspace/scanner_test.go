@@ -325,3 +325,216 @@ func TestGitDiffReconcileEnrichesExplicitRename(t *testing.T) {
 		t.Fatalf("explicit metadata was not preserved: %#v", records[0])
 	}
 }
+
+func TestGitDiffReconcileFiltersAttendanceWorkFiles(t *testing.T) {
+	repoDir := t.TempDir()
+	runGitTestCommand(t, repoDir, "init")
+	runGitTestCommand(t, repoDir, "config", "user.email", "test@test.com")
+	runGitTestCommand(t, repoDir, "config", "user.name", "test")
+	write := func(path string, content []byte) {
+		t.Helper()
+		full := filepath.Join(repoDir, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("seed.txt", []byte("seed"))
+	write(".gitignore", []byte(".leros/\n"))
+	runGitTestCommand(t, repoDir, "add", ".")
+	runGitTestCommand(t, repoDir, "commit", "-m", "initial")
+
+	ctx := context.Background()
+	preTree, err := CapturePreRunTree(ctx, repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(".attendance-work/person-matches.json", []byte("internal"))
+	write(".attendance-pages/doc-1/page-1.png", []byte("image"))
+	write("考勤确认表.md", []byte("attendance review"))
+	write("2026年6月工资核算表.xlsx", []byte("payroll workbook"))
+	write("ordinary-report.md", []byte("ordinary diff"))
+	turnDir := filepath.Join(repoDir, ".leros", "tasks", "1", "turns", "req1")
+	if err := os.MkdirAll(turnDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(turnDir, "artifacts.jsonl")
+	plan := &TaskWorkspace{RepoDir: repoDir, ArtifactManifestPath: manifestPath}
+	if err := GitDiffReconcile(ctx, plan, preTree); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, internalPath := range []string{".attendance-work/", ".attendance-pages/"} {
+		if strings.Contains(string(manifest), internalPath) {
+			t.Fatalf("diff manifest exposes internal path %q: %s", internalPath, manifest)
+		}
+	}
+	if !strings.Contains(string(manifest), "ordinary-report.md") {
+		t.Fatalf("ordinary source:diff artifact was lost: %s", manifest)
+	}
+
+	// Even explicit final declarations for private work paths are not delivered.
+	write(".attendance-work/attendance.json", []byte("private"))
+	write(".attendance-pages/doc-1/page-1.json", []byte("private"))
+	write("考勤确认表.md", []byte("attendance review"))
+	write("2026年6月工资核算表.xlsx", []byte("payroll workbook"))
+	manifest = []byte(
+		`{"path":".attendance-work/attendance.json","is_final":true}` + "\n" +
+			`{"path":".attendance-pages/doc-1/page-1.json","is_final":true}` + "\n" +
+			`{"path":"考勤确认表.md","is_final":true}` + "\n" +
+			`{"path":"考勤确认表.md","is_final":true}` + "\n" +
+			`{"path":"2026年6月工资核算表.xlsx","is_final":true}` + "\n",
+	)
+	if err := os.WriteFile(manifestPath, manifest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	records, err := CollectFinalArtifacts(ctx, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("collected records = %#v, want two formal files with duplicate declaration deduplicated", records)
+	}
+	seen := map[string]bool{}
+	for _, record := range records {
+		seen[record.RelativePath] = true
+	}
+	if !seen["考勤确认表.md"] || !seen["2026年6月工资核算表.xlsx"] {
+		t.Fatalf("formal business files missing: %#v", records)
+	}
+	for _, path := range []string{".attendance-work/attendance.json", ".attendance-pages/doc-1/page-1.json"} {
+		if IsAttendanceInternalPath(path) != true {
+			t.Fatalf("expected private path to be recognized: %s", path)
+		}
+		if _, err := os.Stat(filepath.Join(repoDir, filepath.FromSlash(path))); err != nil {
+			t.Fatalf("filtering removed internal file %s: %v", path, err)
+		}
+	}
+}
+
+func TestGitDiffReconcileFallsBackForOnlyInternalFinalDeclarations(t *testing.T) {
+	repoDir := t.TempDir()
+	runGitTestCommand(t, repoDir, "init")
+	runGitTestCommand(t, repoDir, "config", "user.email", "test@test.com")
+	runGitTestCommand(t, repoDir, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(repoDir, "seed.txt"), []byte("seed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte(".leros/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitTestCommand(t, repoDir, "add", ".")
+	runGitTestCommand(t, repoDir, "commit", "-m", "initial")
+
+	ctx := context.Background()
+	preTree, err := CapturePreRunTree(ctx, repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	internalPath := filepath.Join(repoDir, ".attendance-work", "person-matches.json")
+	if err := os.MkdirAll(filepath.Dir(internalPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(internalPath, []byte("private"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "ordinary-report.md"), []byte("report"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(repoDir, ".leros", "tasks", "1", "turns", "req1", "artifacts.jsonl")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, []byte(`{"path":".attendance-work/person-matches.json","is_final":true}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plan := &TaskWorkspace{RepoDir: repoDir, ArtifactManifestPath: manifestPath}
+	if err := GitDiffReconcile(ctx, plan, preTree); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(manifest), `"path":"ordinary-report.md"`) || !strings.Contains(string(manifest), `"source":"diff"`) {
+		t.Fatalf("internal-only declaration suppressed ordinary diff fallback: %s", manifest)
+	}
+	artifacts, err := CollectFinalArtifacts(ctx, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifacts) != 1 || artifacts[0].RelativePath != "ordinary-report.md" {
+		t.Fatalf("final artifacts = %#v, want only ordinary report", artifacts)
+	}
+	if _, err := os.Stat(internalPath); err != nil {
+		t.Fatalf("filtering removed internal source file: %v", err)
+	}
+}
+
+func TestAttendanceArtifactPathFilteringBoundaries(t *testing.T) {
+	for _, path := range []string{
+		".attendance-work/file.json",
+		"./.attendance-work/file.json",
+		".attendance-work/subdir/file.json",
+		".attendance-work/../.attendance-work/file.json",
+		`.attendance-work\subdir\file.json`,
+		`.attendance-pages//page.json`,
+	} {
+		if !IsAttendanceInternalPath(path) {
+			t.Errorf("IsAttendanceInternalPath(%q) = false", path)
+		}
+	}
+	for _, path := range []string{"output/.attendance-work/file.json", ".attendance-work-copy/file.json", "ordinary-report.md"} {
+		if IsAttendanceInternalPath(path) {
+			t.Errorf("IsAttendanceInternalPath(%q) = true", path)
+		}
+	}
+}
+
+func TestFinalArtifactDeclarationsRejectInvalidPathsAndMalformedManifest(t *testing.T) {
+	for _, path := range []string{"", ".", "../outside.json", "/absolute.json", `C:\outside.json`} {
+		t.Run(path, func(t *testing.T) {
+			_, eligible, err := effectiveFinalArtifactPath(t.TempDir(), ManifestArtifact{Path: path, IsFinal: true})
+			if err == nil || eligible {
+				t.Fatalf("invalid path %q accepted: eligible=%v err=%v", path, eligible, err)
+			}
+		})
+	}
+	manifestPath := filepath.Join(t.TempDir(), "artifacts.jsonl")
+	if err := os.WriteFile(manifestPath, []byte("not-json\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manifestFinalPaths(manifestPath, t.TempDir()); err == nil {
+		t.Fatal("malformed manifest was silently accepted for diff fallback")
+	}
+}
+
+func TestCollectFinalArtifactsRejectsExternalSymlink(t *testing.T) {
+	root := t.TempDir()
+	repoDir := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(root, "outside.md")
+	if err := os.WriteFile(external, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(repoDir, "report.md")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	manifestPath := filepath.Join(root, "artifacts.jsonl")
+	if err := os.WriteFile(manifestPath, []byte(`{"path":"report.md","is_final":true}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manifestFinalPaths(manifestPath, repoDir); err == nil {
+		t.Fatal("external symlink declaration was accepted as an effective final path")
+	}
+	if _, err := CollectFinalArtifacts(context.Background(), &TaskWorkspace{RepoDir: repoDir, ArtifactManifestPath: manifestPath}); err == nil {
+		t.Fatal("external symlink was accepted as a final artifact")
+	}
+}
