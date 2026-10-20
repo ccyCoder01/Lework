@@ -112,6 +112,7 @@ type PublicEnv = {
 export type AppNavigation = {
 	currentPath: string;
 	goToRoute: (route: ViewMode) => void;
+	goToPath?: (path: string) => void;
 	goToProject: (projectId: string) => void;
 	goToProjectTasks: (projectId: string) => void;
 	goToTaskDetail: (projectId: string, taskId: string, sessionId: string) => void;

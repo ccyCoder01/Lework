@@ -16,7 +16,10 @@ function mcpPlugin(code: string, name: string): PluginListItem {
 }
 
 const ORG_LIST_RESPONSE = {
-	data: { code: 0, data: { plugins: [mcpPlugin("github", "GitHub")] } },
+	data: {
+		code: 0,
+		data: { plugins: [mcpPlugin("github", "GitHub"), mcpPlugin("payroll-org-user", "Payroll")] },
+	},
 } as Awaited<ReturnType<typeof pluginApi.list>>;
 
 const EMPTY_PROJECT_RESPONSE = {
@@ -35,8 +38,9 @@ describe("loadComposerConnectorOptions", () => {
 		const result = await loadComposerConnectorOptions({ projectId: "prj_1" });
 
 		expect(result.error).toBeNull();
-		expect(result.options).toHaveLength(1);
+		expect(result.options).toHaveLength(2);
 		expect(result.options[0]?.pluginId).toBe("connector_github");
+		expect(result.options[1]?.pluginId).toBe("connector_payroll-org-user");
 		expect(result.options[0]?.label).toBe("GitHub");
 		expect(result.options[0]?.source).toBe("organization");
 		expect(result.options[0]?.projectAssociated).toBe(false);
@@ -59,7 +63,7 @@ describe("loadComposerConnectorOptions", () => {
 
 		const result = await loadComposerConnectorOptions({ projectId: "prj_1" });
 
-		expect(result.options).toHaveLength(1);
+		expect(result.options).toHaveLength(2);
 		expect(result.error).toBe("项目绑定加载失败");
 	});
 
@@ -71,7 +75,7 @@ describe("loadComposerConnectorOptions", () => {
 
 		expect(list).toHaveBeenCalledWith({ kind: "mcp", status: "active", limit: 100 });
 		expect(listProject).not.toHaveBeenCalled();
-		expect(result.options).toHaveLength(1);
+		expect(result.options).toHaveLength(2);
 		expect(result.error).toBeNull();
 	});
 

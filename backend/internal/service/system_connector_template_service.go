@@ -66,9 +66,6 @@ func normalizeSystemConnectorSpec(spec types.MCPConnectorSpec) (*types.MCPChanne
 		return nil, fmt.Errorf("configured MCP channel %q is invalid", spec.Channel)
 	}
 	auth := types.MCPChannelAuthConfig(normalized.AuthConfig)
-	if normalized.AuthType == types.MCPChannelAuthTypeManaged && auth.Handler != coreKGPlatformCode {
-		return nil, fmt.Errorf("managed authorization only supports handler %q", coreKGPlatformCode)
-	}
 	if normalized.AuthType == types.MCPChannelAuthTypeOAuth && auth.Handler != baiduNetdiskPlatformCode {
 		return nil, fmt.Errorf("oauth authorization only supports handler %q", baiduNetdiskPlatformCode)
 	}

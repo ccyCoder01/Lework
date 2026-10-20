@@ -51,6 +51,7 @@ type ComposerActionBarProps = {
 	/** 连接器候选与选中状态：用于「添加连接器」多选弹窗。已选项在上方独立区域，可在此移除。 */
 	connectorOptions?: PluginComposerOption[];
 	connectorsLoading?: boolean;
+	onConnectorPickerOpen?: () => void;
 	selectedConnectorIds?: string[];
 	onSelectConnector?: (publicId: string) => void;
 	onRemoveConnector?: (publicId: string) => void;
@@ -98,6 +99,7 @@ export function ComposerActionBar({
 	skillsLoading,
 	onAssistantPickerOpen,
 	onSkillPickerOpen,
+	onConnectorPickerOpen,
 	disableAssistantAndSkill = false,
 	assistantSelectionMode = "multiple",
 	executionMode,
@@ -196,7 +198,10 @@ export function ComposerActionBar({
 	const filteredConnectors = useMemo(() => {
 		const query = connectorSearch.trim().toLowerCase();
 		return connectorOptions.filter((connector) => {
-			if (connector.pluginId && selectedConnectorIds.includes(connector.pluginId)) {
+			if (
+				connector.projectAssociated ||
+				(connector.pluginId && selectedConnectorIds.includes(connector.pluginId))
+			) {
 				return false;
 			}
 			if (!query) return true;
@@ -207,9 +212,12 @@ export function ComposerActionBar({
 		});
 	}, [connectorOptions, connectorSearch, selectedConnectorIds]);
 	const selectedConnectors = useMemo(() => {
-		return selectedConnectorIds
-			.map((publicId) => connectorOptions.find((item) => item.pluginId === publicId))
-			.filter((item): item is PluginComposerOption => Boolean(item));
+		const selectedIDs = new Set(selectedConnectorIds);
+		return connectorOptions.filter(
+			(connector) =>
+				connector.projectAssociated ||
+				Boolean(connector.pluginId && selectedIDs.has(connector.pluginId)),
+		);
 	}, [connectorOptions, selectedConnectorIds]);
 	const assistantPickerLoading = assistantOpen && assistantRefreshState === "loading";
 	const assistantPickerError =
@@ -225,11 +233,6 @@ export function ComposerActionBar({
 		<>
 			<Cable className="size-4" />
 			<span>添加连接器</span>
-			{selectedConnectorIds.length > 0 && (
-				<span className="inline-flex size-4 shrink-0 items-center justify-center rounded-full bg-slate-900 text-[10px] font-medium leading-none text-white">
-					{selectedConnectorIds.length}
-				</span>
-			)}
 		</>
 	);
 
@@ -486,7 +489,8 @@ export function ComposerActionBar({
 				onOpenChange={(open) => {
 					if (connectorDisabled) return;
 					setConnectorOpen(open);
-					if (!open) setConnectorSearch("");
+					if (open) onConnectorPickerOpen?.();
+					else setConnectorSearch("");
 				}}
 			>
 				{connectorDisabled ? (
@@ -555,6 +559,7 @@ export function ComposerActionBar({
 												<CommandItem
 													key={publicId}
 													value={`selected:${connector.label}`}
+													disabled={connector.projectAssociated}
 													onSelect={() => {
 														if (onRemoveConnector) {
 															onRemoveConnector(publicId);

@@ -79,9 +79,12 @@ func CollectFinalArtifacts(ctx context.Context, plan *TaskWorkspace) ([]Artifact
 		if !item.IsFinal {
 			continue
 		}
-		key := filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimSpace(item.Path))))
-		if key == "." || strings.HasPrefix(key, "../") || strings.HasPrefix(key, "/") {
-			return nil, fmt.Errorf("invalid artifact path %q", item.Path)
+		key, eligible, err := effectiveFinalArtifactPath(plan.RepoDir, item)
+		if err != nil {
+			return nil, err
+		}
+		if !eligible {
+			continue
 		}
 		item.Path = key
 		if existing, ok := declared[key]; ok && strings.TrimSpace(item.PreviousPath) != "" {

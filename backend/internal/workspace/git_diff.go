@@ -155,7 +155,7 @@ func DiffArtifacts(ctx context.Context, repoDir, preTreeSHA, postTreeSHA string)
 			previousPath := parts[i]
 			filePath := parts[i+1]
 			i += 2
-			if filePath == "" {
+			if filePath == "" || IsAttendanceInternalPath(filePath) {
 				continue
 			}
 			entry := ManifestArtifact{
@@ -174,7 +174,7 @@ func DiffArtifacts(ctx context.Context, repoDir, preTreeSHA, postTreeSHA string)
 		}
 		filePath := parts[i]
 		i++
-		if filePath == "" {
+		if filePath == "" || IsAttendanceInternalPath(filePath) {
 			continue
 		}
 
@@ -217,7 +217,7 @@ func GitDiffReconcile(ctx context.Context, plan *TaskWorkspace, preTreeSHA strin
 
 	// Explicit declarations remain authoritative, but matching rename records are
 	// appended as metadata so the server can keep the old and new paths in one chain.
-	finalPaths, err := manifestFinalPaths(plan.ArtifactManifestPath)
+	finalPaths, err := manifestFinalPaths(plan.ArtifactManifestPath, plan.RepoDir)
 	if err != nil {
 		return err
 	}

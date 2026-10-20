@@ -2,6 +2,8 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,5 +205,89 @@ func TestCallRecordToEntityPreservesIDWhenSet(t *testing.T) {
 	e := callRecordToEntity(r)
 	if e.ID != 42 {
 		t.Fatalf("expected ID=42, got %d", e.ID)
+	}
+}
+
+func TestCallRecordToEntityPreservesOriginalLengthsAndTruncation(t *testing.T) {
+	input := strings.Repeat("输入😀", historyOutputLimit+10)
+	output := strings.Repeat("响应", historyOutputLimit+20)
+	record := &CallRecord{
+		Input: input, Output: output, InputLen: 1 << 20, OutputLen: 8 << 20,
+		InputTruncated: true, OutputTruncated: true,
+	}
+	entity := callRecordToEntity(record)
+	if entity.InputLen != record.InputLen || entity.OutputLen != record.OutputLen {
+		t.Fatalf("original lengths overwritten: input=%d output=%d", entity.InputLen, entity.OutputLen)
+	}
+	if !entity.InputTruncated || !entity.OutputTruncated {
+		t.Fatalf("truncation flags lost: input=%v output=%v", entity.InputTruncated, entity.OutputTruncated)
+	}
+	if len([]rune(entity.Input)) != historyOutputLimit+3 || len([]rune(entity.Output)) != historyOutputLimit+3 {
+		t.Fatal("database preview truncation did not retain its existing limit")
+	}
+}
+
+func TestCallRecordToEntityFallsBackForMissingLengths(t *testing.T) {
+	record := &CallRecord{Input: "request", Output: "response"}
+	entity := callRecordToEntity(record)
+	if entity.InputLen != len(record.Input) || entity.OutputLen != len(record.Output) {
+		t.Fatalf("missing lengths did not fall back to content bytes: input=%d output=%d",
+			entity.InputLen, entity.OutputLen)
+	}
+}
+
+func TestRecorderDBPersistsTruncatedUsageOriginalLengths(t *testing.T) {
+	recorder := setupRecorderDB(t)
+	ctx := context.Background()
+	t.Cleanup(func() { _ = recorder.Shutdown(context.Background()) })
+	input := strings.Repeat("i", 1<<20)
+	output := strings.Repeat("o", 8<<20)
+	record := &CallRecord{
+		OrgID: testOrgID, ModelID: 91, Provider: "test-provider", ModelName: "test-model",
+		Input: input, Output: output, InputLen: 1 << 20, OutputLen: 8 << 20,
+		InputTruncated: true, OutputTruncated: true, InputTokens: 123, OutputTokens: 45,
+		TotalTokens: 168, StatusCode: 200, Success: true, Status: "success",
+		CallerType: CallerTypeWorker, ReqID: "run-usage-1", TraceID: "trace-usage-1",
+		StartedAt: time.Now().Add(-time.Second), FinishedAt: time.Now(),
+	}
+	publication, size, err := boundedUsageRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size > usageMessageMaxBytes {
+		t.Fatalf("NATS usage copy exceeds budget: %d", size)
+	}
+	payload, err := json.Marshal(publication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var consumed CallRecord
+	if err := json.Unmarshal(payload, &consumed); err != nil {
+		t.Fatal(err)
+	}
+	entity := callRecordToEntity(&consumed)
+	if err := recorder.db.Create(entity).Error; err != nil {
+		t.Fatal(err)
+	}
+	records, total, err := recorder.ListCalls(ctx, testOrgID, 0, 10, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(records) != 1 {
+		t.Fatalf("expected one persisted record, total=%d records=%d", total, len(records))
+	}
+	got := records[0]
+	if got.InputLen != record.InputLen || got.OutputLen != record.OutputLen ||
+		!got.InputTruncated || !got.OutputTruncated {
+		t.Fatalf("persisted lengths/flags changed: in=%d out=%d in_truncated=%v out_truncated=%v",
+			got.InputLen, got.OutputLen, got.InputTruncated, got.OutputTruncated)
+	}
+	if got.InputTokens != record.InputTokens || got.OutputTokens != record.OutputTokens ||
+		got.StatusCode != record.StatusCode || got.Success != record.Success ||
+		got.ReqID != record.ReqID || got.TraceID != record.TraceID {
+		t.Fatal("persisted usage metadata changed")
+	}
+	if len([]rune(got.Input)) != historyOutputLimit+3 || len([]rune(got.Output)) != historyOutputLimit+3 {
+		t.Fatal("persisted previews do not match the existing content limit")
 	}
 }

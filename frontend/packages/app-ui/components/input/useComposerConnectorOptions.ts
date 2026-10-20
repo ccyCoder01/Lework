@@ -55,7 +55,6 @@ export async function loadComposerConnectorOptions({
 	const orgPlugins = orgResult.status === "fulfilled" ? orgResult.value : ([] as PluginListItem[]);
 	const projectPlugins =
 		projectResult.status === "fulfilled" ? projectResult.value : ([] as PluginListItem[]);
-
 	const projectBoundIds = new Set<string>();
 	for (const plugin of projectPlugins) {
 		projectBoundIds.add(plugin.public_id);

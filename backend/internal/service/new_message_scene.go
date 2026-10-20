@@ -118,23 +118,14 @@ func validateBidComparisonAttachments(attachments []types.MessageAttachment) err
 }
 
 func validateSalaryAccountingAttachments(attachments []types.MessageAttachment) error {
-	counts := map[string]int{}
+	attendanceCount := 0
 	for _, attachment := range attachments {
-		switch attachment.AttachmentRole {
-		case string(types.AttachmentRoleRoster),
-			string(types.AttachmentRoleHistoricalPayroll),
-			string(types.AttachmentRoleAttendance):
-			counts[attachment.AttachmentRole]++
+		if attachment.AttachmentRole == string(types.AttachmentRoleAttendance) {
+			attendanceCount++
 		}
 	}
-	if counts[string(types.AttachmentRoleRoster)] < 1 {
-		return fmt.Errorf("%w: salary_accounting requires at least 1 roster attachment, got %d", ErrInvalidNewMessage, counts[string(types.AttachmentRoleRoster)])
-	}
-	if counts[string(types.AttachmentRoleHistoricalPayroll)] < 1 {
-		return fmt.Errorf("%w: salary_accounting requires at least 1 historical_payroll attachment, got %d", ErrInvalidNewMessage, counts[string(types.AttachmentRoleHistoricalPayroll)])
-	}
-	if counts[string(types.AttachmentRoleAttendance)] < 1 {
-		return fmt.Errorf("%w: salary_accounting requires at least 1 attendance attachment, got %d", ErrInvalidNewMessage, counts[string(types.AttachmentRoleAttendance)])
+	if attendanceCount < 1 {
+		return fmt.Errorf("%w: salary_accounting requires at least 1 attendance attachment, got %d", ErrInvalidNewMessage, attendanceCount)
 	}
 	return nil
 }

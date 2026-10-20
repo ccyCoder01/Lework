@@ -73,21 +73,23 @@ export function Shell({
 			<FrontendEventTracker currentPath={navigation?.currentPath} />
 			<div className="leros-app-shell">
 				<LeftRail logoSrc={logoSrc} navigation={navigation} />
-				{children ?? (
-					<>
-						{currentView === "chat" && <NewTaskPage />}
-						{currentView === "workbench" && <WorkbenchPage />}
-						{currentView === "tasks" && <EmptyPage />}
-						{currentView === "project" && <ProjectPage />}
-						{currentView === "taskDetail" && activeTaskDetailSessionId && (
-							<TaskDetailPage sessionId={activeTaskDetailSessionId} />
-						)}
-						{currentView === "orgProfile" && <OrgAdminPage section="profile" />}
-						{currentView === "orgDepartments" && <OrgAdminPage section="departments" />}
-						{currentView === "orgAssistants" && <OrgAdminPage section="assistants" />}
-						{currentView === "orgModels" && <OrgAdminPage section="models" />}
-					</>
-				)}
+				<div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+					{children ?? (
+						<>
+							{currentView === "chat" && <NewTaskPage />}
+							{currentView === "workbench" && <WorkbenchPage />}
+							{currentView === "tasks" && <EmptyPage />}
+							{currentView === "project" && <ProjectPage />}
+							{currentView === "taskDetail" && activeTaskDetailSessionId && (
+								<TaskDetailPage sessionId={activeTaskDetailSessionId} />
+							)}
+							{currentView === "orgProfile" && <OrgAdminPage section="profile" />}
+							{currentView === "orgDepartments" && <OrgAdminPage section="departments" />}
+							{currentView === "orgAssistants" && <OrgAdminPage section="assistants" />}
+							{currentView === "orgModels" && <OrgAdminPage section="models" />}
+						</>
+					)}
+				</div>
 			</div>
 			<FilePreviewHost />
 		</AuthProvider>

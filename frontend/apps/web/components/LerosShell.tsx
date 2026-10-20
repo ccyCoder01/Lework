@@ -43,6 +43,9 @@ export function useWebNavigation(): AppNavigation {
 			}
 			router.push(routePath);
 		},
+		goToPath(path) {
+			router.push(path);
+		},
 		goToProject(projectId) {
 			router.push(`/projects/${projectId}`);
 		},

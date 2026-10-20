@@ -334,7 +334,108 @@ function ActionBarCodeHarness({ onValueChange }: { onValueChange?: (value: strin
 	);
 }
 
+function ConnectorActionBarHarness({
+	connectorOptions,
+	selectedConnectorIds,
+	onConnectorPickerOpen,
+}: {
+	connectorOptions: Array<{
+		code: string;
+		label: string;
+		description: string;
+		keywords: string[];
+		pluginId: string;
+		projectAssociated?: boolean;
+	}>;
+	selectedConnectorIds?: string[];
+	onConnectorPickerOpen?: () => void;
+}) {
+	const composerRef = useRef<StructuredComposerHandle | null>(null);
+	return (
+		<ComposerActionBar
+			inputValue=""
+			composerRef={composerRef}
+			connectorOptions={connectorOptions}
+			selectedConnectorIds={selectedConnectorIds}
+			onConnectorPickerOpen={onConnectorPickerOpen}
+		/>
+	);
+}
+
 describe("StructuredComposer", () => {
+	it("将项目已绑定连接器显示在已选列表并刷新绑定状态后不重复列为可选", async () => {
+		const user = userEvent.setup();
+		const onConnectorPickerOpen = vi.fn();
+		render(
+			<ConnectorActionBarHarness
+				connectorOptions={[
+					{
+						code: "payroll-user",
+						label: "Payroll",
+						description: "",
+						keywords: [],
+						pluginId: "plugin-payroll",
+						projectAssociated: true,
+					},
+				]}
+				onConnectorPickerOpen={onConnectorPickerOpen}
+			/>,
+		);
+
+		await user.click(screen.getByRole("button", { name: /添加连接器/ }));
+
+		expect(onConnectorPickerOpen).toHaveBeenCalledTimes(1);
+		expect(screen.getByText("已选连接器")).toBeInTheDocument();
+		expect(screen.getAllByText("Payroll")).toHaveLength(1);
+	});
+
+	it("未绑定项目的连接器仍显示为可选", async () => {
+		const user = userEvent.setup();
+		render(
+			<ConnectorActionBarHarness
+				connectorOptions={[
+					{
+						code: "payroll-user",
+						label: "Payroll",
+						description: "",
+						keywords: [],
+						pluginId: "plugin-payroll",
+						projectAssociated: false,
+					},
+				]}
+			/>,
+		);
+
+		await user.click(screen.getByRole("button", { name: /添加连接器/ }));
+
+		expect(screen.queryByText("已选连接器")).not.toBeInTheDocument();
+		expect(screen.getByText("可选连接器")).toBeInTheDocument();
+		expect(screen.getByText("Payroll")).toBeInTheDocument();
+	});
+
+	it("普通会话手动选择的连接器仍进入已选列表", async () => {
+		const user = userEvent.setup();
+		render(
+			<ConnectorActionBarHarness
+				connectorOptions={[
+					{
+						code: "payroll-user",
+						label: "Payroll",
+						description: "",
+						keywords: [],
+						pluginId: "plugin-payroll",
+					},
+				]}
+				selectedConnectorIds={["plugin-payroll"]}
+			/>,
+		);
+
+		await user.click(screen.getByRole("button", { name: /添加连接器/ }));
+
+		expect(screen.getByText("已选连接器")).toBeInTheDocument();
+		expect(screen.getAllByText("Payroll")).toHaveLength(1);
+	});
+
 	it("中文输入法组合中按 Enter 不会触发发送", () => {
 		const handleSubmit = vi.fn();
 

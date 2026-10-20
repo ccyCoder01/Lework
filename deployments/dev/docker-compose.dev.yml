@@ -22,12 +22,15 @@ services:
   nats:
     image: registry.yygu.cn/library/nats:2.12.7
     container_name: leros-dev-nats
-    command: ["--jetstream"]
+    command: ["--config", "/etc/nats/nats-server.conf", "--jetstream"]
     ports:
       - "14223:4222"
       - "8223:8222"
     volumes:
       - dev_nats_data:/data
+    configs:
+      - source: nats_settings
+        target: /etc/nats/nats-server.conf
     healthcheck:
       test: ["CMD", "/nats-server", "--help"]
       interval: 30s
@@ -40,6 +43,11 @@ services:
 volumes:
   dev_postgres_data:
   dev_nats_data:
+
+configs:
+  nats_settings:
+    content: |
+      max_payload: 8388608
 
 networks:
   leros-dev-network:
