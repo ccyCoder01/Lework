@@ -4,7 +4,34 @@
 
 ## 阶段准入与停顿
 
-正常业务顺序为 `ATTENDANCE_REVIEW → IDENTITY_MATCHING → SALARY_READINESS → PAYROLL_EXECUTION → ATTENDANCE_SUBMISSION → PAYROLL_PRECHECK → PAYROLL_CALCULATION → PAYROLL_EXPORT`。首次考勤任务只交付 Markdown 核对表和简短中文摘要，然后停止；不得在聊天中输出完整人员表。跨轮次考勤确认仍绑定当前任务可见用户消息序号，以及确认后 Review 的月份、版本、`attendance.json` SHA-256 和人员范围；更正或 Review 版本/摘要改变后必须重新确认。人员匹配与只读工资覆盖检查继续按原指令意图推进。覆盖检查不是正式 Precheck 或写入授权。覆盖检查后使用统一展示格式：标题“工资核算范围”，列明工资月份、“共 N 人”，用“纳入：”列出完整名单，用“排除事项：”列出每名未纳入人员及原因，并说明正式提交考勤、正式预检查和通过后工资核算的顺序；随后等待一次明确的工资核算执行授权。范围展示和执行授权不得由 Agent 自行伪造。
+正常业务顺序为 `ATTENDANCE_REVIEW + PROJECT_BINDING → IDENTITY_MATCHING → SALARY_READINESS → PAYROLL_EXECUTION → ATTENDANCE_SUBMISSION → PAYROLL_PRECHECK → PAYROLL_CALCULATION → PAYROLL_EXPORT`。首次考勤任务只交付 Markdown 核对表和简短中文摘要，然后停止；不得在聊天中输出完整人员表。首次确认考勤时一并确认所有来源项目到 Payroll 项目的关系，不另增用户确认轮次。展示项目映射时使用月份和全部标准映射行，并把展示消息及映射摘要与当时考勤 SHA、花名册响应 SHA 一并纳入绑定请求；用户可简短确认“确认以上考勤及项目对应关系”或“确认上述项目映射”，不必重述项目名。展示缺项、映射被改、展示晚于确认、考勤或花名册变化、否定/疑问/范围变更语句都会阻断。跨轮次考勤确认仍绑定当前任务可见用户消息序号，以及确认后 Review 的月份、版本、`attendance.json` SHA-256 和人员范围；更正或 Review 版本/摘要改变后必须重新确认。人员匹配与只读工资覆盖检查继续按原指令意图推进。覆盖检查不是正式 Precheck 或写入授权。覆盖检查后使用统一格式展示唯一范围和排除原因，并说明正式提交、正式预检查和工资核算顺序；随后等待一次明确工资核算执行授权。
+
+### Task 级项目绑定
+
+静态 `project-aliases.json` 不再是运行时来源。每个 Task 都必须重新读取 Payroll `list_roster`，把未经改写的直接 DTO 或 MCP `CallToolResult` JSON 包装保存为 `.attendance-work/payroll-roster.json`；若为包装，单一文本 JSON 与 `structuredContent` 必须一致，脚本会验证后仅解包该 DTO，原文件摘要绑定完整原始响应。然后运行：
+
+```sh
+python3 scripts/project_binding.py prepare \
+  --attendance <workdir>/attendance.json \
+  --roster <workdir>/.attendance-work/payroll-roster.json \
+  --output <workdir>/.attendance-work/project-binding.json
+```
+
+将脚本给出的所有来源项目和精确的 Payroll 项目候选一并展示给用户。在首次考勤确认消息中，要求用户明确确认每一组“来源项目 → Payroll 项目”关系；不能从相似名称、文件名、旧 Task、`roster_id` 或候选排序猜测。根据确认原文构造包含 `month`、`attendance_sha256`、`candidate_response_sha256`、完整 `bindings` 和 `user_confirmation`（消息序号及原文）的请求，再运行：
+
+```sh
+python3 scripts/project_binding.py confirm \
+  --attendance <workdir>/attendance.json \
+  --roster <workdir>/.attendance-work/payroll-roster.json \
+  --request <workdir>/.attendance-work/project-binding-request.json \
+  --output <workdir>/.attendance-work/project-binding.json
+```
+
+脚本要求每个来源项目恰有一个当前花名册候选项目映射，并绑定当前月份、考勤 SHA、花名册响应 SHA 和确认消息摘要。一个 Task 可包含多个项目但只能有一个工资月份；之后所有人员按来源项目使用此映射。全部项目合并为一个核算范围、一个固定 Batch、一次提交、一次正式 Precheck 和一次核算；同一 Payroll Person ID 重复出现时提交前阻断。源字段 `source_project_snapshot` 保留原考勤项目名，`project_snapshot` 采用用户确认的 Payroll 项目名。项目绑定变化、考勤 SHA 变化或花名册响应变化时，身份映射和后续覆盖/范围证据必须重新生成。项目确认不代表身份匹配，不代表范围认可，也不代表 Payroll 写入授权。
+
+提交前 `workflow_gate.py` 会确定性地重新验证 Task 项目绑定、当前考勤、人员映射摘要和实际提交请求中的逐人员来源/目标项目字段；单次授权与兼容的旧提交路径都经过该校验。请求必须使用当前绑定项目，不能先提交后靠导出器发现错名。Excel 导出也再次验证项目绑定和快照字段一致性。
+
+项目候选及对话消息清单由 Agent 根据工具响应和可见对话构造；Skill 脚本核对消息索引顺序、角色、原文摘要、完整映射及当前业务摘要，但不能认证 MCP 响应或 Runtime 用户消息的真实性，也不能阻止 Agent 直接绕过 Skill 调用 MCP。该本地检查不是 Runtime 级认证。缺少证据或对应不完整时失败关闭。
 
 一次性授权前必须提供实际 `.attendance-work/payroll-readiness.json` 路径。门禁限定报告为当前 `.attendance-work` 下的固定普通文件，并调用 `payroll_readiness.report_status()` 重新核对报告与当前 `attendance.json`、`person-matches.json`、月份及匹配人员范围；再将报告的逐人结果、状态计数、规范化响应摘要、请求人员集合和默认 `COVERED` 范围与门禁输入及展示范围逐项比较。报告缺失、损坏、不可用、过期、符号链接、范围/摘要冲突都失败关闭。正式提交前必须再次调用只读覆盖 MCP 并完成批次冲突和范围复核；不能只凭旧报告或旧授权提交。相同范围及相同覆盖响应内容可继续使用当前授权；若规范化覆盖响应或人员范围改变，必须重新展示并取得新的执行授权，不增加额外授权阶段。
 

@@ -13,6 +13,7 @@ from openpyxl import load_workbook
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import build_payroll_workbook as exporter  # noqa: E402
+import project_binding  # noqa: E402
 
 
 COMPONENTS = exporter.COMPONENTS
@@ -98,6 +99,51 @@ def _write_inputs(tmp_path: Path, data: dict) -> tuple[Path, Path, Path]:
     attendance_path.write_text(json.dumps({"schema_version": 1, "month": month, "people": data["_source_people"],
                                            "source_warnings": []}, ensure_ascii=False), encoding="utf-8")
     digest = hashlib.sha256(attendance_path.read_bytes()).hexdigest()
+    roster_path, binding_path = project_binding.default_paths(attendance_path)
+    roster_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_by_record = {row["record_id"]: row for row in data["attendance_snapshot"]["records"]}
+    source_to_target = {
+        person["project"]: snapshot_by_record.get(person["record_id"], {}).get("project_snapshot", person["project"])
+        for person in data["_source_people"]
+    }
+    target_projects = sorted(set(source_to_target.values()))
+    roster_path.write_text(json.dumps({"count": len(target_projects), "items": [
+        {"roster_id": 100 + i, "name": f"合成人员{i + 1:02d}", "project_name": project,
+         "company_name": "合成公司", "employee_type": 1, "position": "合成岗位"}
+        for i, project in enumerate(target_projects)
+    ]}, ensure_ascii=False), encoding="utf-8")
+    prepared_binding = project_binding.prepare(attendance_path, roster_path)
+    binding_request = tmp_path / "project-binding-request.json"
+    bindings = [{"source_project_name": source, "payroll_project_name": target}
+                for source, target in sorted(source_to_target.items())]
+    display = (f"考勤月份：{month}\n考勤人数：{len(data['_source_people'])} 人\n项目对应关系：\n" + "\n".join(
+        f"来源项目：{row['source_project_name']} → Payroll 项目：{row['payroll_project_name']}"
+        for row in bindings
+    ) + "\n请确认考勤事实及以上项目对应关系。")
+    confirmation = "确认项目 " + "；".join(
+        f"{row['source_project_name']} 对应 {row['payroll_project_name']}" for row in bindings
+    )
+    digest_json = lambda value: hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    binding_request.write_text(json.dumps({
+        "month": month, "attendance_sha256": digest,
+        "candidate_response_sha256": prepared_binding["candidate_response_sha256"], "bindings": bindings,
+        "display_evidence": {
+            "message_index": 0, "message": display,
+            "message_sha256": hashlib.sha256(display.encode("utf-8")).hexdigest(),
+            "month": month, "attendance_sha256": digest,
+            "candidate_response_sha256": prepared_binding["candidate_response_sha256"],
+            "bindings": bindings, "mapping_sha256": digest_json(bindings),
+        },
+        "user_confirmation": {"message_index": 1, "message": confirmation,
+                              "message_sha256": hashlib.sha256(confirmation.encode("utf-8")).hexdigest()},
+        "conversation_messages": [
+            {"index": 0, "role": "assistant", "content": display},
+            {"index": 1, "role": "user", "content": confirmation},
+        ],
+    }, ensure_ascii=False), encoding="utf-8")
+    project_binding.confirm(attendance_path, roster_path, binding_request, binding_path)
     calc_items = persisted_data["calculation_result"]["items"]
     person_ids = sorted(item["payroll_person_id"] for item in calc_items)
     record_ids = [f"record-{pid:02d}" for pid in person_ids]
@@ -147,9 +193,10 @@ def _write_inputs(tmp_path: Path, data: dict) -> tuple[Path, Path, Path]:
     calculation_response_path = tmp_path / "calculation-response.json"
     calculation_response_path.write_text(json.dumps(persisted_data["calculation_result"], ensure_ascii=False), encoding="utf-8")
     matches_path = tmp_path / "person-matches.json"
-    matches_path.write_text(json.dumps({"schema_version": 1, "matching_rules_version": "W03.3",
+    matches_path.write_text(json.dumps({"schema_version": 1,
+                                        "matching_rules_version": exporter.person_matches.MATCHING_RULES_VERSION,
                                         "attendance_sha256": digest,
-                                        "project_aliases_sha256": exporter.person_matches._project_aliases()[1],
+                                        "project_binding_sha256": json.loads(binding_path.read_text(encoding="utf-8"))["binding_sha256"],
                                         "matches": data["_source_matches"]},
                                        ensure_ascii=False), encoding="utf-8")
     selected = set(person_ids)
@@ -502,6 +549,34 @@ def test_42_attendance_people_31_calculated_preserves_out_of_scope_unknown_sourc
     review_rows = list(wb["人工复核事项"].iter_rows(min_row=4, values_only=True))
     assert any(row[0] == "程瑶" and row[2] == "核算范围外考勤状态待核实" and "16日" in row[3] for row in review_rows)
     assert any(row[0] == "程瑶" and row[2] == "未纳入核算" for row in review_rows)
+    wb.close()
+
+
+def test_hanyue_42_to_31_uses_confirmed_payroll_project_and_preserves_source_project(tmp_path: Path):
+    data = _out_of_scope_unknown_fixture()
+    source_project, payroll_project = "瀚阅府西苑项目", "瀚阅府"
+    for person in data["_source_people"]:
+        person["project"] = source_project
+    for record in data["attendance_snapshot"]["records"]:
+        record["source_project_snapshot"] = source_project
+        record["project_snapshot"] = payroll_project
+    for item in data["calculation_result"]["items"]:
+        item["project_name"] = payroll_project
+
+    input_path, gate_path, _ = _write_inputs(tmp_path, data)
+    result = _call_export(input_path, gate_path, tmp_path / "hanyue-confirmed-project.xlsx")
+
+    assert result["calculated_people"] == 31
+    assert result["attendance_people_rows"] == 42
+    submission = _read_json(tmp_path / "submission-request.json")
+    assert len(submission["records"]) == 31
+    assert {row["source_project_snapshot"] for row in submission["records"]} == {source_project}
+    assert {row["project_snapshot"] for row in submission["records"]} == {payroll_project}
+    wb = load_workbook(result["path"], data_only=True)
+    assert wb["工资核算明细"].max_row == 34
+    assert wb["考勤汇总"].max_row == 45
+    assert wb["工资核算明细"].cell(4, 2).value == payroll_project
+    assert wb["考勤汇总"].cell(4, 3).value == payroll_project
     wb.close()
 
 

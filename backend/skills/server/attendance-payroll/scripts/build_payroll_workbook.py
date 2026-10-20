@@ -24,6 +24,7 @@ from openpyxl.utils import get_column_letter
 import workflow_gate
 import person_matches
 import attendance_store
+import project_binding
 
 
 COMPONENTS = (
@@ -287,7 +288,7 @@ UNMAPPED_SOURCE_STATUS_LABELS = {
 }
 
 
-def _attendance_record_projection(person: dict, match: dict, month: str, aliases: dict[str, str],
+def _attendance_record_projection(person: dict, match: dict, month: str, project_map: dict[str, str],
                                   allow_unmapped_statuses: bool = False) -> dict:
     """Project only facts with a documented one-to-one Payroll DTO representation."""
     name = person.get("name")
@@ -296,7 +297,9 @@ def _attendance_record_projection(person: dict, match: dict, month: str, aliases
     raw_project = person.get("project")
     if not isinstance(raw_project, str):
         raise ExportError("ATTENDANCE_SOURCE_PROJECT_INVALID")
-    project = person_matches._canonical_project(raw_project, aliases)
+    project = project_map.get(raw_project.strip())
+    if not project:
+        raise ExportError("PROJECT_BINDING_SOURCE_PROJECT_UNBOUND")
     pid = match.get("payroll_person_id") if match.get("status") == "matched" else None
     if pid is not None:
         pid = _person_id(pid, "MATCH_PAYROLL_PERSON_ID")
@@ -476,10 +479,16 @@ def _validate_source_bindings(data: dict, gate_path: Path, calculation_path: Pat
     review = _obj(evidence.get("attendance_review"), "ATTENDANCE_REVIEW")
     if review.get("attendance_sha256") != attendance_sha or review.get("month") != month:
         raise ExportError("ATTENDANCE_REVIEW_SOURCE_MISMATCH")
-    aliases, aliases_sha = person_matches._project_aliases()
+    roster_path, binding_path = project_binding.default_paths(attendance_path)
+    try:
+        project_binding_result = project_binding.validate(attendance_path, roster_path, binding_path)
+    except project_binding.ProjectBindingError as exc:
+        raise ExportError(str(exc)) from exc
+    project_map = project_binding_result["project_map"]
+    binding_sha = project_binding_result["binding"]["binding_sha256"]
     if (matches.get("schema_version") != 1 or matches.get("matching_rules_version") != person_matches.MATCHING_RULES_VERSION
             or matches.get("attendance_sha256") != attendance_sha
-            or matches.get("project_aliases_sha256") != aliases_sha or not isinstance(matches.get("matches"), list)):
+            or matches.get("project_binding_sha256") != binding_sha or not isinstance(matches.get("matches"), list)):
         raise ExportError("PERSON_MATCHES_SOURCE_MISMATCH")
     matches_by_id = {}
     used_ids = set()
@@ -523,7 +532,7 @@ def _validate_source_bindings(data: dict, gate_path: Path, calculation_path: Pat
         source_pid = match.get("payroll_person_id") if match.get("status") == "matched" else None
         calculated = source_pid in calc_ids
         projected = _attendance_record_projection(
-            person, match, month, aliases, allow_unmapped_statuses=not calculated,
+            person, match, month, project_map, allow_unmapped_statuses=not calculated,
         )
         actual = snapshot_by_record[record_id]
         if actual.get("payroll_person_id") != projected["payroll_person_id"]:

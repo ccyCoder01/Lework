@@ -11,11 +11,77 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import workflow_gate  # noqa: E402
 import payroll_readiness  # noqa: E402
+import project_binding  # noqa: E402
+
+
+def _binding_request(prepared: dict, bindings: list[dict], confirmation: str) -> dict:
+    bindings = sorted(bindings, key=lambda row: row["source_project_name"])
+    mapping_sha = hashlib.sha256(json.dumps(
+        bindings, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    display = (f"考勤月份：{prepared['month']}\n考勤人数：2 人\n项目对应关系：\n" + "\n".join(
+        f"来源项目：{row['source_project_name']} → Payroll 项目：{row['payroll_project_name']}"
+        for row in bindings
+    ) + "\n请确认考勤事实及以上项目对应关系。")
+    display_sha = hashlib.sha256(display.encode("utf-8")).hexdigest()
+    confirmation_sha = hashlib.sha256(confirmation.encode("utf-8")).hexdigest()
+    return {
+        "month": prepared["month"], "attendance_sha256": prepared["attendance_sha256"],
+        "candidate_response_sha256": prepared["candidate_response_sha256"], "bindings": bindings,
+        "display_evidence": {
+            "message_index": 0, "message": display, "message_sha256": display_sha,
+            "month": prepared["month"], "attendance_sha256": prepared["attendance_sha256"],
+            "candidate_response_sha256": prepared["candidate_response_sha256"],
+            "bindings": bindings, "mapping_sha256": mapping_sha,
+        },
+        "user_confirmation": {"message_index": 1, "message": confirmation,
+                              "message_sha256": confirmation_sha},
+        "conversation_messages": [
+            {"index": 0, "role": "assistant", "content": display},
+            {"index": 1, "role": "user", "content": confirmation},
+        ],
+    }
 
 
 TEST_ATTENDANCE_DIR = tempfile.TemporaryDirectory(prefix="workflow-gate-")
+BATCH = "task_A12-2026-06"
 TEST_ATTENDANCE_PATH = Path(TEST_ATTENDANCE_DIR.name) / "attendance.json"
-TEST_ATTENDANCE_PATH.write_bytes(b'{"synthetic":"attendance-v5"}\n')
+TEST_WORK_DIR = TEST_ATTENDANCE_PATH.parent / ".attendance-work"
+TEST_WORK_DIR.mkdir(exist_ok=True)
+TEST_ATTENDANCE_DATA = {"schema_version": 1, "month": "2026-06", "people": [
+    {"record_id": "rec-1", "name": "安娜", "project": "合成项目"},
+    {"record_id": "rec-2", "name": "李明", "project": "合成项目"},
+]}
+TEST_ATTENDANCE_PATH.write_text(json.dumps(TEST_ATTENDANCE_DATA, ensure_ascii=False), encoding="utf-8")
+TEST_ROSTER_PATH, TEST_BINDING_PATH = project_binding.default_paths(TEST_ATTENDANCE_PATH)
+TEST_ROSTER_PATH.write_text(json.dumps({"count": 1, "items": [{
+    "roster_id": 10, "name": "安娜", "project_name": "合成项目", "company_name": "合成公司",
+    "employee_type": 1, "position": "施工员",
+}]}, ensure_ascii=False), encoding="utf-8")
+TEST_BINDING_PREPARED = project_binding.prepare(TEST_ATTENDANCE_PATH, TEST_ROSTER_PATH)
+TEST_BINDING_REQUEST = TEST_WORK_DIR / "project-binding-request.json"
+TEST_BINDING_REQUEST.write_text(json.dumps(_binding_request(
+    TEST_BINDING_PREPARED, [{"source_project_name": "合成项目", "payroll_project_name": "合成项目"}],
+    "确认合成项目对应合成项目",
+), ensure_ascii=False), encoding="utf-8")
+TEST_BINDING = project_binding.confirm(
+    TEST_ATTENDANCE_PATH, TEST_ROSTER_PATH, TEST_BINDING_REQUEST, TEST_BINDING_PATH,
+)
+TEST_MATCHES_PATH = TEST_WORK_DIR / "person-matches.json"
+TEST_MATCHES = {"schema_version": 1, "attendance_sha256": TEST_BINDING["attendance_sha256"],
+                "project_binding_sha256": TEST_BINDING["binding_sha256"], "matches": [
+                    {"record_id": "rec-1", "status": "matched", "payroll_person_id": 1},
+                    {"record_id": "rec-2", "status": "matched", "payroll_person_id": 2},
+                ]}
+TEST_MATCHES_PATH.write_text(json.dumps(TEST_MATCHES), encoding="utf-8")
+TEST_SUBMISSION_PATH = TEST_WORK_DIR / "submission-request.json"
+TEST_SUBMISSION_PATH.write_text(json.dumps({
+    "attendance_month": "2026-06", "submission_mode": "BATCH_SNAPSHOT", "batch_id": BATCH,
+    "operation_id": f"submit:{BATCH}", "records": [
+        {"payroll_person_id": 1, "source_project_snapshot": "合成项目", "project_snapshot": "合成项目"},
+        {"payroll_person_id": 2, "source_project_snapshot": "合成项目", "project_snapshot": "合成项目"},
+    ],
+}, ensure_ascii=False), encoding="utf-8")
 TEST_ATTENDANCE_SHA256 = hashlib.sha256(TEST_ATTENDANCE_PATH.read_bytes()).hexdigest()
 
 SCOPE = {
@@ -26,7 +92,6 @@ PEOPLE = [
     {"record_id": "rec-1", "name": "安娜"},
     {"record_id": "rec-2", "name": "李明"},
 ]
-BATCH = "task_A12-2026-06"
 
 
 def _operation_state(submission: str, calculation: str, scope: dict = SCOPE, batch_id: str = BATCH,
@@ -53,6 +118,8 @@ def _operation_state(submission: str, calculation: str, scope: dict = SCOPE, bat
 def _evidence():
     return {
         "attendance_path": str(TEST_ATTENDANCE_PATH),
+        "person_matches_path": str(TEST_MATCHES_PATH),
+        "submission_request_path": str(TEST_SUBMISSION_PATH),
         "attendance_review": {
             "status": "DECLARED", **SCOPE, "people": PEOPLE,
             "visible_after_user_message_index": 0,
@@ -130,6 +197,28 @@ def test_attendance_confirmation_allows_only_explicitly_requested_readonly_follo
     assert generic["ok"] is False
     match_before_confirm = workflow_gate.evaluate(_request("IDENTITY_MATCHING", "请匹配人员", prior))
     assert match_before_confirm["ok"] is False
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("source_project_snapshot", "猜测的来源项目"),
+    ("project_snapshot", "未确认的 Payroll 项目"),
+])
+def test_submission_project_binding_mismatch_is_blocked_before_write(field: str, value: str):
+    original = TEST_SUBMISSION_PATH.read_bytes()
+    try:
+        submission = json.loads(original)
+        submission["records"][0][field] = value
+        TEST_SUBMISSION_PATH.write_text(json.dumps(submission, ensure_ascii=False), encoding="utf-8")
+
+        result = workflow_gate.evaluate(_request(
+            "ATTENDANCE_SUBMISSION", _auth_text("授权正式提交考勤"),
+            "本次处理范围为2026-06版本review-v5的安娜和李明。",
+        ))
+
+        assert result["ok"] is False
+        assert result["error"] == "PROJECT_BINDING_SUBMISSION_PROJECT_MISMATCH"
+    finally:
+        TEST_SUBMISSION_PATH.write_bytes(original)
 
 
 def test_cross_turn_identity_matching_uses_prior_confirmation_bound_to_current_review():
@@ -379,10 +468,23 @@ def _execution_request(total: int, covered: int, matched: int | None = None, aut
     report_path = work_dir / "payroll-readiness.json"
     attendance_data = {
         "schema_version": 1, "month": "2026-06",
-        "people": [{"record_id": f"rec-{i:03d}", "name": f"人员{i:02d}"} for i in range(total)],
+        "people": [{"record_id": f"rec-{i:03d}", "name": f"人员{i:02d}", "project": "合成项目"}
+                   for i in range(total)],
     }
     attendance_path.write_text(json.dumps(attendance_data, ensure_ascii=False), encoding="utf-8")
     attendance_sha = hashlib.sha256(attendance_path.read_bytes()).hexdigest()
+    roster_path, binding_path = project_binding.default_paths(attendance_path)
+    roster_path.write_text(json.dumps({"count": 1, "items": [{
+        "roster_id": 2000, "name": "人员00", "project_name": "合成项目", "company_name": "合成公司",
+        "employee_type": 1, "position": "施工员",
+    }]}, ensure_ascii=False), encoding="utf-8")
+    binding_prepared = project_binding.prepare(attendance_path, roster_path)
+    binding_request_path = work_dir / "project-binding-request.json"
+    binding_request_path.write_text(json.dumps(_binding_request(
+        binding_prepared, [{"source_project_name": "合成项目", "payroll_project_name": "合成项目"}],
+        "确认合成项目对应合成项目",
+    ), ensure_ascii=False), encoding="utf-8")
+    binding = project_binding.confirm(attendance_path, roster_path, binding_request_path, binding_path)
     attendance = {
         "month": "2026-06", "version": "review-exec-v1", "attendance_sha256": attendance_sha,
         "record_ids": [f"rec-{i:03d}" for i in range(total)],
@@ -395,6 +497,7 @@ def _execution_request(total: int, covered: int, matched: int | None = None, aut
     ]
     matches_data = {
         "schema_version": 1, "attendance_sha256": attendance_sha,
+        "project_binding_sha256": binding["binding_sha256"],
         "matches": [
             {"record_id": f"rec-{i:03d}", "status": "matched" if i < matched else "unmatched",
              "payroll_person_id": 1000 + i if i < matched else None,
@@ -436,6 +539,7 @@ def _execution_request(total: int, covered: int, matched: int | None = None, aut
     evidence = {
         "attendance_path": str(attendance_path),
         "person_matches_path": str(identity_path),
+        "submission_request_path": str(work_dir / "submission-request.json"),
         "readiness_report_path": str(report_path),
         "attendance_review": {
             "status": "DECLARED", **attendance,
@@ -473,6 +577,18 @@ def _execution_request(total: int, covered: int, matched: int | None = None, aut
             },
         },
     }
+    submission_records = []
+    for person in selected_people:
+        index = int(person["record_id"].split("-")[1])
+        submission_records.append({
+            "payroll_person_id": 1000 + index,
+            "source_project_snapshot": "合成项目",
+            "project_snapshot": "合成项目",
+        })
+    Path(evidence["submission_request_path"]).write_text(json.dumps({
+        "attendance_month": "2026-06", "submission_mode": "BATCH_SNAPSHOT", "batch_id": batch_id,
+        "operation_id": f"submit:{batch_id}", "records": submission_records,
+    }, ensure_ascii=False), encoding="utf-8")
     scope_sha = workflow_gate._scope_digest(
         {**attendance, "record_ids": record_ids}, identity_sha,
         [1000 + i for i in range(covered)], readiness_sha,

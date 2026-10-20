@@ -10,11 +10,12 @@ import os
 import tempfile
 from pathlib import Path
 
+import project_binding
+
 
 CORE_IDENTITY_FIELDS = ("project_name", "company_name", "employee_type")
 IDENTITY_FIELDS = (*CORE_IDENTITY_FIELDS, "position")
-MATCHING_RULES_VERSION = "W03.3"
-DEFAULT_ALIASES = Path(__file__).resolve().parents[1] / "references" / "project-aliases.json"
+MATCHING_RULES_VERSION = "W03.9"
 
 
 def _read(path: str) -> tuple[object, bytes]:
@@ -69,26 +70,6 @@ def _string_list(value: object, label: str) -> list[str]:
     return sorted(set(value))
 
 
-def _project_aliases(path: str | Path = DEFAULT_ALIASES) -> tuple[dict[str, str], str]:
-    data, raw = _read(str(path))
-    data = _obj(data, "项目别名配置")
-    if data.get("schema_version") != 1 or not isinstance(data.get("projects"), list):
-        raise ValueError("项目别名配置必须为 schema_version=1 且包含 projects 数组")
-    aliases: dict[str, str] = {}
-    for index, group in enumerate(data["projects"]):
-        group = _obj(group, f"projects[{index}]")
-        canonical = _str(group.get("canonical"), f"projects[{index}].canonical")
-        names = group.get("aliases")
-        if not canonical or not isinstance(names, list) or any(not isinstance(name, str) or not name.strip() for name in names):
-            raise ValueError(f"projects[{index}] 的 canonical/aliases 无效")
-        for name in [canonical, *names]:
-            normalized = name.strip()
-            if normalized in aliases and aliases[normalized] != canonical:
-                raise ValueError(f"项目别名重复指向不同规范项目: {normalized}")
-            aliases[normalized] = canonical
-    return aliases, _sha(raw)
-
-
 def _canonical_project(value: object, aliases: dict[str, str]) -> object:
     if not isinstance(value, str):
         return value
@@ -96,8 +77,7 @@ def _canonical_project(value: object, aliases: dict[str, str]) -> object:
     return aliases.get(normalized, normalized) if normalized else None
 
 
-def _people(data: object, aliases: dict[str, str] | None = None) -> list[dict]:
-    aliases = aliases or {}
+def _people(data: object, project_map: dict[str, str]) -> list[dict]:
     data = _obj(data, "attendance.json")
     if data.get("schema_version") != 1 or not isinstance(data.get("people"), list):
         raise ValueError("attendance.json 必须为 schema_version=1 且包含 people 数组")
@@ -118,13 +98,15 @@ def _people(data: object, aliases: dict[str, str] | None = None) -> list[dict]:
             isinstance(employee_type, bool) or not isinstance(employee_type, int) or not 1 <= employee_type <= 5
         ):
             raise ValueError(f"people[{i}].employee_type 必须为 1–5")
-        raw_project = project.strip() or None
+        raw_project = project if project.strip() else None
+        if raw_project is None or raw_project not in project_map:
+            raise ValueError("考勤来源项目未绑定；请先确认当前任务的全部 Payroll 项目")
         result.append({
             "record_id": record_id,
             "facts": {
                 "name": name,
                 "source_project_name": raw_project,
-                "project_name": _canonical_project(raw_project, aliases),
+                "project_name": project_map[raw_project],
                 "company_name": company,
                 "employee_type": employee_type,
                 "position": _str(person.get("position"), f"people[{i}].position", True),
@@ -152,10 +134,16 @@ def _query_sha(data: dict) -> str:
     return _sha(canonical)
 
 
-def candidate_request(attendance_path: str, aliases_path: str | Path = DEFAULT_ALIASES) -> dict:
+def _binding_inputs(attendance_path: str, roster_path: str | None, binding_path: str | None) -> tuple[str, str]:
+    default_roster, default_binding = project_binding.default_paths(attendance_path)
+    return str(roster_path or default_roster), str(binding_path or default_binding)
+
+
+def candidate_request(attendance_path: str, roster_path: str | None = None, binding_path: str | None = None) -> dict:
     attendance, _ = _read(attendance_path)
-    aliases, _ = _project_aliases(aliases_path)
-    return _candidate_request(_people(attendance, aliases))
+    roster_path, binding_path = _binding_inputs(attendance_path, roster_path, binding_path)
+    binding = project_binding.validate(attendance_path, roster_path, binding_path)
+    return _candidate_request(_people(attendance, binding["project_map"]))
 
 
 def _verify_query(query_path: str | None, people: list[dict]) -> str:
@@ -308,7 +296,9 @@ def _project_alias_explains_conflict(candidate: dict, facts: dict, aliases: dict
     raw_values.extend(evidence.get("project_name") for evidence in candidate["roster_evidence"])
     raw_values = [value.strip() for value in raw_values if isinstance(value, str) and value.strip()]
     normalized = {_canonical_project(value, aliases) for value in raw_values}
-    return bool(expected and raw_values and normalized == {expected} and any(value != expected for value in raw_values))
+    source_project = facts.get("source_project_name")
+    return bool(expected and source_project and source_project != expected and raw_values
+                and normalized == {expected})
 
 
 def _candidate_conflicts(candidate: dict, facts: dict, aliases: dict[str, str] | None = None) -> list[str]:
@@ -510,23 +500,26 @@ def build(
     candidates_path: str,
     existing_path: str | None = None,
     query_path: str | None = None,
-    aliases_path: str | Path = DEFAULT_ALIASES,
+    binding_path: str | None = None,
 ) -> dict:
     attendance, attendance_raw = _read(attendance_path)
     roster_data, roster_raw = _read(roster_path)
     candidate_data, candidate_raw = _read(candidates_path)
-    aliases, aliases_sha = _project_aliases(aliases_path)
-    people = _people(attendance, aliases)
+    _, binding_path = _binding_inputs(attendance_path, roster_path, binding_path)
+    binding = project_binding.validate(attendance_path, roster_path, binding_path)
+    project_map = binding["project_map"]
+    binding_sha = binding["binding"]["binding_sha256"]
+    people = _people(attendance, project_map)
     query_sha = _verify_query(query_path, people)
     ids = {person["record_id"] for person in people}
-    rosters = _rosters(roster_data)
+    rosters = _rosters(project_binding.roster_data(roster_data))
     candidate_map = _candidate_map(candidate_data, ids)
     people_by_record = {person["record_id"]: person for person in people}
     matches = []
     for person in people:
         candidates = candidate_map[person["record_id"]]
-        status, person_id, reasons = _classify(person["facts"], candidates, rosters, aliases)
-        roster_matches = _active_roster_matches(person["facts"], rosters, aliases)
+        status, person_id, reasons = _classify(person["facts"], candidates, rosters, project_map)
+        roster_matches = _active_roster_matches(person["facts"], rosters, project_map)
         row = {
             "record_id": person["record_id"],
             "status": status,
@@ -554,13 +547,13 @@ def build(
         "roster_sha256": _sha(roster_raw),
         "candidate_response_sha256": _sha(candidate_raw),
         "query_sha256": query_sha,
-        "project_aliases_sha256": aliases_sha,
+        "project_binding_sha256": binding_sha,
         "matches": matches,
     }
     if existing_path and Path(existing_path).is_file():
         previous, _ = _read(existing_path)
         if (isinstance(previous, dict) and previous.get("attendance_sha256") == result["attendance_sha256"]
-                and previous.get("project_aliases_sha256") == aliases_sha):
+                and previous.get("project_binding_sha256") == binding_sha):
             prior_rows = {row.get("record_id"): row for row in previous.get("matches", []) if isinstance(row, dict)}
             for row in result["matches"]:
                 prior = prior_rows.get(row["record_id"])
@@ -575,7 +568,7 @@ def build(
                 ), None) if confirmed_id is not None else None
                 if confirmed_id is not None and prior_candidate == current_candidate and current_candidate is not None:
                     facts = people_by_record[row["record_id"]]["facts"]
-                    blockers = _candidate_safety(current_candidate, facts, rosters, aliases)
+                    blockers = _candidate_safety(current_candidate, facts, rosters, project_map)
                     if blockers:
                         continue
                     row["status"] = "matched"
@@ -596,11 +589,12 @@ def confirm(
     matches_path: str,
     request_path: str,
     query_path: str | None = None,
-    aliases_path: str | Path = DEFAULT_ALIASES,
+    binding_path: str | None = None,
 ) -> dict:
+    _, binding_path = _binding_inputs(attendance_path, roster_path, binding_path)
     protected_paths = {
         Path(attendance_path).resolve(), Path(roster_path).resolve(), Path(candidates_path).resolve(),
-        Path(request_path).resolve(), Path(aliases_path).resolve(),
+        Path(request_path).resolve(), Path(binding_path).resolve(),
     }
     if query_path:
         protected_paths.add(Path(query_path).resolve())
@@ -611,9 +605,11 @@ def confirm(
     candidate_data, candidate_raw = _read(candidates_path)
     matches_data, _ = _read(matches_path)
     request, _ = _read(request_path)
-    aliases, aliases_sha = _project_aliases(aliases_path)
+    binding = project_binding.validate(attendance_path, roster_path, binding_path)
+    project_map = binding["project_map"]
+    binding_sha = binding["binding"]["binding_sha256"]
     attendance, _ = _read(attendance_path)
-    people = _people(attendance, aliases)
+    people = _people(attendance, project_map)
     query_sha = _verify_query(query_path, people)
     matches_data = _obj(matches_data, "person-matches.json")
     if matches_data.get("schema_version") != 1 or matches_data.get("attendance_sha256") != _sha(attendance_raw):
@@ -621,9 +617,9 @@ def confirm(
     if (matches_data.get("roster_sha256") != _sha(roster_raw)
             or matches_data.get("candidate_response_sha256") != _sha(candidate_raw)
             or matches_data.get("query_sha256") != query_sha
-            or matches_data.get("project_aliases_sha256") != aliases_sha):
-        raise ValueError("Payroll 候选输入已变化；请重新构建最新映射后再确认")
-    fresh = build(attendance_path, roster_path, candidates_path, query_path=query_path, aliases_path=aliases_path)
+            or matches_data.get("project_binding_sha256") != binding_sha):
+        raise ValueError("Payroll 候选或项目绑定已变化；请重新构建最新映射后再确认")
+    fresh = build(attendance_path, roster_path, candidates_path, query_path=query_path, binding_path=binding_path)
     current_candidates = _candidate_map(candidate_data, {person["record_id"] for person in people})
     rows = matches_data.get("matches")
     confirmations = request.get("confirmations") if isinstance(request, dict) else None
@@ -649,6 +645,7 @@ def confirm(
                       current_candidates[record_id]) for record_id in by_record
     ):
         raise ValueError("person-matches 与当前考勤或 Payroll 候选摘要不一致；请重新构建")
+    roster_index = _rosters(project_binding.roster_data(roster_data))
     validated, seen = [], set()
     for i, raw in enumerate(confirmations):
         item = _obj(raw, f"confirmations[{i}]")
@@ -671,7 +668,7 @@ def confirm(
             raise ValueError(f"人员 {person_id} 不属于 {record_id} 的候选列表")
         selected = next(candidate for candidate in row_candidates if candidate["payroll_person_id"] == person_id)
         facts = people_by_record[record_id]["facts"]
-        blockers = _candidate_safety(selected, facts, _rosters(roster_data), aliases)
+        blockers = _candidate_safety(selected, facts, roster_index, project_map)
         if blockers:
             raise ValueError(f"人员 {person_id} 不能普通确认: " + "; ".join(blockers))
         validated.append((row, person_id, note, selected, facts))
@@ -692,14 +689,15 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     request_parser = sub.add_parser("candidate-request", help="生成当前考勤对应的确定性 Payroll 候选请求")
     request_parser.add_argument("--attendance", required=True)
-    request_parser.add_argument("--aliases", default=str(DEFAULT_ALIASES))
+    request_parser.add_argument("--roster", required=True)
+    request_parser.add_argument("--binding", required=True)
     request_parser.add_argument("--output", required=True)
     build_parser = sub.add_parser("build")
     build_parser.add_argument("--attendance", required=True)
     build_parser.add_argument("--roster", required=True)
     build_parser.add_argument("--candidates", required=True)
     build_parser.add_argument("--query", required=True, help="实际发送给 Payroll 候选接口的请求 JSON")
-    build_parser.add_argument("--aliases", default=str(DEFAULT_ALIASES))
+    build_parser.add_argument("--binding", required=True)
     build_parser.add_argument("--output", required=True)
     confirm_parser = sub.add_parser("confirm")
     confirm_parser.add_argument("--attendance", required=True)
@@ -708,23 +706,24 @@ def main() -> None:
     confirm_parser.add_argument("--matches", required=True)
     confirm_parser.add_argument("--request", required=True)
     confirm_parser.add_argument("--query", required=True, help="实际发送给 Payroll 候选接口的请求 JSON")
-    confirm_parser.add_argument("--aliases", default=str(DEFAULT_ALIASES))
+    confirm_parser.add_argument("--binding", required=True)
     args = parser.parse_args()
     status_counts = None
     if args.command == "candidate-request":
-        if Path(args.output).resolve() in {Path(args.attendance).resolve(), Path(args.aliases).resolve()}:
-            raise ValueError("候选请求输出路径不能覆盖考勤或项目别名配置")
-        result = candidate_request(args.attendance, args.aliases)
+        if Path(args.output).resolve() in {Path(args.attendance).resolve(), Path(args.roster).resolve(),
+                                           Path(args.binding).resolve()}:
+            raise ValueError("候选请求输出路径不能覆盖输入文件")
+        result = candidate_request(args.attendance, args.roster, args.binding)
         _write(args.output, result)
         output_path = args.output
         result_count = len(result["records"])
     elif args.command == "build":
         if Path(args.output).resolve() in {
             Path(args.attendance).resolve(), Path(args.roster).resolve(), Path(args.candidates).resolve(),
-            Path(args.query).resolve(), Path(args.aliases).resolve(),
+            Path(args.query).resolve(), Path(args.binding).resolve(),
         }:
             raise ValueError("person-matches 输出路径不能覆盖输入文件")
-        result = build(args.attendance, args.roster, args.candidates, query_path=args.query, aliases_path=args.aliases)
+        result = build(args.attendance, args.roster, args.candidates, query_path=args.query, binding_path=args.binding)
         output_path = args.output
         _write(output_path, result)
         result_count = len(result["matches"])
@@ -734,7 +733,7 @@ def main() -> None:
         }
     else:
         result = confirm(args.attendance, args.roster, args.candidates, args.matches, args.request,
-                         query_path=args.query, aliases_path=args.aliases)
+                         query_path=args.query, binding_path=args.binding)
         output_path = args.matches
         result_count = len(result["matches"])
     response = {"ok": True, "count": result_count, "path": output_path}

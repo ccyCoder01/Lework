@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import payroll_readiness
+import project_binding
 
 
 STAGES = (
@@ -424,6 +425,18 @@ def _execution_context(evidence: dict, conversation: list[dict]) -> dict:
             or identity_source.get("attendance_sha256") != review_scope["attendance_sha256"]
             or not isinstance(source_rows, list)):
         raise GateError("IDENTITY_MAPPING_CONTENT_INVALID")
+    attendance_path = evidence.get("attendance_path")
+    if not isinstance(attendance_path, str) or not attendance_path:
+        raise GateError("CURRENT_ATTENDANCE_PATH_REQUIRED")
+    roster_path, binding_path = project_binding.default_paths(attendance_path)
+    try:
+        binding = project_binding.validate(attendance_path, roster_path, binding_path)
+    except project_binding.ProjectBindingError as exc:
+        raise GateError(str(exc)) from exc
+    if (binding["binding"].get("month") != review_scope["month"]
+            or binding["binding"].get("attendance_sha256") != review_scope["attendance_sha256"]
+            or identity_source.get("project_binding_sha256") != binding["binding"].get("binding_sha256")):
+        raise GateError("PROJECT_BINDING_IDENTITY_SCOPE_MISMATCH")
     source_by_record = {}
     for source_row in source_rows:
         if not isinstance(source_row, dict):
@@ -569,6 +582,26 @@ def _execution_context(evidence: dict, conversation: list[dict]) -> dict:
         "raw_payroll_response_authenticity_verified": False,
         "batch_context": batch_context,
     }
+
+
+def _validate_project_submission(evidence: dict, scope: dict, batch_context: dict) -> None:
+    attendance_path = evidence.get("attendance_path")
+    matches_path = evidence.get("person_matches_path")
+    submission_path = evidence.get("submission_request_path")
+    if not all(isinstance(path, str) and path for path in (attendance_path, matches_path, submission_path)):
+        raise GateError("PROJECT_BINDING_SUBMISSION_EVIDENCE_REQUIRED")
+    batch_id = batch_context.get("batch_id")
+    if not isinstance(batch_id, str) or not batch_id:
+        raise GateError("PROJECT_BINDING_BATCH_ID_REQUIRED")
+    try:
+        verified = project_binding.validate_submission(
+            attendance_path, matches_path, submission_path, scope["record_ids"], scope["month"],
+            batch_id, f"submit:{batch_id}",
+        )
+    except project_binding.ProjectBindingError as exc:
+        raise GateError(str(exc)) from exc
+    if verified["binding"].get("attendance_sha256") != scope["attendance_sha256"]:
+        raise GateError("PROJECT_BINDING_SUBMISSION_ATTENDANCE_MISMATCH")
 
 
 def _execution_intent(text: str, scope_count: int) -> bool:
@@ -1006,6 +1039,7 @@ def _evaluate(request: dict) -> dict:
                 batch_context = _batch_scope(evidence.get("batch_context"), selected)
                 operations = _payroll_operation_state(evidence, selected, batch_context)
                 _require_no_prior_payroll_write(operations, selected)
+                _validate_project_submission(evidence, selected, batch_context)
             except GateError as exc:
                 result["error"] = str(exc)
                 return result
@@ -1050,6 +1084,7 @@ def _evaluate(request: dict) -> dict:
             batch_context = _batch_scope(evidence.get("batch_context"), selected)
             operations = _payroll_operation_state(evidence, selected, batch_context)
             _require_no_prior_payroll_write(operations, selected)
+            _validate_project_submission(evidence, selected, batch_context)
         except GateError as exc:
             result["error"] = str(exc)
             return result
