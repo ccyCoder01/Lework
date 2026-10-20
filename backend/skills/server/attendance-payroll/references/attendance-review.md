@@ -3,6 +3,8 @@
 ## 数据边界
 
 - `attendance.json` 是唯一可修改的工作数据；`.attendance-pages/**/page-*.json` 是只读识别快照，禁止修改。
+- 受控更正只更新当前工作数据，不覆盖 PDF 或页级快照。更正后重新核对并导出 Review；当前事实版本由工作文件 SHA-256 表示。本流程没有独立 Generation 计数器，不能把调用者自填的版本标签当作版本证明。
+- 更正后的新 Review 只能表示本地考勤事实已修订。若原 Task/月已有正式 Payroll 提交或核算回执，不能把本地更正表述为 Payroll 已更新；按工资处理流程的回执门禁停止正式写入。
 - 每条人员记录由 W01 生成的 `record_id` 唯一定位。姓名不作为主键；同名记录不得合并。
 - 原始每日标记保存在 `daily[].raw_mark`，原始解释状态保存在 `daily[].status`，二者均不可被用户更正覆盖。更正另存 `user_confirmed_mark`（可选）和 `user_confirmed_status`，统计优先采用用户确认状态；修改事实不会改写 PDF 来源事实。
 - `printed_work_days` 保留 PDF 印刷值。用户确认的实际出勤单独存为 `confirmed_work_days`，不覆盖印刷值或原始逐日事实。
@@ -55,6 +57,10 @@ python3 scripts/attendance_review.py check --data <工作目录>/attendance.json
 python3 scripts/attendance_export.py --data <工作目录>/attendance.json --output <当前项目仓库>/考勤确认表.md
 ```
 
-脚本只允许目标文件名 `考勤确认表.md`，可在同一任务内重生成该文件。导出分项目分组，每组人员表格必须固定为六列：序号、姓名、岗位、实际出勤、缺勤合计、备注。原始每日明细仍保留在 `attendance.json`，不输出日历矩阵。响应 JSON 给出绝对路径、月份、人数、项目数及待确认事项数。
+脚本只允许目标文件名 `考勤确认表.md`，可在同一任务内重生成该文件。正式 Markdown 只输出按人员汇总的固定六列表格：序号、姓名、岗位、实际出勤、缺勤合计、备注；不生成逐日章节或逐日矩阵。待确认事项、缺日、未知状态、印刷值冲突和来源警告仍须保留在汇总备注或待确认事项中。原始逐日状态、确认值、标记和来源仍完整保留在 PDF/页级 JSON/`attendance.json`，本次展示精简不改变更正、统计或来源核验功能。同名人员由不同 `record_id` 保持为独立汇总行。响应 JSON 给出绝对路径、月份、人数、项目数及待确认事项数。
+
+Agent 在提出更正或范围处理方案前，先按本文件中的 CLI 示例核对 `attendance_review.py` 实际支持的操作。当前仅支持 `set_daily_status`、`set_actual_work_days` 和经明确确认的 `resolve_source_warning`；不支持删除考勤人员。身份匹配与“本次核算暂不纳入”是独立决定，不能通过修改考勤事实实现排除，也不能因本次排除删除原始人员记录。
+
+Agent 的正常聊天回复只简短说明月份、项目、识别人数/页数（有可靠数据时）、核对结果、待确认事项摘要及文件交付状态，不重复整表或逐日明细。用户明确询问特定人员或日期时，只展示对应信息。
 
 该文件生成不等于产物声明成功，也不证明 UI 卡片已显示。由 Agent 按主 Skill 调用 `artifact_declare` 并核验成功响应。

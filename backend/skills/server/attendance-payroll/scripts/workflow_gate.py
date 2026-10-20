@@ -138,6 +138,73 @@ def _batch_scope(evidence: object, scope: dict) -> dict:
     return evidence
 
 
+def _payroll_operation_state(evidence: dict, scope: dict, batch_context: dict) -> dict:
+    """Validate fresh read-only lookups for the fixed Task operation IDs."""
+    state = evidence.get("payroll_operation_state")
+    if not isinstance(state, dict) or state.get("status") != "VERIFIED":
+        raise GateError("PAYROLL_OPERATION_STATE_UNVERIFIED")
+    batch_id = batch_context["batch_id"]
+    if (state.get("task_id") != batch_context["task_id"] or state.get("batch_id") != batch_id
+            or state.get("month") != scope["month"]):
+        raise GateError("PAYROLL_OPERATION_STATE_SCOPE_MISMATCH")
+    operations = state.get("operations")
+    if not isinstance(operations, dict):
+        raise GateError("PAYROLL_OPERATION_STATE_UNVERIFIED")
+    checked = {}
+    for key, prefix in (("submission", "submit"), ("calculation", "calculate")):
+        item = operations.get(key)
+        if not isinstance(item, dict) or item.get("operation_id") != f"{prefix}:{batch_id}":
+            raise GateError("PAYROLL_OPERATION_STATE_UNVERIFIED")
+        status = item.get("status")
+        if not isinstance(status, str) or status not in {"NOT_FOUND", "SUCCEEDED"}:
+            raise GateError("PAYROLL_OPERATION_STATE_UNVERIFIED")
+        if status == "SUCCEEDED":
+            old_scope = {
+                "month": item.get("month"),
+                "attendance_sha256": item.get("attendance_sha256"),
+                "record_ids": item.get("record_ids"),
+                "payroll_person_ids": item.get("payroll_person_ids"),
+            }
+            if (old_scope["month"] != scope["month"]
+                    or not isinstance(old_scope["attendance_sha256"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", old_scope["attendance_sha256"])
+                    or not isinstance(old_scope["record_ids"], list)
+                    or any(not isinstance(value, str) or not value.strip() for value in old_scope["record_ids"])
+                    or len(old_scope["record_ids"]) != len(set(old_scope["record_ids"]))
+                    or not isinstance(old_scope["payroll_person_ids"], list)
+                    or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                           for value in old_scope["payroll_person_ids"])
+                    or len(old_scope["payroll_person_ids"]) != len(set(old_scope["payroll_person_ids"]))):
+                raise GateError("PAYROLL_OPERATION_STATE_UNVERIFIED")
+            old_scope["record_ids"] = sorted(old_scope["record_ids"])
+            old_scope["payroll_person_ids"] = sorted(old_scope["payroll_person_ids"])
+            current_person_ids = _positive_id_list(
+                batch_context.get("payroll_person_ids"), "BATCH_PAYROLL_PERSON_IDS",
+            )
+            if old_scope["payroll_person_ids"] != current_person_ids:
+                raise GateError("PAYROLL_OPERATION_STATE_PERSON_SCOPE_MISMATCH")
+            checked[key] = {"status": status, **old_scope}
+        else:
+            checked[key] = {"status": status}
+    return checked
+
+
+def _require_no_prior_payroll_write(operations: dict, scope: dict) -> None:
+    if operations["submission"]["status"] == "SUCCEEDED":
+        _require_current_operation_scope(operations["submission"], scope, "SUBMISSION")
+        raise GateError("PAYROLL_SUBMISSION_ALREADY_EXISTS")
+    if operations["calculation"]["status"] == "SUCCEEDED":
+        _require_current_operation_scope(operations["calculation"], scope, "CALCULATION")
+        raise GateError("PAYROLL_CALCULATION_ALREADY_EXISTS")
+
+
+def _require_current_operation_scope(operation: dict, scope: dict, label: str) -> None:
+    if operation.get("status") != "SUCCEEDED":
+        raise GateError(f"{label}_RECEIPT_REQUIRED")
+    if any(operation.get(key) != scope[key] for key in ("month", "attendance_sha256", "record_ids")):
+        raise GateError(f"ATTENDANCE_CORRECTION_AFTER_{label}_BLOCKED")
+
+
 def _sha256(value: object, label: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
         raise GateError(f"{label}_DIGEST_INVALID")
@@ -156,7 +223,8 @@ def _positive_id_list(value: object, label: str) -> list[int]:
     return sorted(value)
 
 
-def _scope_digest(scope: dict, identity_sha: str, person_ids: list[int], readiness_sha: str) -> str:
+def _scope_digest(scope: dict, identity_sha: str, person_ids: list[int], readiness_sha: str,
+                  exclusions_sha: str | None = None) -> str:
     payload = {
         "month": scope["month"], "version": scope["version"],
         "attendance_sha256": scope["attendance_sha256"],
@@ -164,6 +232,8 @@ def _scope_digest(scope: dict, identity_sha: str, person_ids: list[int], readine
         "readiness_normalized_response_sha256": readiness_sha,
         "record_ids": scope["record_ids"], "payroll_person_ids": person_ids,
     }
+    if exclusions_sha is not None:
+        payload["scope_exclusions_sha256"] = exclusions_sha
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
@@ -253,7 +323,59 @@ def _compare_readiness_evidence(readiness: dict, actual: dict, status_result: di
         raise GateError("READINESS_PERSON_SCOPE_MISMATCH")
 
 
-def _execution_context(evidence: dict) -> dict:
+def _scope_exclusion_decisions(evidence: dict, conversation: list[dict], review_scope: dict,
+                               identity_sha: str, by_record: dict[str, dict]) -> list[dict]:
+    unresolved = {
+        record_id: person for record_id, person in by_record.items()
+        if person["status"] in {"ambiguous", "pending_confirmation"}
+    }
+    decisions = evidence.get("scope_exclusion_decisions", [])
+    if not isinstance(decisions, list) or len(decisions) != len(unresolved):
+        raise GateError("UNRESOLVED_IDENTITY_CONFLICT")
+    checked = {}
+    required_fields = {
+        "record_id", "name", "reason", "month", "version", "attendance_sha256",
+        "person_matches_sha256", "confirmation_message_index", "confirmation_message_sha256",
+        "message_source_verified",
+    }
+    for decision in decisions:
+        if not isinstance(decision, dict) or set(decision) != required_fields:
+            raise GateError("SCOPE_EXCLUSION_DECISION_INVALID")
+        record_id = decision.get("record_id")
+        person = unresolved.get(record_id)
+        reason = decision.get("reason")
+        index = decision.get("confirmation_message_index")
+        if (person is None or record_id in checked or decision.get("name") != person["name"]
+                or not isinstance(reason, str) or not reason.strip() or len(reason) > 500
+                or any(decision.get(key) != review_scope[key] for key in
+                       ("month", "version", "attendance_sha256"))
+                or decision.get("person_matches_sha256") != identity_sha
+                or decision.get("message_source_verified") is not False
+                or isinstance(index, bool) or not isinstance(index, int)
+                or not 0 <= index < len(conversation) or conversation[index].get("role") != "user"):
+            raise GateError("SCOPE_EXCLUSION_DECISION_INVALID")
+        message = conversation[index]["content"]
+        normalized = re.sub(r"[\s，,。；;：:]", "", message)
+        if (decision.get("confirmation_message_sha256") != _text_sha256(message)
+                or person["name"] not in message or _uncertain(message)
+                or not re.search(r"(?:暂不|不)纳入(?:本次|这次)?(?:工资)?核算", normalized)
+                and not re.search(r"(?:本次|这次)(?:暂不|不)纳入(?:工资)?核算", normalized)):
+            raise GateError("SCOPE_EXCLUSION_USER_CONFIRMATION_REQUIRED")
+        checked[record_id] = {
+            "record_id": record_id, "name": person["name"], "reason": reason.strip(),
+            "month": review_scope["month"], "version": review_scope["version"],
+            "attendance_sha256": review_scope["attendance_sha256"],
+            "person_matches_sha256": identity_sha,
+            "confirmation_message_index": index,
+            "confirmation_message_sha256": decision["confirmation_message_sha256"],
+            "message_source_verified": False,
+        }
+    if set(checked) != set(unresolved):
+        raise GateError("UNRESOLVED_IDENTITY_CONFLICT")
+    return [checked[record_id] for record_id in sorted(checked)]
+
+
+def _execution_context(evidence: dict, conversation: list[dict]) -> dict:
     review_scope = _scope(evidence.get("attendance_review"), "ATTENDANCE_REVIEW", "DECLARED")
     identity = evidence.get("identity_matching")
     identity_scope = _scope(identity, "IDENTITY_MATCHING", "COMPLETE")
@@ -286,8 +408,6 @@ def _execution_context(evidence: dict) -> dict:
             raise GateError("IDENTITY_PEOPLE_INVALID")
         if not isinstance(status, str) or status not in {"matched", "unmatched", "ambiguous", "pending_confirmation"}:
             raise GateError("IDENTITY_STATUS_INVALID")
-        if status in {"ambiguous", "pending_confirmation"}:
-            raise GateError("UNRESOLVED_IDENTITY_CONFLICT")
         pid = person.get("payroll_person_id")
         if status == "matched":
             if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or pid in matched_by_pid:
@@ -298,6 +418,38 @@ def _execution_context(evidence: dict) -> dict:
         by_record[record_id] = person
     if set(by_record) != set(review_scope["record_ids"]):
         raise GateError("IDENTITY_PEOPLE_SCOPE_MISMATCH")
+    identity_source = _read(evidence["person_matches_path"])
+    source_rows = identity_source.get("matches")
+    if (identity_source.get("schema_version") != 1
+            or identity_source.get("attendance_sha256") != review_scope["attendance_sha256"]
+            or not isinstance(source_rows, list)):
+        raise GateError("IDENTITY_MAPPING_CONTENT_INVALID")
+    source_by_record = {}
+    for source_row in source_rows:
+        if not isinstance(source_row, dict):
+            raise GateError("IDENTITY_MAPPING_CONTENT_INVALID")
+        source_id = source_row.get("record_id")
+        if not isinstance(source_id, str) or source_id in source_by_record:
+            raise GateError("IDENTITY_MAPPING_CONTENT_INVALID")
+        source_by_record[source_id] = source_row
+    if set(source_by_record) != set(by_record):
+        raise GateError("IDENTITY_MAPPING_CONTENT_INVALID")
+    for record_id, person in by_record.items():
+        source = source_by_record[record_id]
+        if source.get("status") != person["status"]:
+            raise GateError("IDENTITY_STATUS_CONTENT_MISMATCH")
+        if person["status"] == "matched" and source.get("payroll_person_id") != person.get("payroll_person_id"):
+            raise GateError("IDENTITY_PERSON_ID_CONTENT_MISMATCH")
+        if person["status"] in {"ambiguous", "pending_confirmation"}:
+            facts = source.get("facts")
+            if (not isinstance(facts, dict) or facts.get("name") != person["name"]
+                    or person.get("payroll_person_id") is not None):
+                raise GateError("IDENTITY_CONFLICT_SOURCE_MISMATCH")
+
+    exclusion_decisions = _scope_exclusion_decisions(
+        evidence, conversation, review_scope, identity_sha, by_record,
+    )
+    exclusion_by_record = {item["record_id"]: item for item in exclusion_decisions}
 
     items = readiness.get("items")
     if not isinstance(items, list) or len(items) != len(matched_by_pid):
@@ -386,6 +538,12 @@ def _execution_context(evidence: dict) -> dict:
         status = person["status"]
         if status == "unmatched":
             exclusions.append({"record_id": record_id, "name": person["name"], "reason": "身份待核实"})
+        elif status in {"ambiguous", "pending_confirmation"}:
+            decision = exclusion_by_record[record_id]
+            exclusions.append({
+                "record_id": record_id, "name": person["name"],
+                "reason": f"用户确认本次暂不纳入：{decision['reason']}",
+            })
     for record_id, item in readiness_by_record.items():
         if item["status"] != "COVERED":
             reasons = {
@@ -394,13 +552,17 @@ def _execution_context(evidence: dict) -> dict:
             }
             exclusions.append({"record_id": record_id, "name": item["name"], "reason": reasons[item["status"]]})
     exclusions.sort(key=lambda item: (item["record_id"], item["reason"]))
+    exclusions_sha = _text_sha256(json.dumps(exclusion_decisions, ensure_ascii=False, sort_keys=True,
+                                            separators=(",", ":"))) if exclusion_decisions else None
     return {
         "scope": selected_scope,
         "person_matches_sha256": identity_sha,
         "payroll_person_ids": eligible_pids,
         "people": expected_people,
         "exclusions": exclusions,
-        "scope_sha256": _scope_digest(selected_scope, identity_sha, eligible_pids, readiness_sha),
+        "scope_sha256": _scope_digest(selected_scope, identity_sha, eligible_pids, readiness_sha, exclusions_sha),
+        "scope_exclusion_decisions": exclusion_decisions,
+        "scope_exclusions_sha256": exclusions_sha,
         "readiness_normalized_response_sha256": readiness_sha,
         "readiness_report_revalidated": True,
         "payroll_response_sha256_verified": readiness_status.get("payroll_response_sha256_verified") is True,
@@ -414,8 +576,14 @@ def _execution_intent(text: str, scope_count: int) -> bool:
         return False
     if any(phrase in text for phrase in ("查看工资表", "看一下工资表", "生成工资表")):
         return False
-    intent = any(phrase in text for phrase in (
-        "开始工资核算", "开始核算", "开始算工资", "核算工资", "按上述人员核算",
+    normalized = re.sub(r"\s+", "", text)
+    # Bounded action wording: require a decisive execution verb plus a payroll
+    # calculation action, or an established direct calculation form.
+    intent = bool(re.search(
+        r"(?:开始|启动|进行|执行)(?:本次|此次|这次)?(?:的)?(?:工资|薪资|薪酬)?"
+        r"(?:核算|计算)(?:工资|薪资|薪酬)?", normalized,
+    )) or any(phrase in normalized for phrase in (
+        "核算工资", "开始算工资", "按上述人员核算",
     ))
     if not intent:
         return False
@@ -466,24 +634,39 @@ def _scope_display_index(conversation: list[dict], scope: dict, context: dict, s
     if conversation[index]["role"] != "assistant":
         raise GateError("EXECUTION_SCOPE_DISPLAY_NOT_ASSISTANT")
     text = conversation[index]["content"]
-    if not any(marker in text for marker in ("工资核算范围", "拟核算范围", "本次处理范围")):
+    compact = re.sub(r"\s+", "", text).replace(":", "：")
+    if "工资核算范围：" not in compact:
         raise GateError("EXECUTION_SCOPE_DISPLAY_MARKER_MISSING")
-    if scope["month"] not in text or f"{len(context['people'])}人" not in text.replace(" ", ""):
+    count_pattern = rf"(?<!\d){len(context['people'])}人"
+    inclusion_start = compact.find("纳入：")
+    exclusion_start = compact.find("排除事项：")
+    if (scope["month"] not in compact or not re.search(count_pattern, compact)
+            or inclusion_start < 0 or exclusion_start < inclusion_start):
         raise GateError("EXECUTION_SCOPE_DISPLAY_SUMMARY_MISMATCH")
+    inclusion_end = compact.find("。", inclusion_start)
+    if inclusion_end < 0 or inclusion_end > exclusion_start:
+        inclusion_end = exclusion_start
+    included_text = compact[inclusion_start + len("纳入："):inclusion_end]
+    included_names = [name for name in re.split(r"[、，,;；]|和|及", included_text) if name]
+    if sorted(included_names) != sorted(person["name"] for person in context["people"]):
+        raise GateError("EXECUTION_SCOPE_DISPLAY_PEOPLE_INCOMPLETE")
+    exclusions_end = compact.find("后续", exclusion_start)
+    if exclusions_end < 0:
+        raise GateError("EXECUTION_SCOPE_DISPLAY_SUMMARY_MISMATCH")
+    exclusion_text = compact[exclusion_start + len("排除事项："):exclusions_end].strip("。；;")
+    displayed_exclusions = [] if exclusion_text in {"", "无", "暂无"} else [
+        item.strip("。；;") for item in re.split(r"[；;]", exclusion_text) if item.strip("。；;")
+    ]
+    expected_exclusions = sorted(f"{item['name']}：{item['reason']}" for item in context["exclusions"])
+    if sorted(displayed_exclusions) != expected_exclusions:
+        raise GateError("EXECUTION_SCOPE_DISPLAY_EXCLUSIONS_INCOMPLETE")
     if supplied.get("scope_sha256") != context["scope_sha256"]:
         raise GateError("EXECUTION_SCOPE_DISPLAY_BINDING_MISMATCH")
-    for person in context["people"]:
-        if person["name"] not in text:
-            raise GateError("EXECUTION_SCOPE_DISPLAY_PEOPLE_INCOMPLETE")
-    for exclusion in context["exclusions"]:
-        if exclusion["name"] not in text or exclusion["reason"] not in text:
-            raise GateError("EXECUTION_SCOPE_DISPLAY_EXCLUSIONS_INCOMPLETE")
-    if not all(term in text for term in ("正式提交考勤", "正式预检查", "工资核算")):
+    if not all(term in compact for term in ("正式提交考勤", "正式预检查", "工资核算")):
         raise GateError("EXECUTION_SCOPE_SIDE_EFFECTS_NOT_DISCLOSED")
     scope_markers = [
         i for i, item in enumerate(conversation)
-        if item["role"] == "assistant" and any(marker in item["content"] for marker in
-                                                 ("工资核算范围", "拟核算范围", "本次处理范围"))
+        if item["role"] == "assistant" and "工资核算范围" in re.sub(r"\s+", "", item["content"])
     ]
     if not scope_markers or scope_markers[-1] != index:
         raise GateError("EXECUTION_SCOPE_DISPLAY_NOT_LATEST")
@@ -491,8 +674,10 @@ def _scope_display_index(conversation: list[dict], scope: dict, context: dict, s
 
 
 def _authorize_payroll_execution(request: dict, messages: list[str], evidence: dict) -> dict:
-    context = _execution_context(evidence)
     conversation = _conversation(request.get("conversation_messages"), messages)
+    context = _execution_context(evidence, conversation)
+    operations = _payroll_operation_state(evidence, context["scope"], context["batch_context"])
+    _require_no_prior_payroll_write(operations, context["scope"])
     display_index = _scope_display_index(
         conversation, context["scope"], context, evidence.get("scope_display"),
     )
@@ -519,6 +704,8 @@ def _authorize_payroll_execution(request: dict, messages: list[str], evidence: d
         "scope_display_message_index": display_index,
         "scope_display_message_sha256": _text_sha256(conversation[display_index]["content"]),
         "scope_sha256": context["scope_sha256"],
+        "scope_exclusion_decisions": context["scope_exclusion_decisions"],
+        "scope_exclusions_sha256": context["scope_exclusions_sha256"],
         "month": context["scope"]["month"],
         "version": context["scope"]["version"],
         "attendance_sha256": context["scope"]["attendance_sha256"],
@@ -540,11 +727,11 @@ def _authorize_payroll_execution(request: dict, messages: list[str], evidence: d
 def _validate_execution_authorization(
     request: dict, messages: list[str], evidence: dict, expected_scope: dict | None = None,
 ) -> tuple[dict, dict]:
-    context = _execution_context(evidence)
+    conversation = _conversation(request.get("conversation_messages"), messages)
+    context = _execution_context(evidence, conversation)
     token = evidence.get("execution_authorization")
     if not isinstance(token, dict) or token.get("status") != "EXECUTION_AUTHORIZED_FOR_DISPLAYED_SCOPE":
         raise GateError("PAYROLL_EXECUTION_AUTHORIZATION_REQUIRED")
-    conversation = _conversation(request.get("conversation_messages"), messages)
     auth_index = token.get("authorization_message_index")
     display_index = token.get("scope_display_message_index")
     if (isinstance(auth_index, bool) or not isinstance(auth_index, int) or auth_index != len(messages) - 1
@@ -567,6 +754,8 @@ def _validate_execution_authorization(
         raise GateError("PAYROLL_EXECUTION_AUTHORIZATION_STALE")
     expected = {
         "scope_sha256": context["scope_sha256"],
+        "scope_exclusion_decisions": context["scope_exclusion_decisions"],
+        "scope_exclusions_sha256": context["scope_exclusions_sha256"],
         "month": context["scope"]["month"], "version": context["scope"]["version"],
         "attendance_sha256": context["scope"]["attendance_sha256"],
         "person_matches_sha256": context["person_matches_sha256"],
@@ -814,7 +1003,9 @@ def _evaluate(request: dict) -> dict:
                 return result
             selected = context["scope"]
             try:
-                _batch_scope(evidence.get("batch_context"), selected)
+                batch_context = _batch_scope(evidence.get("batch_context"), selected)
+                operations = _payroll_operation_state(evidence, selected, batch_context)
+                _require_no_prior_payroll_write(operations, selected)
             except GateError as exc:
                 result["error"] = str(exc)
                 return result
@@ -856,7 +1047,9 @@ def _evaluate(request: dict) -> dict:
             result["error"] = "PRIOR_EXACT_SCOPE_CONFIRMATION_REQUIRED"
             return result
         try:
-            _batch_scope(evidence.get("batch_context"), selected)
+            batch_context = _batch_scope(evidence.get("batch_context"), selected)
+            operations = _payroll_operation_state(evidence, selected, batch_context)
+            _require_no_prior_payroll_write(operations, selected)
         except GateError as exc:
             result["error"] = str(exc)
             return result
@@ -878,6 +1071,15 @@ def _evaluate(request: dict) -> dict:
             scope = _scope(scope_review, "SUBMISSION_SCOPE_REVIEW", "CONFIRMED")
         try:
             batch_context = _batch_scope(evidence.get("batch_context"), scope)
+        except GateError as exc:
+            result["error"] = str(exc)
+            return result
+        try:
+            operations = _payroll_operation_state(evidence, scope, batch_context)
+            _require_current_operation_scope(operations["submission"], scope, "SUBMISSION")
+            if operations["calculation"]["status"] == "SUCCEEDED":
+                _require_current_operation_scope(operations["calculation"], scope, "CALCULATION")
+                raise GateError("PAYROLL_CALCULATION_ALREADY_EXISTS")
         except GateError as exc:
             result["error"] = str(exc)
             return result
@@ -914,6 +1116,15 @@ def _evaluate(request: dict) -> dict:
             except GateError as exc:
                 result["error"] = str(exc)
                 return result
+            try:
+                operations = _payroll_operation_state(evidence, scope, batch_context)
+                _require_current_operation_scope(operations["submission"], scope, "SUBMISSION")
+                if operations["calculation"]["status"] == "SUCCEEDED":
+                    _require_current_operation_scope(operations["calculation"], scope, "CALCULATION")
+                    raise GateError("PAYROLL_CALCULATION_ALREADY_EXISTS")
+            except GateError as exc:
+                result["error"] = str(exc)
+                return result
             precheck_operation = f"precheck:{batch_context['batch_id']}"
             if (precheck.get("batch_id") != batch_context["batch_id"]
                     or precheck.get("operation_id") != precheck_operation
@@ -942,6 +1153,15 @@ def _evaluate(request: dict) -> dict:
             return result
         try:
             batch_context = _batch_scope(evidence.get("batch_context"), submitted)
+        except GateError as exc:
+            result["error"] = str(exc)
+            return result
+        try:
+            operations = _payroll_operation_state(evidence, submitted, batch_context)
+            _require_current_operation_scope(operations["submission"], submitted, "SUBMISSION")
+            if operations["calculation"]["status"] == "SUCCEEDED":
+                _require_current_operation_scope(operations["calculation"], submitted, "CALCULATION")
+                raise GateError("PAYROLL_CALCULATION_ALREADY_EXISTS")
         except GateError as exc:
             result["error"] = str(exc)
             return result
@@ -976,6 +1196,13 @@ def _evaluate(request: dict) -> dict:
         except GateError as exc:
             result["error"] = str(exc)
             return result
+        try:
+            operations = _payroll_operation_state(evidence, context["scope"], batch_context)
+            _require_current_operation_scope(operations["submission"], context["scope"], "SUBMISSION")
+            _require_current_operation_scope(operations["calculation"], context["scope"], "CALCULATION")
+        except GateError as exc:
+            result["error"] = str(exc)
+            return result
         expected_batch_id = batch_context["batch_id"]
         if (calculation.get("batch_id") != expected_batch_id
                 or calculation.get("operation_id") != f"calculate:{expected_batch_id}"
@@ -1001,6 +1228,13 @@ def _evaluate(request: dict) -> dict:
     submitted = _scope(submission, "SUBMISSION_RECEIPT", "SUCCEEDED")
     try:
         batch_context = _batch_scope(evidence.get("batch_context"), submitted)
+    except GateError as exc:
+        result["error"] = str(exc)
+        return result
+    try:
+        operations = _payroll_operation_state(evidence, submitted, batch_context)
+        _require_current_operation_scope(operations["submission"], submitted, "SUBMISSION")
+        _require_current_operation_scope(operations["calculation"], submitted, "CALCULATION")
     except GateError as exc:
         result["error"] = str(exc)
         return result

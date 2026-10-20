@@ -90,4 +90,12 @@ W03 仅允许 `list_roster` 和 `resolve_payroll_person_candidates` 两项只读
 
 面向用户统一表达为：`matched` 是“已关联”；`ambiguous` 或 `pending_confirmation` 是“待核实”；`unmatched` 是“当前 Payroll 未找到可关联的人员档案，本次暂不纳入自动核算范围”。只有用户明确同意本次处理范围后，才可继续处理该范围；未匹配记录仍保留为业务异常，不建议创建人员，也不得按姓名猜测关联。
 
+### 本次核算范围排除（不更改身份）
+
+用户明确表示某条仍为 `ambiguous` 或 `pending_confirmation` 的考勤记录暂不纳入本次核算时，可以把它作为**范围排除决定**处理；不得把该记录改成 `matched`、`unmatched`，不得删除它或修改候选快照。需要先以稳定 `record_id`、姓名和具体原因记录决定，并绑定当前 Review 的月份/版本/`attendance.json` SHA-256、`person-matches.json` SHA-256，以及当前对话中用户明确确认该人员本次不纳入的消息索引和消息摘要。随后 `workflow_gate.py` 会校验 `evidence.scope_exclusion_decisions`，要求每条未解决的歧义记录均有对应决定，且确认消息与当前会话、人员和当前摘要一致；未确认、过期、额外或冲突决定均阻断。
+
+排除决定仅作用于本次 `matched + COVERED` 核算范围，不改变考勤事实或 Payroll 人员身份。它会进入范围展示及执行授权摘要，决定、考勤或映射变化后旧范围授权失效。其他未解决的 `ambiguous` / `pending_confirmation` 仍会阻断。`unmatched` 继续按既有规则保留为身份待核并排除在自动核算范围之外；用户范围排除不是身份匹配的替代品。
+
+门禁只能验证调用者提供的消息索引/摘要与当前对话文本一致，不能由 Skills-only 认证消息确实来自 Runtime 用户，也不能阻止 Agent 绕过脚本。因此必须直接核对当前用户原话；本地排除证据不具备服务端授权效力。
+
 完成后向用户说明已关联、待核实和暂不纳入的人数及人员。身份映射不代表考勤已正式提交，也不授权工资核算；后续工资处理必须单独获得用户明确授权。

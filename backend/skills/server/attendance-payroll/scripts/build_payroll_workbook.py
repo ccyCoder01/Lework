@@ -23,6 +23,7 @@ from openpyxl.utils import get_column_letter
 
 import workflow_gate
 import person_matches
+import attendance_store
 
 
 COMPONENTS = (
@@ -44,8 +45,8 @@ SHEETS = {
                   "历史工资来源月份", "历史应发工资", "核算应发工资", "与历史差额", "状态"],
     "工资基准": ["姓名", "项目", "公司/部门", "岗位", "人员类别", "历史工资来源月份", "历史应发工资",
                  *[value for _, name in COMPONENTS for value in (name, f"{name}来源状态")]],
-    "考勤汇总": ["姓名", "项目", "公司/部门", "岗位", "人员类别", "来源出勤天数", "派生出勤天数", "确认出勤天数",
-                "事假天数", "病假天数", "旷工天数", "对账状态", "备注", "日期", "日状态", "确认值", "原始标记"],
+    "考勤汇总": ["姓名", "考勤记录ID", "项目", "公司/部门", "岗位", "人员类别", "来源出勤天数", "派生出勤天数",
+                "确认出勤天数", "事假天数", "病假天数", "旷工天数", "对账状态", "备注"],
     "历史工资对比": ["姓名", "项目", "公司/部门", "岗位", "历史工资来源月份", "历史应发工资", "本次核算应发", "与历史差额"],
     "人工复核事项": ["姓名", "处理状态", "问题类型", "问题说明"],
 }
@@ -54,7 +55,7 @@ DAYS_FMT = "0.00;[Red](0.00);-"
 WIDTHS = {
     "工资核算明细": [10, 10, 11, 10, 10, *([18] * 13), 10],
     "工资基准": [10, 10, 11, 10, 10, 18, 18, *([18] * 13), 16, 18, 18, 18, 24],
-    "考勤汇总": [10, 14, 11, 14, 10, *([14] * 6), 10, 36, 10, 10, 10, 10],
+    "考勤汇总": [14, 24, 14, 14, 14, 12, *([14] * 6), 12, 36],
     "历史工资对比": [10, 10, 11, 10, *([18] * 4)],
     "人工复核事项": [12, 10, 18, 36],
 }
@@ -160,6 +161,10 @@ def _keys(value: dict, allowed: set[str], required: set[str], label: str) -> Non
 
 def _validate_calculation_dto(value: object) -> dict:
     result = _obj(value, "RAW_CALCULATION_RESPONSE")
+    if "issues" in result and result["issues"] is None:
+        # Go encodes a nil slice without omitempty as JSON null. For a
+        # successful response this is equivalent to an empty issue slice.
+        result = {**result, "issues": []}
     _keys(result, CALCULATION_KEYS, CALCULATION_KEYS, "RAW_CALCULATION_RESPONSE")
     for key in ("payroll_month", "batch_id", "operation_id", "precheck_snapshot_id", "calculation_stage", "status"):
         if not isinstance(result.get(key), str):
@@ -218,6 +223,38 @@ def _validate_calculation_dto(value: object) -> dict:
     return result
 
 
+def _calculation_dto_from_payroll_response(value: object) -> dict:
+    """Normalize a verified Payroll DTO or its actual MCP CallToolResult wrapper."""
+    response = _obj(value, "RAW_CALCULATION_RESPONSE")
+    if not ({"content", "structuredContent", "isError", "_meta"} & set(response)):
+        return _validate_calculation_dto(response)
+
+    allowed = {"content", "structuredContent", "isError", "_meta"}
+    if set(response) - allowed or "structuredContent" not in response:
+        raise ExportError("RAW_CALCULATION_MCP_ENVELOPE_INVALID")
+    if response.get("isError", False) is not False:
+        raise ExportError("RAW_CALCULATION_MCP_ERROR")
+    if "_meta" in response and not isinstance(response["_meta"], dict):
+        raise ExportError("RAW_CALCULATION_MCP_ENVELOPE_INVALID")
+
+    content = response.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        raise ExportError("RAW_CALCULATION_MCP_CONTENT_INVALID")
+    text_content = _obj(content[0], "RAW_CALCULATION_MCP_CONTENT")
+    if set(text_content) != {"type", "text"} or text_content.get("type") != "text" or not isinstance(
+        text_content.get("text"), str
+    ):
+        raise ExportError("RAW_CALCULATION_MCP_CONTENT_INVALID")
+    try:
+        text_dto = json.loads(text_content["text"])
+    except json.JSONDecodeError as exc:
+        raise ExportError("RAW_CALCULATION_MCP_CONTENT_INVALID") from exc
+    structured_dto = _obj(response["structuredContent"], "RAW_CALCULATION_MCP_STRUCTURED_CONTENT")
+    if _canonical_json(text_dto) != _canonical_json(structured_dto):
+        raise ExportError("RAW_CALCULATION_MCP_CONTENT_MISMATCH")
+    return _validate_calculation_dto(structured_dto)
+
+
 def _canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
@@ -241,9 +278,17 @@ ATTENDANCE_STATUS_TO_PAYROLL = {
     "rest": 5,
     "comp_leave": 6,
 }
+UNMAPPED_SOURCE_STATUS_LABELS = {
+    "transfer": "调离",
+    "departed": "离职后",
+    "unknown": "未知",
+    "blank": "空白",
+    "other": "其他",
+}
 
 
-def _attendance_record_projection(person: dict, match: dict, month: str, aliases: dict[str, str]) -> dict:
+def _attendance_record_projection(person: dict, match: dict, month: str, aliases: dict[str, str],
+                                  allow_unmapped_statuses: bool = False) -> dict:
     """Project only facts with a documented one-to-one Payroll DTO representation."""
     name = person.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -272,6 +317,7 @@ def _attendance_record_projection(person: dict, match: dict, month: str, aliases
     if not isinstance(daily, list):
         raise ExportError("ATTENDANCE_SOURCE_DAILY_INVALID")
     by_day = {}
+    unmapped_days = {}
     corrections = "confirmed_work_days" in person
     personal = sick = absent = observed = 0
     for day in daily:
@@ -280,7 +326,9 @@ def _attendance_record_projection(person: dict, match: dict, month: str, aliases
         if day["day"] in by_day:
             raise ExportError("ATTENDANCE_SOURCE_DAY_DUPLICATE")
         status = _effective_attendance_status(day)
-        if status not in ATTENDANCE_STATUS_TO_PAYROLL:
+        if not isinstance(status, str) or status not in attendance_store.STATUS:
+            raise ExportError("ATTENDANCE_SOURCE_STATUS_INVALID")
+        if status not in ATTENDANCE_STATUS_TO_PAYROLL and not allow_unmapped_statuses:
             raise ExportError("ATTENDANCE_STATUS_HAS_NO_PAYROLL_EQUIVALENT")
         raw_mark = day.get("raw_mark")
         if not isinstance(raw_mark, str):
@@ -295,10 +343,12 @@ def _attendance_record_projection(person: dict, match: dict, month: str, aliases
             _decimal(value, "ATTENDANCE_SOURCE_DAILY_VALUE")
         projected = {
             "day": day["day"],
-            "status": ATTENDANCE_STATUS_TO_PAYROLL[status],
+            "status": ATTENDANCE_STATUS_TO_PAYROLL.get(status),
             "value": None if value is None else str(value),
             "raw_value": raw_mark,
         }
+        if status not in ATTENDANCE_STATUS_TO_PAYROLL:
+            unmapped_days[day["day"]] = status
         by_day[day["day"]] = projected
         observed += int(status == "work")
         personal += int(status == "personal_leave")
@@ -343,6 +393,7 @@ def _attendance_record_projection(person: dict, match: dict, month: str, aliases
         "reconciliation_status": 2 if corrections else 1,
         "remark": note,
         "items": [by_day[day] for day in sorted(by_day)],
+        "unmapped_days": unmapped_days,
     }
 
 
@@ -369,11 +420,24 @@ def _compare_attendance_record(expected: dict, actual: dict) -> None:
             raise ExportError("ATTENDANCE_SNAPSHOT_DAY_DUPLICATE")
         by_day[day] = item
     exp_by_day = {item["day"]: item for item in expected["items"]}
+    unmapped_days = expected.get("unmapped_days", {})
     if set(by_day) != set(exp_by_day):
         raise ExportError("ATTENDANCE_SNAPSHOT_SOURCE_MISMATCH")
     for day, exp in exp_by_day.items():
         got = by_day[day]
-        if got.get("status") != exp["status"] or got.get("raw_value") != exp["raw_value"]:
+        if day in unmapped_days:
+            # Local workbook snapshots use null as an explicit non-Payroll
+            # placeholder when an out-of-scope source fact has no DTO mapping.
+            # No Payroll status can be inferred from this value.
+            if got.get("status") is not None or exp.get("status") is not None:
+                raise ExportError("ATTENDANCE_SNAPSHOT_SOURCE_MISMATCH")
+        else:
+            got_status = _int(got.get("status"), "ATTENDANCE_SNAPSHOT_STATUS", 1)
+            if got_status not in DAY_STATUS:
+                raise ExportError("ATTENDANCE_STATUS_UNKNOWN")
+            if got_status != exp["status"]:
+                raise ExportError("ATTENDANCE_SNAPSHOT_SOURCE_MISMATCH")
+        if got.get("raw_value") != exp["raw_value"]:
             raise ExportError("ATTENDANCE_SNAPSHOT_SOURCE_MISMATCH")
         if not _decimal_equal(got.get("value"), exp["value"], "ATTENDANCE_SNAPSHOT_VALUE"):
             raise ExportError("ATTENDANCE_SNAPSHOT_SOURCE_MISMATCH")
@@ -381,10 +445,12 @@ def _compare_attendance_record(expected: dict, actual: dict) -> None:
 
 def _validate_source_bindings(data: dict, gate_path: Path, calculation_path: Path,
                               matches_path: Path, submission_path: Path) -> None:
-    raw_calculation = _validate_calculation_dto(_read(calculation_path, "RAW_CALCULATION_RESPONSE"))
-    calculation = _obj(data.get("calculation_result"), "CALCULATION_RESULT")
+    raw_calculation = _calculation_dto_from_payroll_response(_read(calculation_path, "RAW_CALCULATION_RESPONSE"))
+    calculation = _validate_calculation_dto(_obj(data.get("calculation_result"), "CALCULATION_RESULT"))
     if _canonical_json(raw_calculation) != _canonical_json(calculation):
         raise ExportError("CALCULATION_RESULT_SOURCE_MISMATCH")
+    calc_ids = {_person_id(item.get("payroll_person_id"), "CALCULATION_PERSON_ID")
+                for item in calculation.get("items", [])}
 
     gate_request = _read(gate_path, "GATE_REQUEST")
     evidence = _obj(gate_request.get("evidence"), "GATE_EVIDENCE")
@@ -450,14 +516,20 @@ def _validate_source_bindings(data: dict, gate_path: Path, calculation_path: Pat
         snapshot_by_record[record_id] = record
     if set(snapshot_by_record) != set(matches_by_id):
         raise ExportError("ATTENDANCE_SNAPSHOT_SOURCE_SCOPE_MISMATCH")
+    source_people_by_record = {}
     for person in people:
         record_id = person.get("record_id")
         match = matches_by_id[record_id]
-        projected = _attendance_record_projection(person, match, month, aliases)
+        source_pid = match.get("payroll_person_id") if match.get("status") == "matched" else None
+        calculated = source_pid in calc_ids
+        projected = _attendance_record_projection(
+            person, match, month, aliases, allow_unmapped_statuses=not calculated,
+        )
         actual = snapshot_by_record[record_id]
         if actual.get("payroll_person_id") != projected["payroll_person_id"]:
             raise ExportError("ATTENDANCE_IDENTITY_SOURCE_MISMATCH")
         _compare_attendance_record(projected, actual)
+        source_people_by_record[record_id] = person
 
     _keys(submission, SUBMISSION_ROOT_KEYS, SUBMISSION_ROOT_KEYS, "SUBMISSION_REQUEST")
     if (submission.get("attendance_month") != month or submission.get("submission_mode") != "BATCH_SNAPSHOT"
@@ -475,7 +547,6 @@ def _validate_source_bindings(data: dict, gate_path: Path, calculation_path: Pat
         if pid in submitted_by_id:
             raise ExportError("SUBMISSION_REQUEST_PERSON_DUPLICATE")
         submitted_by_id[pid] = record
-    calc_ids = {_person_id(item.get("payroll_person_id"), "CALCULATION_PERSON_ID") for item in calculation.get("items", [])}
     if set(submitted_by_id) != calc_ids:
         raise ExportError("SUBMISSION_REQUEST_SCOPE_MISMATCH")
     for record in records:
@@ -511,6 +582,7 @@ def _validate_source_bindings(data: dict, gate_path: Path, calculation_path: Pat
     receipt_ids = submission_receipt.get("payroll_person_ids")
     if not isinstance(receipt_ids, list) or set(receipt_ids) != set(submitted_by_id) or len(receipt_ids) != len(submitted_by_id):
         raise ExportError("SUBMISSION_RECEIPT_SCOPE_MISMATCH")
+    return source_people_by_record
 
 
 def _person_id(value: object, label: str) -> int:
@@ -654,44 +726,78 @@ def _validate_gate(path: Path, month: str, calculation: dict) -> dict:
 
 
 def _review_items(attendance: list[dict], calc_by_id: dict[int, dict], month: str, issues: object) -> list[list[object]]:
-    rows = []
+    grouped: dict[tuple[str, str], dict] = {}
+
+    def add(identity: object, name: object, status: str, category: str, detail: str) -> None:
+        stable = str(identity) if identity not in (None, "") else f"name:{name or ''}"
+        key = (stable, category)
+        entry = grouped.setdefault(key, {"name": str(name or ""), "status": status, "details": []})
+        if detail not in entry["details"]:
+            entry["details"].append(detail)
+
     for record in attendance:
         pid = record.get("payroll_person_id")
+        identity = f"payroll:{pid}" if pid is not None else f"record:{record.get('record_id') or ''}"
+        name = record.get("name_snapshot") or ""
         if pid is None or pid not in calc_by_id:
-            rows.append([record.get("name_snapshot") or "", "待处理", "未纳入核算", "该考勤人员未出现在本次成功核算明细中。"])
+            add(identity, name, "待处理", "未纳入核算", "该考勤人员未出现在本次成功核算明细中。")
         if record.get("reconciliation_status") == 2:
-            rows.append([record.get("name_snapshot") or "", "待确认", "考勤人工调整", str(record.get("remark") or "来源记录标记为人工调整。")])
+            add(identity, name, "待确认", "考勤人工调整", str(record.get("remark") or "来源记录标记为人工调整。"))
         elif record.get("reconciliation_status") not in RECONCILIATION:
-            rows.append([record.get("name_snapshot") or "", "待核实", "考勤对账状态未知", "来源考勤快照未提供可识别的对账状态。"])
+            add(identity, name, "待核实", "考勤对账状态未知", "来源考勤快照未提供可识别的对账状态。")
         items = record.get("items", [])
         if not isinstance(items, list):
             continue
         days = [entry.get("day") for entry in items if isinstance(entry, dict)]
         if len(days) != len(set(days)):
-            rows.append([record.get("name_snapshot") or "", "待核实", "考勤日期重复", "来源考勤快照包含重复日期。"])
+            add(identity, name, "待核实", "考勤日期重复", "重复日期：" + ", ".join(map(str, sorted(set(day for day in days if days.count(day) > 1)))))
         expected = calendar.monthrange(int(month[:4]), int(month[5:]))[1]
         if set(days) != set(range(1, expected + 1)):
-            rows.append([record.get("name_snapshot") or "", "待核实", "考勤日明细不完整", "来源快照未包含当月每个日期的记录。"])
+            missing = sorted(set(range(1, expected + 1)) - set(days))
+            add(identity, name, "待核实", "考勤日明细不完整", "缺少日期：" + ", ".join(map(str, missing)))
         observed_work = sum(1 for entry in items if isinstance(entry, dict) and entry.get("status") == 1)
         source_days = record.get("source_actual_work_days")
         derived_days = record.get("derived_actual_work_days")
         if source_days is not None and _decimal(source_days, "SOURCE_WORK_DAYS") != Decimal(observed_work):
-            rows.append([record.get("name_snapshot") or "", "待核实", "印刷出勤与逐日观察不一致",
-                         f"来源印刷值为 {source_days}，逐日出勤标记计数为 {observed_work}；两项原始证据均予保留。"])
+            add(identity, name, "待核实", "印刷出勤与逐日观察不一致",
+                f"来源印刷值为 {source_days}，逐日出勤标记计数为 {observed_work}；两项原始证据均予保留。")
         if derived_days is not None and _decimal(derived_days, "DERIVED_WORK_DAYS") != Decimal(observed_work):
-            rows.append([record.get("name_snapshot") or "", "待核实", "派生出勤与逐日观察不一致",
-                         f"派生值为 {derived_days}，逐日出勤标记计数为 {observed_work}；未据此覆盖任一值。"])
+            add(identity, name, "待核实", "派生出勤与逐日观察不一致",
+                f"派生值为 {derived_days}，逐日出勤标记计数为 {observed_work}；未据此覆盖任一值。")
+    calc_name_by_id = {pid: item.get("name", "") for pid, item in calc_by_id.items()}
+    calc_id_by_roster = {item.get("roster_id"): pid for pid, item in calc_by_id.items()}
     if isinstance(issues, list):
-        for issue in issues:
+        for issue_index, issue in enumerate(issues):
             if isinstance(issue, dict):
-                rows.append([str(issue.get("name") or ""), "待处理", str(issue.get("code") or "核算事项"),
-                             str(issue.get("message") or issue.get("reason") or "Payroll 返回了需处理事项。")])
+                pid = issue.get("payroll_person_id")
+                roster_id = issue.get("roster_id")
+                if pid is None and roster_id in calc_id_by_roster:
+                    pid = calc_id_by_roster[roster_id]
+                if pid is not None:
+                    identity = f"payroll:{pid}"
+                elif roster_id is not None:
+                    identity = f"roster:{roster_id}"
+                else:
+                    identity = f"issue:{issue.get('code') or '核算事项'}:{issue_index}"
+                name = issue.get("name") or calc_name_by_id.get(pid, "")
+                category = str(issue.get("code") or "核算事项")
+                scope = str(issue.get("scope") or "")
+                message = str(issue.get("message") or issue.get("reason") or "Payroll 返回了需处理事项。")
+                issue_context = []
+                if scope:
+                    issue_context.append(f"范围：{scope}")
+                if roster_id is not None:
+                    issue_context.append(f"花名册ID：{roster_id}")
+                detail = "；".join([*issue_context, message])
+                add(identity, name, "待处理", category, detail)
             else:
-                rows.append(["", "待处理", "核算事项", str(issue)])
-    return rows
+                add("issue:核算事项", "", "待处理", "核算事项", str(issue))
+    return [[identity, entry["name"], entry["status"], category, "；".join(entry["details"])]
+            for (identity, category), entry in sorted(grouped.items())]
 
 
-def _build_rows(data: dict, gate_request: Path) -> tuple[str, list[list], list[list], list[list], list[list], list[list]]:
+def _build_rows(data: dict, gate_request: Path, source_people_by_record: dict[str, dict] | None = None
+                ) -> tuple[str, list[list], list[list], list[list], list[list], list[list]]:
     workflow = _obj(data.get("workflow_state"), "WORKFLOW_STATE")
     precheck = _obj(data.get("latest_precheck"), "LATEST_PRECHECK")
     snapshot = _obj(data.get("attendance_snapshot"), "ATTENDANCE_SNAPSHOT")
@@ -760,42 +866,133 @@ def _build_rows(data: dict, gate_request: Path) -> tuple[str, list[list], list[l
             part = comp[code]
             source_status = {True: "是", False: "否", None: "待核实"}[part["source_present"]]
             base_row.extend([_display_decimal(part["source_amount"]), source_status])
-            if part["source_present"] is not True:
-                label = "工资分项来源缺失" if part["source_present"] is False else "工资分项来源待核实"
-                reviews.append([name, "待核实", label, f"{COMPONENT_NAMES[code]}来源状态未能确认为存在；计算金额仍按 Payroll 返回结果展示。"])
+            calculated_amount = part["calculated_amount"]
+            source_amount = part["source_amount"]
+            if part["source_present"] is False and calculated_amount != 0:
+                reviews.append([f"payroll:{pid}", name, "待核实", "工资来源与计算金额不一致",
+                                f"{COMPONENT_NAMES[code]}无来源记录但计算金额为 {_display_decimal(calculated_amount)}；以 Payroll 原始结果为准，需核实。"])
+            elif part["source_present"] is None:
+                reviews.append([f"payroll:{pid}", name, "待核实", "工资分项来源状态未知",
+                                f"{COMPONENT_NAMES[code]}来源状态未知，来源金额为 {_display_decimal(source_amount)}，计算金额为 {_display_decimal(calculated_amount)}。"])
         baseline.append(base_row)
         if historical is not None:
             history.append([name, project, company, position, history_month, _display_decimal(historical),
                             _display_decimal(gross), _display_decimal(difference)])
         else:
-            reviews.append([name, "待核实", "历史工资来源缺失", "Payroll 核算结果未提供历史工资来源记录，未生成历史差额。"])
+            reviews.append([f"payroll:{pid}", name, "待核实", "历史工资来源缺失", "Payroll 核算结果未提供历史工资来源记录，未生成历史差额。"])
     # Preserve every attendance fact, including people not included in Payroll calculation.
-    for source_raw in attendance:
+    for source_raw in sorted(attendance, key=lambda item: str(item.get("record_id", ""))):
         source = _obj(source_raw, "ATTENDANCE_RECORD")
         pid = source.get("payroll_person_id")
         name, project, company, position, employee_type = _attrs(source)
+        record_id = source.get("record_id")
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise ExportError("ATTENDANCE_RECORD_ID_INVALID")
+        by_day = {}
         for day_item_raw in source["items"]:
             day_item = _obj(day_item_raw, "ATTENDANCE_DAY")
             day = _int(day_item.get("day"), "ATTENDANCE_DAY", 1)
             if day > calendar.monthrange(int(month[:4]), int(month[5:]))[1]:
                 raise ExportError("ATTENDANCE_DAY_OUT_OF_MONTH")
-            status = _int(day_item.get("status"), "ATTENDANCE_STATUS", 1)
+            if day in by_day:
+                raise ExportError("ATTENDANCE_DAY_DUPLICATE")
+            status = day_item.get("status")
+            if status is not None:
+                status = _int(status, "ATTENDANCE_STATUS", 1)
+                if status not in DAY_STATUS:
+                    raise ExportError("ATTENDANCE_STATUS_UNKNOWN")
+            by_day[day] = day_item
+        days_in_month = calendar.monthrange(int(month[:4]), int(month[5:]))[1]
+        if set(by_day) != set(range(1, days_in_month + 1)):
+            raise ExportError("ATTENDANCE_SOURCE_DAILY_INCOMPLETE")
+        row = [name, record_id, project, company, position, employee_type,
+               source.get("source_actual_work_days"), source.get("derived_actual_work_days"),
+               source.get("confirmed_actual_work_days"), source.get("personal_leave_days"),
+               source.get("sick_leave_days"), source.get("absent_days"),
+               RECONCILIATION.get(source.get("reconciliation_status"), "待核实"), source.get("remark")]
+        source_person = (source_people_by_record or {}).get(record_id)
+        source_day_by_day = {
+            source_item["day"]: source_item
+            for source_item in source_person.get("daily", [])
+            if isinstance(source_item, dict) and type(source_item.get("day")) is int
+        } if source_person is not None else {}
+        for day in range(1, days_in_month + 1):
+            item = by_day[day]
+            source_day = source_day_by_day.get(day)
+            source_status = _effective_attendance_status(source_day) if source_day is not None else None
+            out_of_scope = pid is None or pid not in calc_by_id
+            if (out_of_scope and source_status is not None
+                    and source_status not in ATTENDANCE_STATUS_TO_PAYROLL):
+                label = UNMAPPED_SOURCE_STATUS_LABELS.get(source_status, "未映射")
+                value_raw = source_day.get("value")
+                raw_mark = source_day.get("raw_mark")
+                value = "（空）" if value_raw is None else str(value_raw)
+                mark = "（空）" if raw_mark is None else str(raw_mark)
+                row.append(f"待核实（来源状态：{label}）\n值：{value}\n原始：{mark}")
+                continue
+            status = _int(item.get("status"), "ATTENDANCE_STATUS", 1)
             if status not in DAY_STATUS:
                 raise ExportError("ATTENDANCE_STATUS_UNKNOWN")
-            attendance_rows.append([name, project, company, position, employee_type,
-                                    source.get("source_actual_work_days"), source.get("derived_actual_work_days"),
-                                    source.get("confirmed_actual_work_days"), source.get("personal_leave_days"),
-                                    source.get("sick_leave_days"), source.get("absent_days"),
-                                    RECONCILIATION.get(source.get("reconciliation_status"), "待核实"),
-                                    source.get("remark"), day, DAY_STATUS[status], day_item.get("value"), day_item.get("raw_value")])
+            value = "（空）" if item.get("value") is None else str(item.get("value"))
+            raw_mark = "（空）" if item.get("raw_value") is None else str(item.get("raw_value"))
+            row.append(f"{DAY_STATUS[status]}\n值：{value}\n原始：{raw_mark}")
+        attendance_rows.append(row)
     reviews.extend(_review_items(attendance, calc_by_id, month, calc.get("issues")))
+    if source_people_by_record:
+        snapshot_by_record = {record["record_id"]: record for record in attendance}
+        for record_id, source_person in source_people_by_record.items():
+            source_record = snapshot_by_record[record_id]
+            pid = source_record.get("payroll_person_id")
+            if pid is not None and pid in calc_by_id:
+                continue
+            name = source_record.get("name_snapshot") or source_person.get("name") or ""
+            for item in source_person.get("daily", []):
+                if not isinstance(item, dict):
+                    continue
+                status = _effective_attendance_status(item)
+                if status in ATTENDANCE_STATUS_TO_PAYROLL:
+                    continue
+                label = UNMAPPED_SOURCE_STATUS_LABELS.get(status, "未映射")
+                reviews.append([
+                    f"record:{record_id}", name, "待核实", "核算范围外考勤状态待核实",
+                    f"{int(item['day'])}日来源状态为{label}，未映射为 Payroll 日状态；原始标记：{item.get('raw_mark') or '（空）'}。",
+                ])
+    # Component-level findings use the same stable identity + issue category aggregation.
+    if reviews:
+        grouped_reviews = {}
+        for identity, name, status, category, detail_text in reviews:
+            key = (str(identity), str(category))
+            group = grouped_reviews.setdefault(key, {"name": name, "status": status, "details": []})
+            if detail_text not in group["details"]:
+                group["details"].append(detail_text)
+        reviews = []
+        for (identity, category), group in sorted(grouped_reviews.items()):
+            if identity.startswith("payroll:"):
+                trace = f"Payroll Person ID {identity.split(':', 1)[1]}"
+            elif identity.startswith("record:"):
+                trace = f"考勤记录ID {identity.split(':', 1)[1]}"
+            elif identity.startswith("roster:"):
+                trace = f"花名册ID {identity.split(':', 1)[1]}"
+            else:
+                trace = ""
+            detail_text = "；".join(group["details"])
+            if trace:
+                detail_text = f"追溯标识：{trace}；{detail_text}"
+            reviews.append([group["name"], group["status"], category, detail_text])
     if not reviews:
         reviews = [[None, "已完成", "无待处理事项", "本次暂无待处理事项"]]
     return month, detail, baseline, attendance_rows, history, reviews
 
 
-def _style_sheet(ws, name: str, subtitle: str, rows: list[list]) -> None:
-    headers = SHEETS[name]
+def _sheet_headers(name: str, month: str) -> list[str]:
+    if name != "考勤汇总":
+        return SHEETS[name]
+    days = calendar.monthrange(int(month[:4]), int(month[5:]))[1]
+    return [*SHEETS[name], *[f"{day}日" for day in range(1, days + 1)]]
+
+
+def _style_sheet(ws, name: str, subtitle: str, rows: list[list], month: str) -> None:
+    headers = _sheet_headers(name, month)
     last_col = len(headers)
     ws.append([name])
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
@@ -820,9 +1017,10 @@ def _style_sheet(ws, name: str, subtitle: str, rows: list[list]) -> None:
     ws.row_dimensions[1].height = 25
     ws.row_dimensions[2].height = 30
     ws.row_dimensions[3].height = 30
-    ws.freeze_panes = "A4"
+    ws.freeze_panes = "O4" if name == "考勤汇总" else "A4"
     ws.auto_filter.ref = f"A3:{get_column_letter(last_col)}{max(3, ws.max_row)}"
-    for col, width in enumerate(WIDTHS[name], start=1):
+    widths = [*WIDTHS[name], *([8] * (last_col - len(WIDTHS[name])))]
+    for col, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
     if name == "工资核算明细":
         for row in range(4, ws.max_row + 1):
@@ -840,8 +1038,14 @@ def _style_sheet(ws, name: str, subtitle: str, rows: list[list]) -> None:
                 ws.cell(row, col).number_format = MONEY_FMT
     elif name == "考勤汇总":
         for row in range(4, ws.max_row + 1):
-            for col in range(6, 12):
+            for col in range(7, 13):
                 ws.cell(row, col).number_format = DAYS_FMT
+            for col in range(15, last_col + 1):
+                ws.cell(row, col).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            ws.row_dimensions[row].height = 42
+    elif name == "人工复核事项":
+        for row in range(4, ws.max_row + 1):
+            ws.cell(row, 4).alignment = Alignment(vertical="top", wrap_text=True)
 
 
 def export(input_path: Path, gate_path: Path, output_path: Path, calculation_response_path: Path,
@@ -853,22 +1057,25 @@ def export(input_path: Path, gate_path: Path, output_path: Path, calculation_res
     if not output_path.parent.is_dir():
         raise ExportError("OUTPUT_PARENT_MISSING")
     data = _read(input_path, "INPUT")
-    _validate_source_bindings(data, gate_path, calculation_response_path, person_matches_path, submission_request_path)
-    month, detail, baseline, attendance, history, reviews = _build_rows(data, gate_path)
+    source_people_by_record = _validate_source_bindings(
+        data, gate_path, calculation_response_path, person_matches_path, submission_request_path,
+    )
+    month, detail, baseline, attendance, history, reviews = _build_rows(data, gate_path, source_people_by_record)
     wb = Workbook()
     wb.remove(wb.active)
     row_sets = (detail, baseline, attendance, history, reviews)
     for (name, _), rows in zip(SHEETS.items(), row_sets):
         ws = wb.create_sheet(name)
         count = len(detail)
-        _style_sheet(ws, name, f"{month}工资核算成功，共核算 {count} 人。", rows)
+        _style_sheet(ws, name, f"{month}工资核算成功，共核算 {count} 人。", rows, month)
     fd, temp_name = tempfile.mkstemp(prefix=f".{output_path.stem}-", suffix=".xlsx", dir=output_path.parent)
     os.close(fd)
     temp_path = Path(temp_name)
     try:
         wb.save(temp_path)
         check = load_workbook(temp_path, read_only=False, data_only=False)
-        if check.sheetnames != list(SHEETS) or any(check[name].max_column != len(headers) for name, headers in SHEETS.items()):
+        if check.sheetnames != list(SHEETS) or any(check[name].max_column != len(_sheet_headers(name, month))
+                                                   for name in SHEETS):
             raise ExportError("OUTPUT_VALIDATION_FAILED")
         if any(cell.data_type == "f" for ws in check.worksheets for row in ws.iter_rows() for cell in row):
             raise ExportError("UNEXPECTED_FORMULA")
@@ -882,7 +1089,8 @@ def export(input_path: Path, gate_path: Path, output_path: Path, calculation_res
         if temp_path.exists():
             temp_path.unlink()
     return {"ok": True, "status": "EXPORTED", "path": str(output_path.resolve()), "month": month,
-            "calculated_people": len(detail), "attendance_day_rows": len(attendance),
+            "calculated_people": len(detail), "attendance_people_rows": len(attendance),
+            "attendance_day_rows": sum(len(record.get("items", [])) for record in data["attendance_snapshot"]["records"]),
             "review_items": 0 if reviews == [[None, "已完成", "无待处理事项", "本次暂无待处理事项"]] else len(reviews)}
 
 

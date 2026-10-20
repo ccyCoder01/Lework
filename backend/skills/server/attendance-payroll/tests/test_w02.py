@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -23,14 +24,41 @@ def dataset(*people):
     return {"schema_version": 1, "month": "2026-06", "people": list(people)}
 
 
-def test_export_has_fixed_six_columns_and_no_daily_matrix(tmp_path):
-    text, report = render(dataset(person()))
+def test_export_keeps_six_column_summary_without_daily_detail():
+    first = person()
+    first["daily"][0].update({"user_confirmed_status": "rest", "user_confirmed_mark": "用户确认休息", "value": 0})
+    second = person("doc-1-p1-r2", "张三")
+    text, report = render(dataset(first, second))
     assert "| 序号 | 姓名 | 岗位 | 实际出勤 | 缺勤合计 | 备注 |" in text
-    assert "每日明细" not in text
-    assert "1–30日" not in text and "1–15日" not in text and "16–30日" not in text
+    assert "逐日考勤明细" not in text
+    assert "原始标记" not in text
+    assert text.count("| 1 | 张三 | 施工员 |") == 1
+    assert text.count("| 2 | 张三 | 施工员 |") == 1
     row = next(line for line in text.splitlines() if line.startswith("| 1 |"))
     assert len(row.split("|")[1:-1]) == 6
-    assert report["people_count"] == 1
+    assert report["people_count"] == 2
+
+
+def test_daily_facts_remain_in_source_and_missing_date_issue_remains_in_summary():
+    item = person()
+    item["daily"] = [row for row in item["daily"] if row["day"] != 2]
+    text, report = render(dataset(item))
+    assert "逐日考勤明细" not in text
+    assert any(issue["reason"] == "日期缺失" for issue in report["issues"])
+    assert "日期缺失" in text
+    assert len(item["daily"]) == 29
+
+
+@pytest.mark.parametrize("count", [33, 42])
+def test_offline_summary_has_one_row_per_attendance_record_and_keeps_anomalies(count):
+    people = [person(f"doc-1-p1-r{i + 1}", f"人员{i + 1}") for i in range(count)]
+    people[-1]["daily"] = [item for item in people[-1]["daily"] if item["day"] != 2]
+    text, report = render(dataset(*people))
+
+    assert "逐日考勤明细" not in text
+    assert text.count("| 施工员 |") == count
+    assert report["people_count"] == count
+    assert "日期缺失" in text
 
 
 def test_page_warnings_survive_into_export():
@@ -55,6 +83,28 @@ def test_single_daily_and_confirmed_total_updates_recalculate(tmp_path):
     report = analyze(updated)
     assert report["stats"]["doc-1-p1-r1"]["actual_work_days"] == 24
     assert any(issue["reason"] == "印刷出勤与逐日统计不一致" for issue in report["issues"])
+
+
+def test_controlled_correction_changes_work_file_digest_without_replacing_source_mark(tmp_path):
+    data_path = tmp_path / "attendance.json"
+    request_path = tmp_path / "correction.json"
+    data_path.write_text(json.dumps(dataset(person()), ensure_ascii=False), encoding="utf-8")
+    before = hashlib.sha256(data_path.read_bytes()).hexdigest()
+    request_path.write_text(json.dumps({"operations": [{
+        "op": "set_daily_status", "record_id": "doc-1-p1-r1", "day": 1,
+        "status": "rest", "confirmed_mark": "用户确认休息",
+    }]}, ensure_ascii=False), encoding="utf-8")
+
+    apply_file(data_path, request_path)
+    after = hashlib.sha256(data_path.read_bytes()).hexdigest()
+    updated = json.loads(data_path.read_text(encoding="utf-8"))
+    day = updated["people"][0]["daily"][0]
+
+    assert after != before
+    assert day["raw_mark"] == "8"
+    assert day["status"] == "work"
+    assert day["user_confirmed_status"] == "rest"
+    assert day["user_confirmed_mark"] == "用户确认休息"
 
 
 def test_batch_update_is_all_or_nothing(tmp_path):

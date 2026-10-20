@@ -29,6 +29,27 @@ PEOPLE = [
 BATCH = "task_A12-2026-06"
 
 
+def _operation_state(submission: str, calculation: str, scope: dict = SCOPE, batch_id: str = BATCH,
+                     payroll_person_ids: list[int] | None = None):
+    payroll_person_ids = payroll_person_ids or [1, 2]
+
+    def item(kind: str, status: str):
+        operation = {"operation_id": f"{kind}:{batch_id}", "status": status}
+        if status == "SUCCEEDED":
+            operation.update({key: scope[key] for key in ("month", "attendance_sha256", "record_ids")})
+            operation["payroll_person_ids"] = payroll_person_ids
+        return operation
+
+    return {
+        "status": "VERIFIED", "task_id": "task_A12", "batch_id": batch_id,
+        "month": scope["month"],
+        "operations": {
+            "submission": item("submit", submission),
+            "calculation": item("calculate", calculation),
+        },
+    }
+
+
 def _evidence():
     return {
         "attendance_path": str(TEST_ATTENDANCE_PATH),
@@ -43,7 +64,7 @@ def _evidence():
         },
         "batch_context": {
             "status": "VERIFIED_NO_CONFLICT", "task_id": "task_A12", "batch_id": BATCH,
-            "operation_id": f"submit:{BATCH}", **SCOPE,
+            "operation_id": f"submit:{BATCH}", **SCOPE, "payroll_person_ids": [1, 2],
         },
         "submission_receipt": {
             "status": "SUCCEEDED", **SCOPE, "batch_id": BATCH, "operation_id": f"submit:{BATCH}",
@@ -55,11 +76,17 @@ def _evidence():
         "calculation_receipt": {
             "status": "SUCCEEDED", **SCOPE, "batch_id": BATCH, "operation_id": f"calculate:{BATCH}",
         },
+        "payroll_operation_state": _operation_state("SUCCEEDED", "SUCCEEDED"),
     }
 
 
 def _request(action: str, message: str, *prior: str):
-    return {"action": action, "user_messages": [*prior, message], "evidence": _evidence(),
+    evidence = _evidence()
+    if action == "ATTENDANCE_SUBMISSION":
+        evidence["payroll_operation_state"] = _operation_state("NOT_FOUND", "NOT_FOUND")
+    elif action in {"PAYROLL_PRECHECK", "PAYROLL_CALCULATION"}:
+        evidence["payroll_operation_state"] = _operation_state("SUCCEEDED", "NOT_FOUND")
+    return {"action": action, "user_messages": [*prior, message], "evidence": evidence,
             "expected_submit_operation_id": f"submit:{BATCH}",
             "expected_precheck_operation_id": f"precheck:{BATCH}",
             "expected_calculate_operation_id": f"calculate:{BATCH}"}
@@ -112,6 +139,25 @@ def test_cross_turn_identity_matching_uses_prior_confirmation_bound_to_current_r
     assert result["ok"] is True
     assert result["attendance_confirmation_evidence"]["confirmation_message_index"] == 1
     assert result["message_source_verified"] is False
+
+
+def test_reconfirmed_corrected_review_can_reenter_readonly_identity_matching(tmp_path: Path):
+    request = _request(
+        "IDENTITY_MATCHING", "现在开始匹配人员", "请识别考勤并在我确认后匹配人员。", "确认考勤",
+    )
+    attendance_path = tmp_path / "attendance.json"
+    attendance_path.write_text('{"synthetic":"corrected-attendance"}\n', encoding="utf-8")
+    scope = {**SCOPE, "version": "review-v6",
+             "attendance_sha256": hashlib.sha256(attendance_path.read_bytes()).hexdigest()}
+    request["evidence"]["attendance_path"] = str(attendance_path)
+    request["evidence"]["attendance_review"].update(scope)
+    request["evidence"]["attendance_confirmation"] = {
+        "status": "CONFIRMED_FOR_CURRENT_REVIEW", **scope, "confirmation_message_index": 1,
+    }
+
+    result = workflow_gate.evaluate(request)
+    assert result["ok"] is True
+    assert result["attendance_confirmation_evidence"]["attendance_sha256"] == scope["attendance_sha256"]
 
 
 def test_cross_turn_salary_readiness_uses_prior_confirmation_and_completed_identity():
@@ -241,6 +287,89 @@ def test_exact_submission_intent_is_bound_to_month_version_and_people():
     assert result["authorization_text_checked"] is True
 
 
+def test_payroll_write_stages_fail_closed_when_operation_state_is_missing_or_unknown():
+    request = _execution_request(2, 2, 2)
+    request["evidence"].pop("payroll_operation_state")
+    assert workflow_gate.evaluate(request)["error"] == "PAYROLL_OPERATION_STATE_UNVERIFIED"
+
+    request = _execution_request(2, 2, 2)
+    request["evidence"]["payroll_operation_state"]["operations"]["submission"]["status"] = "UNKNOWN"
+    assert workflow_gate.evaluate(request)["error"] == "PAYROLL_OPERATION_STATE_UNVERIFIED"
+
+
+def test_changed_review_is_blocked_when_fixed_submit_operation_has_old_receipt():
+    request = _request("ATTENDANCE_SUBMISSION", _auth_text("授权正式提交考勤"),
+                       "本次处理范围为2026-06版本review-v5的安娜和李明。")
+    state = request["evidence"]["payroll_operation_state"]
+    state["operations"]["submission"] = _operation_state(
+        "SUCCEEDED", "NOT_FOUND", {**SCOPE, "attendance_sha256": "f" * 64},
+    )["operations"]["submission"]
+    result = workflow_gate.evaluate(request)
+    assert result["ok"] is False
+    assert result["error"] == "ATTENDANCE_CORRECTION_AFTER_SUBMISSION_BLOCKED"
+
+
+def test_changed_review_is_blocked_when_fixed_calculation_operation_has_old_result():
+    request = _request("PAYROLL_CALCULATION", _auth_text("授权工资核算"))
+    state = request["evidence"]["payroll_operation_state"]
+    state["operations"]["calculation"] = _operation_state(
+        "SUCCEEDED", "SUCCEEDED", {**SCOPE, "attendance_sha256": "f" * 64},
+    )["operations"]["calculation"]
+    result = workflow_gate.evaluate(request)
+    assert result["ok"] is False
+    assert result["error"] == "ATTENDANCE_CORRECTION_AFTER_CALCULATION_BLOCKED"
+
+
+def test_same_scope_calculation_receipt_prevents_calculate_replay():
+    request = _request("PAYROLL_CALCULATION", _auth_text("授权工资核算"))
+    request["evidence"]["payroll_operation_state"] = _operation_state("SUCCEEDED", "SUCCEEDED")
+    result = workflow_gate.evaluate(request)
+    assert result["ok"] is False
+    assert result["error"] == "PAYROLL_CALCULATION_ALREADY_EXISTS"
+
+
+def test_prior_submission_or_calculation_blocks_new_execution_authorization():
+    request = _execution_request(2, 2, 2)
+    state = request["evidence"]["payroll_operation_state"]
+    pids = request["evidence"]["batch_context"]["payroll_person_ids"]
+    state["operations"]["submission"] = _operation_state(
+        "SUCCEEDED", "NOT_FOUND", {**request["evidence"]["execution_scope"],
+                                    "attendance_sha256": "f" * 64},
+        payroll_person_ids=pids,
+    )["operations"]["submission"]
+    assert workflow_gate.evaluate(request)["error"] == "ATTENDANCE_CORRECTION_AFTER_SUBMISSION_BLOCKED"
+
+    request = _execution_request(2, 2, 2)
+    state = request["evidence"]["payroll_operation_state"]
+    pids = request["evidence"]["batch_context"]["payroll_person_ids"]
+    state["operations"]["calculation"] = _operation_state(
+        "NOT_FOUND", "SUCCEEDED", {**request["evidence"]["execution_scope"],
+                                    "attendance_sha256": "f" * 64},
+        payroll_person_ids=pids,
+    )["operations"]["calculation"]
+    assert workflow_gate.evaluate(request)["error"] == "ATTENDANCE_CORRECTION_AFTER_CALCULATION_BLOCKED"
+
+
+def test_precheck_cannot_reuse_submission_receipt_from_another_attendance_sha():
+    request = _request("PAYROLL_PRECHECK", "开始正式预检查")
+    request["evidence"]["payroll_operation_state"]["operations"]["submission"] = _operation_state(
+        "SUCCEEDED", "NOT_FOUND", {**SCOPE, "attendance_sha256": "f" * 64},
+    )["operations"]["submission"]
+    result = workflow_gate.evaluate(request)
+    assert result["ok"] is False
+    assert result["error"] == "ATTENDANCE_CORRECTION_AFTER_SUBMISSION_BLOCKED"
+
+
+def test_export_cannot_bind_old_calculation_to_current_attendance_review():
+    request = _request("PAYROLL_EXPORT", "交付工资核算表")
+    request["evidence"]["payroll_operation_state"]["operations"]["calculation"] = _operation_state(
+        "SUCCEEDED", "SUCCEEDED", {**SCOPE, "attendance_sha256": "f" * 64},
+    )["operations"]["calculation"]
+    result = workflow_gate.evaluate(request)
+    assert result["ok"] is False
+    assert result["error"] == "ATTENDANCE_CORRECTION_AFTER_CALCULATION_BLOCKED"
+
+
 def _execution_request(total: int, covered: int, matched: int | None = None, authorization: str | None = None):
     matched = matched if matched is not None else covered + 5
     work_dir = Path(TEST_ATTENDANCE_DIR.name) / ".attendance-work"
@@ -334,6 +463,14 @@ def _execution_request(total: int, covered: int, matched: int | None = None, aut
         "batch_context": {
             "status": "VERIFIED_NO_CONFLICT", "task_id": task_id, "batch_id": batch_id,
             "operation_id": f"submit:{batch_id}", **{**selected, "record_ids": record_ids},
+            "payroll_person_ids": default["payroll_person_ids"],
+        },
+        "payroll_operation_state": {
+            "status": "VERIFIED", "task_id": task_id, "batch_id": batch_id, "month": "2026-06",
+            "operations": {
+                "submission": {"operation_id": f"submit:{batch_id}", "status": "NOT_FOUND"},
+                "calculation": {"operation_id": f"calculate:{batch_id}", "status": "NOT_FOUND"},
+            },
         },
     }
     scope_sha = workflow_gate._scope_digest(
@@ -373,6 +510,72 @@ def _execution_request(total: int, covered: int, matched: int | None = None, aut
     }
 
 
+def _with_confirmed_conflict_exclusion(request: dict, record_index: int = 25) -> dict:
+    evidence = request["evidence"]
+    work_dir = Path(evidence["readiness_report_path"]).parent
+    identity_path = Path(evidence["person_matches_path"])
+    matches_data = json.loads(identity_path.read_text(encoding="utf-8"))
+    record_id = f"rec-{record_index:03d}"
+    match = next(row for row in matches_data["matches"] if row["record_id"] == record_id)
+    match["status"] = "ambiguous"
+    match["facts"] = {"name": f"人员{record_index:02d}"}
+    identity_raw = json.dumps(matches_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    identity_path.write_bytes(identity_raw)
+    identity_sha = hashlib.sha256(identity_raw).hexdigest()
+    evidence["identity_matching"]["person_matches_sha256"] = identity_sha
+    evidence["identity_matching"]["people"][record_index]["status"] = "ambiguous"
+    evidence["execution_scope"]["person_matches_sha256"] = identity_sha
+    evidence["batch_context"]["person_matches_sha256"] = identity_sha
+
+    report = payroll_readiness.build_report(
+        str(work_dir / "attendance.json"), str(identity_path), "2026-06", str(work_dir / "mcp-response.json"),
+    )
+    Path(evidence["readiness_report_path"]).write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    evidence["salary_readiness"].update({
+        "person_matches_sha256": identity_sha,
+        "normalized_response_sha256": report["normalized_response_sha256"],
+        "items": report["items"], "counts": report["counts"],
+        "requested_payroll_person_ids": report["requested_payroll_person_ids"],
+        "payroll_response_summary": report["payroll_response_summary"],
+    })
+
+    user_text = f"人员{record_index:02d}暂不纳入本次工资核算"
+    reason = "同名候选存在跨项目冲突"
+    conversation = request["conversation_messages"]
+    old_display = conversation[3]["content"]
+    old_display = old_display.replace(
+        f"人员{record_index:02d}：身份待核实",
+        f"人员{record_index:02d}：用户确认本次暂不纳入：{reason}",
+    )
+    conversation[3:3] = [
+        {"role": "assistant", "content": "人员身份存在待核实事项。"},
+        {"role": "user", "content": user_text},
+    ]
+    conversation[5]["content"] = old_display
+    conversation[6]["content"] = f"按刚才展示的20人开始工资核算。"
+    request["user_messages"] = [item["content"] for item in conversation if item["role"] == "user"]
+
+    scope = evidence["execution_scope"]
+    decision = {
+        "record_id": record_id, "name": f"人员{record_index:02d}", "reason": reason,
+        "month": scope["month"], "version": scope["version"],
+        "attendance_sha256": scope["attendance_sha256"], "person_matches_sha256": identity_sha,
+        "confirmation_message_index": 4,
+        "confirmation_message_sha256": workflow_gate._text_sha256(user_text),
+        "message_source_verified": False,
+    }
+    evidence["scope_exclusion_decisions"] = [decision]
+    canonical_decisions = json.dumps([decision], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    exclusions_sha = workflow_gate._text_sha256(canonical_decisions)
+    readiness_sha = report["normalized_response_sha256"]
+    scope_sha = workflow_gate._scope_digest(
+        scope, identity_sha, scope["payroll_person_ids"], readiness_sha, exclusions_sha,
+    )
+    conversation[5]["content"] = old_display
+    evidence["scope_display"] = {"message_index": 5, "scope_sha256": scope_sha}
+    return request
+
+
 @pytest.mark.parametrize(("total", "matched", "covered"), [(33, 25, 20), (42, 39, 31)])
 def test_one_execution_authorization_binds_default_covered_scope(total: int, matched: int, covered: int):
     request = _execution_request(total, covered, matched)
@@ -389,6 +592,92 @@ def test_one_execution_authorization_binds_default_covered_scope(total: int, mat
     assert token["payroll_response_sha256_verified"] is False
     assert token["raw_payroll_response_authenticity_verified"] is False
     assert result["next_action"] == "RECHECK_COVERAGE_AND_BATCH_THEN_SUBMIT_SAME_SCOPE"
+
+
+def test_user_confirmed_conflict_exclusion_keeps_identity_ambiguous_and_allows_other_covered_people():
+    request = _with_confirmed_conflict_exclusion(_execution_request(33, 20, 25))
+
+    result = workflow_gate.evaluate(request)
+
+    assert result["ok"] is True
+    assert result["execution_authorization"]["record_ids"] == [f"rec-{i:03d}" for i in range(20)]
+    assert result["execution_authorization"]["scope_exclusion_decisions"][0]["record_id"] == "rec-025"
+    assert request["evidence"]["identity_matching"]["people"][25]["status"] == "ambiguous"
+    assert request["evidence"]["scope_exclusion_decisions"][0]["message_source_verified"] is False
+
+
+def test_scope_display_accepts_punctuation_variants_but_preserves_exact_people_set():
+    request = _execution_request(33, 20, 25)
+    display = request["conversation_messages"][3]["content"]
+    display = display.replace("工资核算范围：", "工资核算范围:")
+    display = display.replace("，共20人", ", 共 20 人")
+    display = display.replace("纳入：", "纳入:").replace("、", ",")
+    display = display.replace("排除事项：", "排除事项:")
+    request["conversation_messages"][3]["content"] = display
+    result = workflow_gate.evaluate(request)
+    assert result["ok"] is True
+
+    request = _execution_request(33, 20, 25)
+    request["conversation_messages"][3]["content"] = request["conversation_messages"][3]["content"].replace(
+        "人员19。排除事项：", "人员19、外部人员。排除事项：",
+    )
+    result = workflow_gate.evaluate(request)
+    assert result["ok"] is False
+    assert result["error"] == "EXECUTION_SCOPE_DISPLAY_PEOPLE_INCOMPLETE"
+
+
+def test_conflicting_identity_without_explicit_exclusion_is_blocked():
+    request = _execution_request(33, 20, 25)
+    request = _with_confirmed_conflict_exclusion(request)
+    request["evidence"].pop("scope_exclusion_decisions")
+
+    result = workflow_gate.evaluate(request)
+
+    assert result["ok"] is False
+    assert result["error"] == "UNRESOLVED_IDENTITY_CONFLICT"
+
+
+def test_exclusion_decision_change_invalidates_already_issued_execution_authorization():
+    request = _with_confirmed_conflict_exclusion(_execution_request(33, 20, 25))
+    accepted = workflow_gate.evaluate(request)
+    assert accepted["ok"] is True
+    request["evidence"]["execution_authorization"] = accepted["execution_authorization"]
+    request["evidence"]["scope_exclusion_decisions"][0]["reason"] = "改成别的理由"
+    request["action"] = "ATTENDANCE_SUBMISSION"
+
+    result = workflow_gate.evaluate(request)
+
+    assert result["ok"] is False
+    assert result["error"] in {
+        "PAYROLL_EXECUTION_AUTHORIZATION_SCOPE_MISMATCH",
+        "EXECUTION_SCOPE_DISPLAY_EXCLUSIONS_INCOMPLETE",
+    }
+
+
+@pytest.mark.parametrize("mutation", ["stale_attendance", "stale_identity", "unrelated_message", "matched_record"])
+def test_scope_exclusion_decision_is_bound_to_current_user_and_identity_facts(mutation: str):
+    request = _with_confirmed_conflict_exclusion(_execution_request(33, 20, 25))
+    decision = request["evidence"]["scope_exclusion_decisions"][0]
+    if mutation == "stale_attendance":
+        decision["attendance_sha256"] = "f" * 64
+    elif mutation == "stale_identity":
+        decision["person_matches_sha256"] = "f" * 64
+    elif mutation == "unrelated_message":
+        request["conversation_messages"][4]["content"] = "我不确认排除人员25"
+        request["user_messages"][2] = request["conversation_messages"][4]["content"]
+        decision["confirmation_message_sha256"] = workflow_gate._text_sha256(
+            request["conversation_messages"][4]["content"]
+        )
+    else:
+        decision["record_id"] = "rec-000"
+
+    result = workflow_gate.evaluate(request)
+
+    assert result["ok"] is False
+    assert result["error"] in {
+        "SCOPE_EXCLUSION_DECISION_INVALID", "SCOPE_EXCLUSION_USER_CONFIRMATION_REQUIRED",
+        "EXECUTION_SCOPE_DISPLAY_BINDING_MISMATCH",
+    }
 
 
 @pytest.mark.parametrize("message", [
@@ -420,6 +709,75 @@ def test_one_shot_execution_rejects_natural_language_scope_changes(message: str)
 @pytest.mark.parametrize("name", ["增加", "排除", "替换", "张某"])
 def test_scope_change_detection_does_not_treat_names_or_plain_mentions_as_scope_edits(name: str):
     assert workflow_gate._scope_change_intent(f"按刚才展示的31人开始工资核算，人员包括{name}。") is False
+
+
+@pytest.mark.parametrize("message", [
+    "我同意按刚才展示的范围开始本次工资核算。",
+    "请按上面确认的范围执行工资核算。",
+    "按当前已展示人员进行工资核算。",
+    "确认本次范围，开始进行工资计算。",
+    "按上述人员核算2026-06工资。",
+])
+def test_execution_authorization_accepts_clear_natural_language_variants(message: str):
+    result = workflow_gate.evaluate(_execution_request(2, 2, 2, message))
+    assert result["ok"] is True
+
+
+@pytest.mark.parametrize("message", [
+    "按刚才展示的范围开始薪资核算。",
+    "按上述31人开始薪酬核算。",
+])
+def test_execution_authorization_accepts_salary_calculation_synonyms(message: str):
+    result = workflow_gate.evaluate(_execution_request(31, 31, 31, message))
+    assert result["ok"] is True
+
+
+@pytest.mark.parametrize("message", [
+    "可以开始薪资核算吗？",
+    "暂不开始薪资核算。",
+    "查看薪资表。",
+    "生成工资表。",
+    "开始薪资核算，把某人也算上。",
+])
+def test_execution_authorization_rejects_salary_synonym_non_authorization(message: str):
+    result = workflow_gate.evaluate(_execution_request(31, 31, 31, message))
+    assert result["ok"] is False
+
+
+@pytest.mark.parametrize("message", [
+    "请按刚才展示的人员开始工资核算，可以吗？",
+    "我同意按刚才展示的范围开始工资核算，但先不要提交。",
+    "我想问按刚才展示的范围是否开始工资核算。",
+])
+def test_execution_authorization_variants_still_reject_questions_and_negation(message: str):
+    result = workflow_gate.evaluate(_execution_request(2, 2, 2, message))
+    assert result["ok"] is False
+
+
+def test_standard_scope_display_contract_remains_bound_to_exact_people_and_effects():
+    request = _execution_request(2, 2, 2)
+    display_index = request["evidence"]["scope_display"]["message_index"]
+    display = request["conversation_messages"][display_index]["content"]
+    assert "工资核算范围" in display
+    assert "2026-06" in display and "2人" in display
+    assert all(person["name"] in display for person in request["evidence"]["execution_scope"]["people"])
+    assert "正式提交考勤" in display and "正式预检查" in display and "工资核算" in display
+
+
+@pytest.mark.parametrize(("replace", "expected_error"), [
+    ("工资核算范围", "EXECUTION_SCOPE_DISPLAY_MARKER_MISSING"),
+    ("纳入：", "EXECUTION_SCOPE_DISPLAY_SUMMARY_MISMATCH"),
+    ("排除事项：", "EXECUTION_SCOPE_DISPLAY_SUMMARY_MISMATCH"),
+])
+def test_scope_display_must_follow_one_canonical_contract(replace: str, expected_error: str):
+    request = _execution_request(2, 2, 2)
+    index = request["evidence"]["scope_display"]["message_index"]
+    request["conversation_messages"][index]["content"] = request["conversation_messages"][index]["content"].replace(
+        replace, "范围标题" if replace == "工资核算范围" else "名单：", 1,
+    )
+    result = workflow_gate.evaluate(request)
+    assert result["ok"] is False
+    assert result["error"] == expected_error
 
 
 def test_actual_readiness_report_is_revalidated_and_compared_to_request_evidence():
@@ -541,6 +899,15 @@ def test_one_execution_authorization_reuses_same_scope_through_submit_precheck_c
         "status": "SUCCEEDED", **{key: scope[key] for key in ("month", "version", "attendance_sha256", "record_ids")},
         "batch_id": batch_id, "operation_id": f"submit:{batch_id}",
     }
+    evidence["payroll_operation_state"] = {
+        **evidence["payroll_operation_state"],
+        "operations": {
+            "submission": _operation_state("SUCCEEDED", "NOT_FOUND", scope, batch_id,
+                                             evidence["execution_scope"]["payroll_person_ids"])["operations"]["submission"],
+            "calculation": _operation_state("SUCCEEDED", "NOT_FOUND", scope, batch_id,
+                                              evidence["execution_scope"]["payroll_person_ids"])["operations"]["calculation"],
+        },
+    }
     precheck = workflow_gate.evaluate({**request, "action": "PAYROLL_PRECHECK"})
     assert precheck["ok"] is True
     assert precheck["next_action"] == "RUN_PRECHECK_THEN_CALCULATE_SAME_SCOPE_IF_VALID"
@@ -649,6 +1016,11 @@ def test_execution_authorization_reaches_export_only_after_successful_same_scope
     evidence["calculation_receipt"] = {
         "status": "SUCCEEDED", **scope_fields, "batch_id": batch_id,
         "operation_id": f"calculate:{batch_id}",
+    }
+    evidence["payroll_operation_state"] = {
+        **evidence["payroll_operation_state"],
+        "operations": _operation_state("SUCCEEDED", "SUCCEEDED", scope, batch_id,
+                                         evidence["execution_scope"]["payroll_person_ids"])["operations"],
     }
     evidence["submission_scope_review"] = {
         "status": "EXECUTION_AUTHORIZED", **scope_fields,

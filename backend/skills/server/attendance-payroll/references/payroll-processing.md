@@ -4,7 +4,7 @@
 
 ## 阶段准入与停顿
 
-正常业务顺序为 `ATTENDANCE_REVIEW → IDENTITY_MATCHING → SALARY_READINESS → PAYROLL_EXECUTION → ATTENDANCE_SUBMISSION → PAYROLL_PRECHECK → PAYROLL_CALCULATION → PAYROLL_EXPORT`。首次考勤任务只交付 Markdown 核对表和简短中文摘要，然后停止；不得在聊天中输出完整人员表。跨轮次考勤确认仍绑定当前任务可见用户消息序号，以及确认后 Review 的月份、版本、`attendance.json` SHA-256 和人员范围；更正或 Review 版本/摘要改变后必须重新确认。人员匹配与只读工资覆盖检查继续按原指令意图推进。覆盖检查不是正式 Precheck 或写入授权。覆盖检查后，展示一次唯一默认可核算范围及所有排除原因，并说明将依次正式提交考勤、执行正式 Precheck、再核算；随后等待一次明确的工资核算执行授权。范围展示和执行授权不得由 Agent 自行伪造。
+正常业务顺序为 `ATTENDANCE_REVIEW → IDENTITY_MATCHING → SALARY_READINESS → PAYROLL_EXECUTION → ATTENDANCE_SUBMISSION → PAYROLL_PRECHECK → PAYROLL_CALCULATION → PAYROLL_EXPORT`。首次考勤任务只交付 Markdown 核对表和简短中文摘要，然后停止；不得在聊天中输出完整人员表。跨轮次考勤确认仍绑定当前任务可见用户消息序号，以及确认后 Review 的月份、版本、`attendance.json` SHA-256 和人员范围；更正或 Review 版本/摘要改变后必须重新确认。人员匹配与只读工资覆盖检查继续按原指令意图推进。覆盖检查不是正式 Precheck 或写入授权。覆盖检查后使用统一展示格式：标题“工资核算范围”，列明工资月份、“共 N 人”，用“纳入：”列出完整名单，用“排除事项：”列出每名未纳入人员及原因，并说明正式提交考勤、正式预检查和通过后工资核算的顺序；随后等待一次明确的工资核算执行授权。范围展示和执行授权不得由 Agent 自行伪造。
 
 一次性授权前必须提供实际 `.attendance-work/payroll-readiness.json` 路径。门禁限定报告为当前 `.attendance-work` 下的固定普通文件，并调用 `payroll_readiness.report_status()` 重新核对报告与当前 `attendance.json`、`person-matches.json`、月份及匹配人员范围；再将报告的逐人结果、状态计数、规范化响应摘要、请求人员集合和默认 `COVERED` 范围与门禁输入及展示范围逐项比较。报告缺失、损坏、不可用、过期、符号链接、范围/摘要冲突都失败关闭。正式提交前必须再次调用只读覆盖 MCP 并完成批次冲突和范围复核；不能只凭旧报告或旧授权提交。相同范围及相同覆盖响应内容可继续使用当前授权；若规范化覆盖响应或人员范围改变，必须重新展示并取得新的执行授权，不增加额外授权阶段。
 
@@ -22,15 +22,31 @@ python3 scripts/workflow_gate.py --request <workdir>/workflow-gate-request.json
 
 `action` 只能是上面的阶段名。正常一次性路径调用 `PAYROLL_EXECUTION`；旧独立授权模式仍可使用 `SUBMISSION_SCOPE_REVIEW`、`ATTENDANCE_SUBMISSION`、`PAYROLL_CALCULATION`。各状态证据须提供一致的 `month`、`version`、`attendance_sha256`、`record_ids`；涉及人员时提供按 `record_id` 对应的 `people`。一次性路径的 `identity_matching`、`salary_readiness`、`execution_scope` 和 `batch_context` 必须互相一致；覆盖结果需带 `normalized_response_sha256`，以便重查后确认响应内容未变。`scope_display` 指向授权前的最新范围展示消息，并附同一范围摘要。准入输出的 `execution_authorization` 只用于后续同一请求链的本地一致性复核，不保存到业务授权系统。缺少任一证据、证据范围不一致或批次冲突都停止。
 
+### 更正后的安全重入
+
+受控考勤更正只修改当前 `attendance.json`；原始 PDF、页级 JSON、每日 `raw_mark` 和原始识别状态保持不变。更正后重新运行核对、导出并声明新的本地考勤 Review。以 `attendance.json` 当前 SHA-256 作为事实版本；当前 Skill 没有独立持久化 Generation。Review 的 `version` 字符串仅作关联标签，不能替代内容摘要。SHA 改变后，旧 Gate 1 确认、Identity、Salary Readiness、一次性 `PAYROLL_EXECUTION` 授权及旧 Precheck/核算证据均不得用于新版；重新确认后，依次重建身份映射、覆盖报告、范围展示和执行授权。
+
+正式执行前，使用 `task_context.py` 从当前 Runtime Task 路径派生的固定 Batch/Operation ID，分别只读调用 `get_attendance_submission(operation_id=submit:<batch_id>)` 和 `get_payroll_calculation(operation_id=calculate:<batch_id>)`。将实际结果规范为 `evidence.payroll_operation_state`：外层必须为 `status=VERIFIED`，并包含当前 `task_id`、`batch_id`、`month`；`operations.submission` 与 `operations.calculation` 各含固定 `operation_id` 和 `status`（仅接受 `NOT_FOUND` 或 `SUCCEEDED`）。`SUCCEEDED` 项还须带 `month`、`attendance_sha256`、稳定 `record_ids` 及精确 `payroll_person_ids`；这些范围必须从保留的原始提交请求/核算结果及其绑定 Review 核对，不能用当前值覆盖旧值。门禁会将它们与本次固定范围比对。查询失败、结果不完整、范围不一致或无法取得原始来源时，状态为未知并停止，禁止声明 `VERIFIED`。
+
+`PAYROLL_EXECUTION` 和 `ATTENDANCE_SUBMISSION` 仅在两个固定操作均查明 `NOT_FOUND` 时允许首次写入；已有成功回执时禁止再次提交或新授权重跑。`PAYROLL_PRECHECK` 必须对应当前 SHA 和范围的成功提交，并确认尚无已成功核算；`PAYROLL_CALCULATION` 必须对应当前成功提交和正式有效 Precheck，且固定计算操作当前为 `NOT_FOUND`。已有核算成功时不再计算；只有当前版本与原成功结果完全一致，才可走既有导出/声明路径。旧提交/核算的 SHA 或人员范围与当前 Review 不同，返回阻断，不以旧回执充当新版成功。
+
+这两个 MCP 查询只按给定 Operation ID 查单个操作，不能列举该月份所有 Task/Batch，也不能证明另一个 Task 没有提交。Payroll 当前没有已核实的修订、撤销、替代或冲销流程。因此，新 Task ID 或 `VERIFIED_NO_CONFLICT` 的本地标记本身不是月度历史无冲突证明；若无法核实跨 Task/Batch 影响，仍须停止正式写入。此处 `payroll_operation_state` 是本地结构校验输入，不认证 MCP 来源、Runtime 对话或授权，也不是服务端强制门禁。
+
+对业务用户只需说明：已有正式考勤或核算记录，当前考勤更正尚未同步到 Payroll；系统没有可核实的安全修订/冲销流程，因此已停止正式提交或重算。不要向用户要求 Task ID、Batch ID、SHA 或脚本错误码。
+
 ### 一次性工资核算执行授权（F3.2）
 
-正常路径将范围展示和两个独立写授权收敛为一次业务授权。调用 `PAYROLL_EXECUTION` 前，必须有当前有效考勤确认、完成的身份映射、有效历史工资覆盖报告、无身份歧义、唯一的 `matched + COVERED` 默认范围，以及已通过只读核验的固定批次上下文。向用户展示月份、准确人数和人员范围、所有被排除人员及原因，并明确说明后续将**正式提交考勤、执行正式预检查、通过后进行工资核算**。范围展示消息位置和其范围摘要随授权证据提交检查；授权消息必须晚于该展示，且有明确工资核算意图、无否定或疑问、没有与范围冲突的人数。
+正常路径将范围展示和两个独立写授权收敛为一次业务授权。调用 `PAYROLL_EXECUTION` 前，必须有当前有效考勤确认、身份映射、有效历史工资覆盖报告、唯一的 `matched + COVERED` 默认范围，以及已通过只读核验的固定批次上下文。所有 `ambiguous` / `pending_confirmation` 记录必须保持原身份状态；若用户决定某条仅暂不纳入本次核算，必须先有下述独立排除决定，否则仍阻断。向用户展示月份、准确纳入人员及所有排除人员和原因，并明确说明后续将**正式提交考勤、执行正式预检查、通过后进行工资核算**。范围展示消息位置和其范围摘要随授权证据提交检查；授权消息必须晚于该展示，且有明确工资核算意图、无否定或疑问、没有与范围冲突的人数。
 
-允许“按刚才展示的 31 人开始工资核算”或“确认本次 20 人范围，开始工资核算”。不要求复述姓名、版本、SHA 或批次标识。拒绝“确认考勤”“人员匹配完成”“查看工资表”“继续处理”“可以核算吗”“先别提交，开始算工资”及与展示人数冲突的表达。只含“按刚才展示的”而没有核算动作也不是授权。
+对仍为 `ambiguous` 或 `pending_confirmation` 的记录，用户可以明确决定该稳定 `record_id` 本次暂不纳入。此决定是独立的 `evidence.scope_exclusion_decisions`，不得写入或伪装成 `person-matches.json` 的身份状态。每项必须含 `record_id`、姓名、具体排除原因、当前月份、Review 版本、考勤 SHA、身份映射 SHA、`confirmation_message_index`、`confirmation_message_sha256`，并标记 `message_source_verified=false`。门禁核验确认消息确实对应当前传入对话中的用户消息，提及该人员并明确表达本次不纳入；决策集合必须与全部 unresolved identity conflicts 一一对应。决策摘要绑定范围摘要和一次性授权；输入版本/映射、决定或授权范围变化都会使旧证据失效。没有确认、证据过期、目标不是未解决身份记录、或有其他未处理冲突时阻断。正常 `unmatched` 继续按既有规则列为身份待核并不进入匹配候选范围。
+
+该排除记录仅表示本地范围决定，不改变考勤或身份事实，不创建 Payroll 人员、不修改 Payroll 花名册，也不证明用户消息来源可信。Skills-only 门禁只能校验调用者提供的消息索引/内容摘要与当前会话文本一致；它不能认证 Runtime 消息，也不能阻止绕过脚本直接调用 MCP。对话来源无法核实则停止。
+
+允许“按刚才展示的 31 人开始工资核算”“确认本次 20 人范围，开始工资核算”“请按上面确认的范围执行工资核算”或“同意按当前已展示范围进行工资核算”等明确执行表达。门禁允许有限的“开始/启动/进行/执行 + 工资核算或工资计算”措辞变化；仍拒绝疑问、否定、范围变更、仅查看/生成表格、仅说“确认考勤”“人员匹配完成”或“继续处理”。不要求复述姓名、版本、SHA 或批次标识；只含“按刚才展示的”而没有核算动作也不是授权。
 
 准入器将授权绑定到月份、Review 版本和 SHA、身份映射 SHA、规范化历史覆盖响应 SHA、精确 `record_ids`、Payroll Person ID 集合、Task/Batch ID 和授权/范围展示消息序号。正式提交前必须重新调用历史覆盖只读 MCP，并重新只读核对已有批次。覆盖响应规范化 SHA、考勤/映射摘要、范围或批次任一变化都使旧授权失效，必须重新展示并取得新授权；不能用新 Batch ID 绕过已有范围。执行授权仍只是本地流程证据，不能认证用户消息，也不是 Payroll 回执。
 
-一次性授权仅在这些精确绑定的证据不变时允许顺序执行：先 `submit_attendance` 并核验真实成功回执；再对相同批次和完整范围执行正式 `precheck_payroll`；仅 `valid=true` 且无阻塞人员时才执行 `calculate_payroll`。结果不明先只读查询，禁止盲目重试；提交回执缺失/失败、Precheck 无效、范围漂移或远端状态无法核实时立即停止，不自动缩围。核算后仍走既有 `PAYROLL_EXPORT` 门禁及 F2.2 原始响应/考勤快照内容绑定检查。仅完整 SUCCESS 可正式导出。
+一次性授权仅在这些精确绑定的证据不变时允许顺序执行：先 `submit_attendance` 并核验真实成功回执；再对相同批次和完整范围执行正式 `precheck_payroll`；仅 `valid=true` 且无阻塞人员时才执行 `calculate_payroll`。结果不明先只读查询，禁止盲目重试；提交回执缺失/失败、Precheck 无效、范围漂移或远端状态无法核实时立即停止，不自动缩围。完整 `SUCCESS` 后，Agent 必须自动进入既有 `PAYROLL_EXPORT` 门禁、执行五 Sheet 导出和 Artifact 声明，不再询问用户是否生成工资表；这属于该一次性授权对应的正常交付步骤，不是额外写授权。导出仍须通过 F2.2 原始响应/考勤快照内容绑定检查。仅完整 SUCCESS 可正式导出。
 
 `PAYROLL_EXECUTION` 是正常流程的单次授权模式。旧版 `SUBMISSION_SCOPE_REVIEW → ATTENDANCE_SUBMISSION` 独立提交授权与独立 `PAYROLL_CALCULATION` 授权路径继续兼容；兼容旧模式时，仍需明确正式提交授权，并且必须另行确认用户明确要求开始工资核算，即另行明确授权工资核算。两种路径都不得跳过提交回执、正式 Precheck、固定批次和范围校验。两种授权模式不可混用；发现 execution token 时如果校验失败，必须阻断，不得退回旧路径。
 
@@ -62,7 +78,7 @@ python3 scripts/workflow_gate.py --request <workdir>/workflow-gate-request.json
 
    必须逐项核对月份、人员 ID 集合、人数、状态和计数。`COVERED` 必须有不晚于目标月的 `source_month`；其他状态不能携带来源月份。任何错误都失败关闭。报告状态检查会重新核对逐人明细、统计、身份映射和归一化响应摘要；原始 MCP 响应 SHA 只保留为原始文件的追溯摘要，因原始响应不随报告保存，状态检查不会重新验证其来源。归一化内容摘要用于发现报告内部未同步修改，不提供来源真实性或防恶意篡改保证。`COVERAGE_CHECKED` 仅表示本次历史覆盖响应结构完整且与本地范围一致，不代表用户授权、正式 Precheck 通过或远端数据当前仍未变化。报告不是提交回执或 Precheck Snapshot。输入损坏、报告无效或不可用状态均必须停止；若不可用状态无法写入，调用方仍须停止，不能沿用旧报告。输入数据变化后运行 `status` 会返回过期。每次正式提交前都必须重新调用 MCP 并覆盖该报告，因为远端历史工资导入不会改变本地 SHA；不得仅凭已有报告复用覆盖结论。
 
-   检查成功时 CLI 还会给出 `default_calculable_scope`：仅取身份状态为 `matched` 且工资历史为 `COVERED` 的记录，并列出稳定 `record_id`、精确 Payroll Person ID、考勤摘要及映射摘要。当前 Review 的版本号必须从已验证 Review 证据带入范围证据；范围与考勤摘要或身份映射摘要任一不一致都需重新检查。此范围只是候选范围，不是用户认可、提交授权或核算授权。`MISSING_HISTORY`、`AMBIGUOUS_HISTORY`、`UNKNOWN` 和身份未关联人员均保留在排除清单及原因中。若有身份冲突或待人工确认，先解决这些人员问题并重建映射，再确定最终范围；不可把暂时未匹配静默当作永久排除。结果包含重复姓名时以 `record_id` 和 Payroll Person ID 区分，不能按姓名去重。
+   检查成功时 CLI 还会给出 `default_calculable_scope`：仅取身份状态为 `matched` 且工资历史为 `COVERED` 的记录，并列出稳定 `record_id`、精确 Payroll Person ID、考勤摘要及映射摘要。当前 Review 的版本号必须从已验证 Review 证据带入范围证据；范围与考勤摘要或身份映射摘要任一不一致都需重新检查。此范围只是候选范围，不是用户认可、提交授权或核算授权。`MISSING_HISTORY`、`AMBIGUOUS_HISTORY`、`UNKNOWN` 和身份未关联人员均保留在排除清单及原因中。身份冲突不得自动排除；如用户明确决定某条歧义记录本次暂不纳入，按上文创建独立绑定证据，并在范围展示中列明人员和原因。其他 unresolved identity 仍阻断。结果包含重复姓名时以 `record_id` 和 Payroll Person ID 区分，不能按姓名去重。
 
    遇到 MCP 明确不可用时记录阻断状态：
 
@@ -78,7 +94,7 @@ python3 scripts/workflow_gate.py --request <workdir>/workflow-gate-request.json
    `UNAVAILABLE` 永远不是部分通过。`READINESS_STALE` 表示报告与当前考勤、映射或人员范围不一致；`READINESS_REPORT_INVALID` 表示报告结构或内部数据无法通过校验；`READINESS_CHECK_BLOCKED` 表示当前输入或检查过程无法安全验证。失败状态写入本身失败时，CLI 返回错误且不得继续；文件系统故障可能使旧文件仍留在磁盘，因此调用方必须以本次命令成功结果为前提，绝不能在写入失败后读取旧报告继续流程。
 
 4. 在向用户提供缩围选项前，按 W03.5.1 从当前 Runtime 上下文派生固定 Batch/Operation ID，并用 `get_attendance_submission` 核对既有提交回执及其月份、内容和完整人员范围。新 Task ID 或单条 Operation 查询无记录都不能证明不存在其他相关批次；若不能确认这是安全的首次处理，停止，不提供“仅处理已覆盖人员”的可执行路径。若已有提交回执，原批次人员范围已固定，不得缩围、扩围或换 Batch ID。
-5. 用一次简洁摘要展示考勤人数、身份可靠匹配人数、历史覆盖人数、默认候选处理范围，以及身份待核/缺少历史/歧义/未知人员及排除原因。不得在聊天回复中重发完整考勤表。`COVERED` 只代表找到历史工资来源，不代表完整 Payroll Precheck 通过。未知或歧义人员不得算作覆盖。遇到身份冲突或待人工确认时，先处理这些人员后再固定最终范围。首次处理且批次检查未发现冲突时，可将 `default_calculable_scope` 作为范围审阅的默认建议；它由当前月份、Review 版本、考勤 SHA、身份映射 SHA、`record_id` 和精确 Payroll Person ID 绑定。F3.2 正常路径将范围展示、正式考勤提交授权和工资核算授权收敛为一次授权：展示唯一范围、所有排除原因及后续正式副作用后，等待用户明确开始工资核算。授权之后仍先复查覆盖及批次，再按既有顺序提交、正式 Precheck、核算；不得自动缩围。范围或证据变化时重新检查、展示并取得新授权。
+5. 用一次简洁摘要展示考勤人数、身份可靠匹配人数、历史覆盖人数、默认候选处理范围，以及身份待核/缺少历史/歧义/未知人员及排除原因。不得在聊天回复中重发完整考勤表。`COVERED` 只代表找到历史工资来源，不代表完整 Payroll Precheck 通过。未知或歧义人员不得算作覆盖。身份冲突必须保持待核；用户明确排除某条记录时，显示其身份待核和本次排除原因，按独立排除证据绑定当前考勤及身份摘要。首次处理且批次检查未发现冲突时，可将 `default_calculable_scope` 作为范围审阅的默认建议；它由当前月份、Review 版本、考勤 SHA、身份映射 SHA、`record_id` 和精确 Payroll Person ID 绑定。F3.2 正常路径将范围展示、正式考勤提交授权和工资核算授权收敛为一次授权：展示唯一范围、所有排除原因及后续正式副作用后，等待用户明确开始工资核算。授权之后仍先复查覆盖及批次，再按既有顺序提交、正式 Precheck、核算；不得自动缩围。范围或证据变化时重新检查、展示并取得新授权。
 
 面客说明使用业务语言：`COVERED` 表示“已找到历史工资来源”；`MISSING_HISTORY` 表示“未找到符合条件的历史工资”；`AMBIGUOUS_HISTORY` 表示“历史工资记录存在歧义”；`UNKNOWN` 表示“暂时无法核实”；未匹配人员单独列为“身份待核实”。不向用户展示内部状态码、SHA 或 Batch ID。
 
@@ -162,14 +178,14 @@ python3 scripts/build_payroll_workbook.py \
   --output <project-root>/2026年6月工资核算表.xlsx
 ```
 
-输出目标必须是新的 `.xlsx` 路径，脚本不会覆盖已有文件。`--gate-request` 是当前阶段请求证据，脚本会再次调用本地 `workflow_gate.py` 的 `PAYROLL_EXPORT` 判定；其中身份、提交范围、提交回执、正式 Precheck 与核算回执的每个人员条目都必须包含 `record_id`、姓名和精确 `payroll_person_id`，并与核算结果按人员 ID 一一对应，不能仅按姓名关联。原始核算响应须为 Payroll `PayrollCalculationResult` DTO 的直接 JSON 对象；未知外层包装或字段会被拒绝。导出器对原始 DTO 与 `calculation_result` 做键顺序/空白无关的规范化结构比较，覆盖整体状态、计数、问题、所有人员、工资分项、来源状态与金额及汇总。
+输出目标必须是新的 `.xlsx` 路径，脚本不会覆盖已有文件。`--gate-request` 是当前阶段请求证据，脚本会再次调用本地 `workflow_gate.py` 的 `PAYROLL_EXPORT` 判定；其中身份、提交范围、提交回执、正式 Precheck 与核算回执的每个人员条目都必须包含 `record_id`、姓名和精确 `payroll_person_id`，并与核算结果按人员 ID 一一对应，不能仅按姓名关联。Payroll 源码当前确认成功响应为 `PayrollCalculationResult` DTO；MCP `NewToolResultJSON` 同时返回 `structuredContent` 和包含同一 DTO JSON 的单个 text `content`。导出器可读取直接 DTO，或校验此 MCP 包装后提取 DTO；两份载荷必须相同，原始响应文件保持不变。Go nil `issues` 切片可序列化为 `null`，仅对此字段按空问题列表规范化；关键 `items`/工资分项数组为 `null` 时阻断。`source_amount:null` 仅在 `source_present=false` 时合法，零金额仍是明确金额。DTO 的 `omitempty` 可选字段不会被补造，正式导出仍要求所需批次、操作、Precheck 快照及考勤绑定信息存在。Payroll 当前源码没有证实其他字段别名，故未知别名、外层包装或字段一律拒绝。导出器对标准化 DTO 与 `calculation_result` 做键顺序/空白无关的规范化结构比较，覆盖整体状态、计数、问题、所有人员、工资分项、来源状态与金额及汇总。
 
-考勤核验要求快照中每条记录带有稳定 `record_id`，与当前 `attendance.json` 和当前 `person-matches.json` 全量一一对应；核验考勤摘要、月份、人员/Payroll ID 关系、逐日状态、`value`、原始标记、印刷/派生/确认出勤、请假旷工统计及备注。提交请求的批次、月份、模式、操作 ID、人员集合须与回执、核算和快照吻合，提交人员记录须与快照逐字段一致。Payroll 日状态只显式映射 `work`、`personal_leave`、`sick_leave`、`absent`、`rest`、`comp_leave`；其他考勤状态没有经过证明的一对一 Payroll 状态时阻断，不猜测映射。每日 `value` 只使用当前来源中实际存在的字段，缺失按 DTO 的 null 表示；与原始标记不同的用户确认标记无法在现有 DTO 中同时表达时阻断。人员范围之外的考勤人员仍须保留在完整快照和工作簿中。
+考勤核验要求快照中每条记录带有稳定 `record_id`，与当前 `attendance.json` 和当前 `person-matches.json` 全量一一对应；核验考勤摘要、月份、人员/Payroll ID 关系、逐日状态、`value`、原始标记、印刷/派生/确认出勤、请假旷工统计及备注。提交请求的批次、月份、模式、操作 ID、人员集合须与回执、核算和快照吻合，提交人员记录须与快照逐字段一致。Payroll 日状态只显式映射 `work`、`personal_leave`、`sick_leave`、`absent`、`rest`、`comp_leave`；其他考勤状态没有经过证明的一对一 Payroll 状态时阻断，不猜测映射。对于**未纳入核算且未进入正式提交请求**的人员，若来源日状态没有 Payroll 映射，工作簿输入快照的该日 `status` 必须为 JSON `null`。这只是本地导出表示“没有可证明的 Payroll 状态”，不是 Payroll 的日状态，也不得作为 `BATCH_SNAPSHOT` 提交；导出器会以当前 `attendance.json` 中的状态、原始标记和值核对它，任何非 null 状态都拒绝。已核算人员仍必须具有合法且与来源一致的 Payroll 状态。每日 `value` 只使用当前来源中实际存在的字段，缺失按 DTO 的 null 表示；与原始标记不同的用户确认标记无法在现有 DTO 中同时表达时阻断。人员范围之外的考勤人员仍须保留在完整快照和工作簿中。
 
 Payroll 当前 Go 实现的 `payload_sha256` 是对 `BATCH_SNAPSHOT` 的 `{attendance_month,batch_id,submission_mode,records}` DTO 子集执行 `json.Marshal` 后计算；`operation_id` 不在摘要载荷中。Skill 不自行重造 Go 序列化器来复算该摘要，导出器只核验摘要格式、回执的批次/范围，并将提供的原始提交请求逐字段与快照及当前事实对齐。原始请求、回执和响应仍由 Agent/运行环境提供，因此本地一致性检查不提供来源真实性证明。
 
-脚本只校验并展示输入，不连接 Payroll、不调用 MCP、不补算工资。仅完整 `SUCCESS`、有效 Precheck、匹配的固定批次及 `PAYROLL_EXPORT` 阶段准入可导出正式文件；`PARTIAL`、`FAILED`、损坏/缺失回执、来源内容不一致或无法映射均失败关闭，不能改走内部或手工工资表路径。五个 Sheet 按已审计模板顺序生成，金额直接来自原始 Payroll 核算响应；完整考勤快照单独保留，未纳入核算人员及有证据的异常进入“人工复核事项”。
+脚本只校验并展示输入，不连接 Payroll、不调用 MCP、不补算工资。仅完整 `SUCCESS`、有效 Precheck、匹配的固定批次及 `PAYROLL_EXPORT` 阶段准入可导出正式文件；`PARTIAL`、`FAILED`、损坏/缺失回执、来源内容不一致或**已核算人员**状态无法映射均失败关闭，不能改走内部或手工工资表路径。五个 Sheet 按已审计模板顺序生成，金额直接来自原始 Payroll 核算响应；完整考勤快照单独保留，未纳入核算人员及有证据的异常进入“人工复核事项”。“考勤汇总”按稳定 `record_id` 每人一行，日期列按目标月份动态展开；单元格以状态、值和原始标记的复合文本展示，日期由列标题确定，月度字段不再按天重复。逐日记录仍在来源快照中逐字段校验，未纳入核算的人员也保留。“人工复核事项”按稳定人员标识与问题类别聚合，说明中保留各项具体问题及可追溯人员 ID；不同类别、不同人员不合并。工资基准始终保留九项的原始来源状态和来源金额：来源明确存在且为零不产生来源缺失告警；来源明确不存在、金额为空且计算为零只在工资基准展示该来源事实；来源不存在但计算非零会列为来源/计算不一致；来源未知必须待核，不能按正常零金额处理。Payroll 当前核算 DTO 要求 `source_present` 为布尔值，若原始 DTO 给出 null/缺字段，仍按 DTO 校验失败关闭，不将其改写成布尔值或零金额。
 
-脚本成功返回 `ok=true` 和输出路径后，确认文件存在，再调用 `artifact_declare` 声明该新文件并检查 `ok=true`。脚本失败、回执真实性无法从正常 Skill/MCP 流程核实或 Artifact 声明失败时，不得称工资表已交付。阶段门禁是 Skill 正常路径约束，不是可阻止任意 Shell 或 MCP 调用的 Runtime 权限边界。
+脚本成功返回 `ok=true` 和输出路径后，确认文件存在，再调用 `artifact_declare` 声明该新文件并检查 `ok=true`。不得在完整 SUCCESS 后另行询问是否导出。若导出失败，应报告“工资核算已完成，但正式工资表导出失败”；若文件已生成但声明失败，应说明文件生成成功、交付未完成。任何导出/声明重试都只重试对应步骤，不得再次调用 `calculate_payroll`；已有成功核算结果先按原 `operation_id` 只读核实并复用。PARTIAL、FAILED、结果不明、回执缺失、范围漂移、DTO 或来源绑定校验失败时停止，不得绕过导出器。Artifact `ok=true` 证明声明成功，不证明 UI 已显示。阶段门禁是 Skill 正常路径约束，不是可阻止任意 Shell 或 MCP 调用的 Runtime 权限边界。
 
 身份和范围的自然语言展示使用“已关联 / 待核实 / 暂不纳入”，不向业务用户展示内部枚举或要求其选择恢复策略。
